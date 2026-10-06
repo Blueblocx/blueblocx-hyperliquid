@@ -132,6 +132,20 @@ net_worth       = clearinghouseState.accountValue                          -- pe
   computed net_worth within 1% (verified: portfolio-margin wallet −0.001%, plain
   perp wallet 0.0%). Both are asserted in `_reconciliation.json`.
 
+## 6a. Incremental runs and window coverage
+
+* `--incremental` resumes each wallet from `_watermarks.json[wallet].through_ms`
+  minus a 1h overlap (re-pulled rows dedup on the natural key); a wallet whose
+  core pulls failed is skipped and its watermark is NOT advanced; watermarks are
+  written only after the (optional) Iceberg lift succeeded.
+* Analytics (`realized_pnl_Nd`, `net_flow_Nd`) always run over the wallet's
+  **accumulated** ledger (rows on disk ∪ this pull), never just the pull window.
+  `coverage_days` counts from `coverage_start_ms` = the earliest window start ever
+  pulled for the wallet (persisted in the watermark). An Nd metric is emitted
+  only when coverage ≥ N days **and** no truncated (non-backfilled) window ever
+  occurred for the wallet (`fills_truncated` is sticky in the watermark until a
+  backfilled run clears it); otherwise it is `null` with `*_complete=false`.
+
 ## 6b. Sources, HIP-3 dexes, fallbacks
 
 * **Sources**: Info API for the recent window (`userFillsByTime` ≤ ~10k fills,

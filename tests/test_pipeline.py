@@ -120,6 +120,16 @@ class IncrementalWindowTests(unittest.TestCase):
                          9_000_000)
 
 
+class MergeRowsTests(unittest.TestCase):
+    def test_merge_rows_by_key_new_wins_and_unions(self):
+        a = {"tx_hash": "h1", "event_index": 0, "direction": "in", "amount_signed": 1.0}
+        b = {"tx_hash": "h2", "event_index": 0, "direction": "in", "amount_signed": 2.0}
+        a2 = dict(a, amount_signed=5.0)
+        merged = extract.merge_rows_by_key([a, b], [a2])
+        self.assertEqual(len(merged), 2)
+        self.assertEqual({r["tx_hash"]: r["amount_signed"] for r in merged}, {"h1": 5.0, "h2": 2.0})
+
+
 class Hip3NetWorthTests(unittest.TestCase):
     def test_other_dex_equity_added_without_overlap(self):
         from hl_poc import analytics

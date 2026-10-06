@@ -113,6 +113,39 @@ def _load_watermarks(path: Path) -> dict:
     return {}
 
 
+def _load_wallet_ledger_rows(path: Path, wallet: str) -> list[dict]:
+    """Read a wallet's rows already on disk (typed enough for analytics)."""
+    if not path.exists():
+        return []
+    out = []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            if r.get("wallet_address") != wallet:
+                continue
+            r["amount_signed"] = float(r["amount_signed"] or 0)
+            r["event_index"] = int(r["event_index"] or 0)
+            out.append(r)
+    return out
+
+
+def _load_token_meta(path: Path) -> dict[str, dict]:
+    """token_address -> {symbol, is_stablecoin} from l1_token_metadata.csv."""
+    if not path.exists():
+        return {}
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        return {r["token_address"]: {"symbol": r.get("symbol"),
+                                     "is_stablecoin": str(r.get("is_stablecoin")).lower() == "true"}
+                for r in csv.DictReader(fh)}
+
+
+def merge_rows_by_key(existing: list[dict], new: list[dict]) -> list[dict]:
+    """Union by the natural key; new rows win (same semantics as upsert_csv)."""
+    merged = {mappers.natural_key(r): r for r in existing}
+    for r in new:
+        merged[mappers.natural_key(r)] = r
+    return list(merged.values())
+
+
 def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
                   max_workers: int, dexes: list[str] | None = None) -> dict:
     """Run the independent Info API pulls for one wallet concurrently (7 core +
@@ -352,29 +385,50 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         if float(staking.get("delegated", 0) or 0) or float(staking.get("undelegated", 0) or 0):
             syms.add("HYPE")
         held_symbols |= {s for s in syms if s and s.upper() not in _STABLE_SYMBOLS}
-        # price every symbol the LEDGER touched too (fee/quote legs), not just holdings
-        ledger_syms = {m.get("symbol") for m in registry.items().values()}
+        # Analytics run over the wallet's ACCUMULATED ledger (disk + this run), not
+        # just this pull: in incremental mode the pull window is ~1h, but
+        # realized_7d/30d must be computed over everything we hold. Coverage
+        # starts at the earliest window ever pulled for the wallet (watermark).
+        prior_wm = watermarks.get(wallet) or {}
+        coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
+        if incremental:
+            analysis_rows = merge_rows_by_key(
+                _load_wallet_ledger_rows(ns_dir / "l1_wallet_ledger.csv", wallet), l1_rows)
+        else:
+            analysis_rows = l1_rows
+        # price every symbol the ACCUMULATED ledger touched (fee/quote legs), not
+        # just holdings; historical tokens come from l1_token_metadata.csv
+        token_meta_all = dict(_load_token_meta(ns_dir / "l1_token_metadata.csv"))
+        token_meta_all.update(registry.items())
+        ledger_syms = {m.get("symbol") for m in token_meta_all.values()}
         spot_px = prices.spot_symbol_prices(resolver, spot_meta, spot_ctxs, syms | ledger_syms)
         token_usd_price = {addr: (1.0 if m.get("is_stablecoin") else spot_px.get(m.get("symbol")))
-                           for addr, m in registry.items().items()}
+                           for addr, m in token_meta_all.items()}
         token_usd_price = {a: p for a, p in token_usd_price.items() if p is not None}
 
         # --- analytics contribution + oracle ---------------------------------
-        wa = analytics.compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms,
+        wa = analytics.compute_analytics(analysis_rows, snap_rows, chs, spot_state, now_ms,
                                          now_iso, spot_price_by_symbol=spot_px,
                                          staking=staking, token_usd_price=token_usd_price,
                                          vault_equities=vaults,
-                                         window_start_ms=w_start_ms,
-                                         fills_truncated=fills_saturated,
+                                         window_start_ms=coverage_start_ms,
+                                         fills_truncated=(fills_saturated
+                                                          or bool(prior_wm.get("fills_truncated"))),
                                          account_value_by_dex=account_value_by_dex)
         oracle = analytics.validate_against_oracle(wa, portfolio, now_ms)
         recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
         recon["unmapped_ledger_types"] = unknown
         recon["fetch_errors"] = d["_errors"]
         recon["window_start_ms"] = w_start_ms
+        recon["coverage_start_ms"] = coverage_start_ms
+        recon["analysis_rows"] = len(analysis_rows)
         recon["s3_backfill"] = s3_report
         recon["hip3_dexes_with_equity"] = sorted(account_value_by_dex)
-        watermarks[wallet] = {"through_ms": now_ms, "updated_at": now_iso}
+        # A truncated window (no S3 backfill) poisons coverage for good: remember it
+        # so later incremental runs keep reporting *_complete=false honestly.
+        watermarks[wallet] = {"through_ms": now_ms, "coverage_start_ms": coverage_start_ms,
+                              "fills_truncated": bool(fills_saturated or prior_wm.get("fills_truncated")),
+                              "updated_at": now_iso}
         recon["spot_price_source"] = "spotMetaAndAssetCtxs"
         recon["unpriced_held_symbols"] = sorted(s for s in syms
                                                if s and s.upper() not in _STABLE_SYMBOLS
