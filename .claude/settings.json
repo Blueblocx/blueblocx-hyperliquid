@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/BlueBlocx/code/atlas-project/services/rust/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/services/spark-jobs/jobs/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/services/rust/wallet-statement-watchlist/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/services/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/services/rust/fifo-pnl/src/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/services/rust/wallet-statement-watchlist/src/**)",
+      "Read(//d/BlueBlocx/code/atlas-project/services/rust/wallet-statement-usd/src/**)"
+    ]
+  }
+}

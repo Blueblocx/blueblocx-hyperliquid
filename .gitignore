@@ -1,0 +1,17 @@
+# Secrets — NEVER commit
+key
+.env
+*.pem
+*.key
+credentials*
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# POC output / scratch
+out/
+*.lz4
+*.log
+wallets.txt
