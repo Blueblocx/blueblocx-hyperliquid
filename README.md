@@ -129,5 +129,9 @@ production use**), `NESSIE_URI` + `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/
   comes from S3. Hour files are 25–70 MB lz4 (Requester Pays) and publish ~1h
   after the hour; the extractor fetches only the gap the API could not serve,
   reports missing/failed hours, and does not advance the watermark until the
-  window is complete.
+  window is complete. Measured end to end on the MM wallet: a 24h window = 23
+  hour files, 165,504 S3 fills + 14,504 API fills = 180,008 (fidelity residual
+  0.0), ~35 min wall-clock (~90 s per hour file, dominated by scanning
+  ~130–330 MB of JSON lines per file — parallelising the parse is the next
+  throughput lever).
 - **`group hash`**: `xxh64(addr, seed=0).abs() % 4000` matches Rust production.
