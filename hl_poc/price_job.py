@@ -68,7 +68,8 @@ def build_price_rows(client: InfoClient, resolver: SpotMetaResolver, *,
             log.warning("spot candles failed for %s (%s): %s", sym, pair.candle_coin, e)
             report["unpriceable"].append(sym)
             continue
-        rows += prices.candles_to_price_1m(pair.base.token_address, candles, now_iso)
+        rows += prices.candles_to_price_1m(pair.base.token_address, candles, now_iso,
+                                           closed_before_ms=end_ms)
         if candles:
             report["coverage"][sym] = {
                 "token_address": pair.base.token_address, "rows": len(candles),
@@ -82,14 +83,16 @@ def build_price_rows(client: InfoClient, resolver: SpotMetaResolver, *,
             log.warning("perp candles failed for %s: %s", coin, e)
             continue
         addr = f"hlcore:perp:{coin}"
-        rows += prices.candles_to_price_1m(addr, candles, now_iso)
+        rows += prices.candles_to_price_1m(addr, candles, now_iso, closed_before_ms=end_ms)
         if candles:
             report["coverage"][f"perp:{coin}"] = {
                 "token_address": addr, "rows": len(candles),
                 "first": prices._iso(candles[0]["t"]), "last": prices._iso(candles[-1]["t"]),
             }
 
-    grid = prices.minute_grid(start_ms, end_ms, step_min=step_min)
+    # stable pins: closed buckets only (bucket open + step <= end)
+    grid = [t for t in prices.minute_grid(start_ms, end_ms, step_min=step_min)
+            if t + step_min * 60_000 <= end_ms]
     addrs = set(stable_addrs or ())
     addrs.add(S.USDC_ADDRESS)
     for addr in sorted(addrs):

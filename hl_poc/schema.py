@@ -201,6 +201,7 @@ L4X_PERP_POSITION_SNAPSHOT_COLUMNS = [
     "wallet_address",
     "wallet_group",
     "coin",
+    "dex",                 # main | HIP-3 dex name (xyz, flx, ...); margin accounts are per dex
     "szi",                 # signed size (+long / -short); NOT a token balance
     "entry_px",
     "position_value",

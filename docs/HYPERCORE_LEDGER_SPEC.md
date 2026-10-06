@@ -87,13 +87,20 @@ realized_pnl_Nd = FIFO_spot_realized_Nd
                   -- *_complete=false)
 unrealized_pnl  = Σ l4x_perp_position_snapshot.unrealized_pnl_usd        (latest as_of)
 net_flow_Nd     = Σ usd(row) WHERE event_type IN (deposit, withdraw, transfer)  -- never PnL
-net_worth       = clearinghouseState.accountValue                          -- perp book (ground truth)
-                − min(accountValue, spot USDC.spotHold)                     -- portfolio-margin overlap: unified
-                                                                            --   accounts collateralise perps with
-                                                                            --   spot USDC that is already in total
+total_perp      = clearinghouseState(main).accountValue + Σ clearinghouseState(dex=d).accountValue
+                                                                            -- HIP-3 dexes have their own margin
+                                                                            --   accounts; portfolio.perpAllTime ==
+                                                                            --   this sum (verified live)
+collateral      = spot USDC.spotHold if present                             -- portfolio-margin accounts
+                  else USDC.hold if (portfolioMarginEnabled or |hold − total_perp| ≤ 10%·total_perp)
+                  else 0                                                    -- plain `hold` = resting spot orders
+net_worth       = total_perp − min(total_perp, collateral)                  -- unified accounts keep perp collateral
+                                                                            --   inside spot USDC.total: never add twice
                 + Σ spot balance × price  (stables at $1)                   -- spotClearinghouseState
                 + staked HYPE × HYPE price                                  -- delegatorSummary
                 + Σ vault equity                                            -- userVaultEquities
+                -- validated on 3 wallets (plain MM: no spot USDC row → overlap 0; portfolio-margin
+                -- wallet via spotHold; HIP-3 trader via hold ≈ main+xyz). networth_matches guards it.
 ```
 
 ## 4. Token identity, decimals, stables
@@ -135,9 +142,16 @@ net_worth       = clearinghouseState.accountValue                          -- pe
 ## 6a. Incremental runs and window coverage
 
 * `--incremental` resumes each wallet from `_watermarks.json[wallet].through_ms`
-  minus a 1h overlap (re-pulled rows dedup on the natural key); a wallet whose
-  core pulls failed is skipped and its watermark is NOT advanced; watermarks are
-  written only after the (optional) Iceberg lift succeeded.
+  minus a 1h overlap (re-pulled rows dedup on the natural key) — **never clamped
+  to `--days`**, so a missed day cannot leave a silent hole; `--days` only sizes
+  a wallet's first window. A wallet whose core pulls failed (history, main or any
+  HIP-3 clearinghouse) is skipped and its watermark is NOT advanced; watermarks
+  are written only after the (optional) Iceberg lift succeeded.
+* A window that is still **truncated** (10k cap without `--s3-backfill`, or an S3
+  backfill with missing/failed hour files) does NOT advance `through_ms`, so a
+  later backfilled run re-pulls the same window and genuinely repairs the hole.
+  `fills_truncated` is sticky until a run that is complete AND contiguous with
+  the prior watermark clears it.
 * Analytics (`realized_pnl_Nd`, `net_flow_Nd`) always run over the wallet's
   **accumulated** ledger (rows on disk ∪ this pull), never just the pull window.
   `coverage_days` counts from `coverage_start_ms` = the earliest window start ever
@@ -155,11 +169,19 @@ net_worth       = clearinghouseState.accountValue                          -- pe
   `cloid`; `block_number` is available there but left **NULL** on the row so
   rows are byte-identical across sources (the key never uses it).
 * **HIP-3 builder dexes** (`perpDexs`: xyz, flx, vntl, …): fills and funding
-  carry `dex:COIN` coins and map as perps (USDC cashflow). Each dex has its own
-  margin account → `clearinghouseState(user, dex=…)` per dex; positions join the
-  l4x snapshot and their `accountValue` is added to net worth
-  (`account_value_by_dex`). The portfolio-margin overlap (§3) applies to the
-  main dex only.
+  carry `dex:COIN` coins and map as perps. Each dex settles in **its own
+  collateral token** (`meta(dex).collateralToken`: xyz/abcd/para/mkts/io = USDC,
+  flx/vntl/km = USDH, hyna = USDE, cash = USDT0 as of 2026-10) — PnL/funding/
+  builder-fee legs for `dex:*` coins are booked in that token, not USDC. Each dex
+  has its own margin account → `clearinghouseState(user, dex=…)` per dex;
+  positions join the l4x snapshot with a `dex` column and their `accountValue`
+  is part of total perp equity (§3). `portfolio.perpAllTime` equals main + Σ dex.
+* **Node-only fill fields**: `builderFee` and `deployerFee` are folded into one
+  builder-fee leg (ordinal 2 perp / 3 spot); `liquidation`, `priorityGas`,
+  `cloid`, `builder` are not booked.
+* **Only closed candles** enter `l3_token_price_usd_1m` (candle close ≤ run time):
+  the Iceberg lift is insert-if-absent, so an in-progress candle would otherwise
+  be frozen forever.
 * **Ledger types**: `internalTransfer` and `subAccountTransfer` map to
   `transfer` with normal in/out direction (they move between distinct
   addresses); the net-zero two-leg treatment is reserved for moves inside ONE

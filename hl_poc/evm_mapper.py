@@ -59,15 +59,23 @@ def map_evm_transfers_to_ledger(
     block_ts: dict[int, int],
     token_meta: dict[str, dict],
     now_iso: str,
+    stats: dict | None = None,
 ) -> list[dict]:
     """logs: raw eth_getLogs entries. block_ts: {block_number: unix_seconds}.
     token_meta: {token_address_lower: {"decimals": int, "symbol": str}}.
 
     Emits the wallet's own directional row per Transfer (see module docstring).
+    Logs whose block timestamp is unknown are DROPPED and counted in
+    stats['dropped_no_timestamp'] — never written as epoch-1970 rows (block_date
+    is the Iceberg partition key and every time-window rollup reads it).
     """
     wallet = wallet.lower()
     rows: list[dict] = []
     seen: set[tuple] = set()
+    if stats is None:
+        stats = {}
+    stats.setdefault("dropped_no_timestamp", 0)
+    stats.setdefault("amount_null", 0)
 
     for lg in logs:
         topics = lg.get("topics", [])
@@ -101,8 +109,13 @@ def map_evm_transfers_to_ledger(
         signed = None
         if amount is not None:
             signed = amount if direction == S.DIRECTION_IN else -amount
+        else:
+            stats["amount_null"] += 1
 
-        ts = block_ts.get(block_num, 0)
+        ts = block_ts.get(block_num)
+        if not ts:
+            stats["dropped_no_timestamp"] += 1
+            continue
         tx_index = lg.get("transactionIndex")
         rows.append({
             "block_number": block_num,

@@ -58,13 +58,24 @@ def run(wallets: list[str], blocks: int, out_dir: Path, rpc_url: str | None = No
         block_ts = evm.get_block_timestamps(sorted({int(lg["blockNumber"], 16) for lg in logs}))
         token_addrs = sorted({lg["address"].lower() for lg in logs})
         meta = evm_tokens.resolve_token_metadata(evm, token_addrs)
-        rows = evm_mapper.map_evm_transfers_to_ledger(logs, wallet, block_ts, meta, now_iso)
+        stats: dict = {}
+        rows = evm_mapper.map_evm_transfers_to_ledger(logs, wallet, block_ts, meta, now_iso,
+                                                      stats=stats)
         for addr, m in meta.items():
-            registry[addr] = {"symbol": m.get("symbol"), "decimals": m.get("decimals") or 0,
+            # decimals stay NULL when unresolved — never persisted as 0 (a consumer
+            # deriving amount = amount_raw / 10^decimals would inflate by 10^18)
+            registry[addr] = {"symbol": m.get("symbol"), "decimals": m.get("decimals"),
                               "is_stablecoin": (m.get("symbol") or "").upper() in
                               {"USDC", "USDT0", "USDT", "USDHL", "FEUSD", "USDE", "USDH"}}
         all_rows += rows
-        report[wallet] = {"logs": len(logs), "rows": len(rows), "tokens": len(token_addrs)}
+        unresolved = sorted(a for a, m in meta.items() if m.get("decimals") is None)
+        report[wallet] = {"logs": len(logs), "rows": len(rows), "tokens": len(token_addrs),
+                          "rows_dropped_no_timestamp": stats.get("dropped_no_timestamp", 0),
+                          "rows_amount_null": stats.get("amount_null", 0),
+                          "tokens_unresolved_decimals": unresolved}
+        if stats.get("dropped_no_timestamp") or unresolved:
+            log.warning("[%s] dropped_no_timestamp=%d unresolved_decimals=%s", wallet[:10],
+                        stats.get("dropped_no_timestamp", 0), unresolved)
         log.info("[%s] %d logs -> %d rows (%d tokens)", wallet[:10], len(logs), len(rows), len(token_addrs))
 
     def s(v):

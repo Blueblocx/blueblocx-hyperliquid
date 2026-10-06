@@ -32,15 +32,21 @@ def _minute_floor(ms: int) -> int:
 
 
 def candles_to_price_1m(token_address: str, candles: list[dict],
-                        now_iso: str) -> list[dict]:
+                        now_iso: str, closed_before_ms: int | None = None) -> list[dict]:
     """One candle -> one l3_token_price_usd_1m row, keyed by token_address.
 
     Candle fields (verified): t(open ms), T(close ms), o,h,l,c (strings),
     v(volume base), n(trade count). vwap approximated as (h+l+c)/3.
+
+    Only CLOSED candles are emitted when `closed_before_ms` is given (candle
+    close T <= that instant): the in-progress candle would otherwise be frozen
+    forever by the insert-if-absent Iceberg lift while the CSV later corrects it.
     """
     rows: list[dict] = []
     tg = S.addr_group(token_address)
     for c in candles:
+        if closed_before_ms is not None and int(c.get("T", 0) or 0) > closed_before_ms:
+            continue
         o = float(c["o"]); h = float(c["h"]); low = float(c["l"]); cl = float(c["c"])
         vol_token = float(c.get("v", 0) or 0)
         vwap = (h + low + cl) / 3.0
@@ -91,12 +97,12 @@ def minute_grid(start_ms: int, end_ms: int, step_min: int = 1) -> list[int]:
 
 
 def clearinghouse_to_snapshot(state: dict, wallet: str, as_of_ms: int,
-                              now_iso: str) -> list[dict]:
+                              now_iso: str, dex: str = "main") -> list[dict]:
     """clearinghouseState -> one l4x_perp_position_snapshot row per open position.
 
     unrealizedPnl is marked at markPx by Hyperliquid. We derive mark_px from
-    positionValue / |szi|. accountValue/withdrawable are whole-account figures,
-    repeated on each row for convenience.
+    positionValue / |szi|. accountValue/withdrawable are per-DEX margin-account
+    figures (main or a HIP-3 dex), repeated on each of that dex's rows.
     """
     ms = state.get("marginSummary", {}) or {}
     account_value = float(ms.get("accountValue", 0) or 0)
@@ -118,6 +124,7 @@ def clearinghouse_to_snapshot(state: dict, wallet: str, as_of_ms: int,
             "wallet_address": wallet.lower(),
             "wallet_group": wg,
             "coin": p.get("coin"),
+            "dex": dex or "main",
             "szi": szi,
             "entry_px": float(p["entryPx"]) if p.get("entryPx") else None,
             "position_value": pos_value,
@@ -151,7 +158,8 @@ def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
             "standard": S.STANDARD_ERC20,
             "symbol": meta.get("symbol"),
             "name": meta.get("symbol"),
-            "decimals": int(meta.get("decimals", 0) or 0),
+            # NULL when unresolved (nullable INT in the DDL) — never a fake 0
+            "decimals": (int(meta["decimals"]) if meta.get("decimals") is not None else None),
             "first_seen": now_iso,
             "source": "hypercore:spotMeta",
             "logo_url": None,

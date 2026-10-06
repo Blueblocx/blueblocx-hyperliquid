@@ -278,6 +278,16 @@ class NetWorthCompositionTests(unittest.TestCase):
         self.assertAlmostEqual(a["perp_spot_overlap_usd"], 500.0)
         self.assertAlmostEqual(a["net_worth"], 2000 + 200)
 
+    def test_l4x_snapshot_carries_dex(self):
+        from hl_poc import prices
+        chs = {"marginSummary": {"accountValue": "10"}, "assetPositions": [
+            {"position": {"coin": "xyz:SP500", "szi": "1", "entryPx": "1", "positionValue": "1",
+                          "unrealizedPnl": "0", "returnOnEquity": "0", "marginUsed": "1",
+                          "leverage": {"type": "cross", "value": 1}, "cumFunding": {}}}]}
+        rows = prices.clearinghouse_to_snapshot(chs, WALLET_A, 1_700_000_000_000, NOW, dex="xyz")
+        self.assertEqual(rows[0]["dex"], "xyz")
+        self.assertIn("dex", S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS)
+
     def test_vault_and_staking_are_added(self):
         a = self._analytics(vaults=[{"equity": "1000"}, {"equity": "0.5"}], staked="3")
         self.assertAlmostEqual(a["vault_value_usd"], 1000.5)

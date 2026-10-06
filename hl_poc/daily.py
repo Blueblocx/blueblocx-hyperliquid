@@ -54,10 +54,30 @@ def main() -> int:
     recon = extract.run(wallets, args.days, Path(args.out), with_prices=args.with_prices,
                         max_workers=args.workers, s3_backfill=args.s3_backfill,
                         iceberg=args.iceberg, incremental=True)
-    done = [r for r in recon["by_wallet"].values() if not r.get("skipped")]
-    ok = (recon["natural_key_ok"] and all(r.get("fidelity_ok") for r in done)
-          and all((r.get("oracle") or {}).get("account_value_matches") for r in done))
-    log.info("daily done: wallets=%d ok=%s", len(wallets), ok)
+    mine = {w: recon["by_wallet"].get(w, {}) for w in wallets}
+    skipped = [w for w, r in mine.items() if r.get("skipped")]
+    done = [r for r in mine.values() if r and not r.get("skipped")]
+    problems = []
+    if not recon["natural_key_ok"]:
+        problems.append("natural_key")
+    if skipped:
+        problems.append(f"skipped={len(skipped)}")
+    for w, r in mine.items():
+        if not r or r.get("skipped"):
+            continue
+        o = r.get("oracle") or {}
+        if not r.get("fidelity_ok"):
+            problems.append(f"{w[:10]}:fidelity")
+        if not o.get("account_value_matches"):
+            problems.append(f"{w[:10]}:perp_oracle")
+        if o.get("networth_matches") is False:
+            problems.append(f"{w[:10]}:networth_oracle")
+        if r.get("fills_truncated_at_10k_cap"):
+            problems.append(f"{w[:10]}:fills_truncated")
+        if r.get("fetch_errors"):
+            problems.append(f"{w[:10]}:fetch_errors={sorted(r['fetch_errors'])}")
+    ok = not problems and len(done) == len(wallets)
+    log.info("daily done: wallets=%d ok=%s problems=%s", len(wallets), ok, problems)
     return 0 if ok else 1
 
 

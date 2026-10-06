@@ -97,11 +97,17 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
 
 def compute_start_ms(default_start_ms: int, watermark_through_ms: int | None,
                      overlap_ms: int = 3_600_000) -> int:
-    """Incremental window start: resume from the last watermark minus an overlap
-    (re-pulled rows dedup on the natural key), never earlier than the default."""
+    """Incremental window start.
+
+    First run for a wallet (no watermark): the --days default window. Afterwards
+    ALWAYS resume from the watermark minus an overlap (re-pulled rows dedup on the
+    natural key) — never clamped to --days, otherwise a missed day would leave a
+    silent hole between the watermark and now-days while coverage stayed
+    'contiguous'. A long gap simply produces a long window (10k-capped fills then
+    fall back to --s3-backfill)."""
     if watermark_through_ms is None:
         return default_start_ms
-    return max(default_start_ms, int(watermark_through_ms) - overlap_ms)
+    return int(watermark_through_ms) - overlap_ms
 
 
 def _load_watermarks(path: Path) -> dict:
@@ -192,6 +198,17 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
 
 
 _CORE_PULLS = ("fills", "funding", "ledger", "chs")
+
+
+def _is_core_pull(name: str) -> bool:
+    """Pulls whose failure makes the wallet's run invalid: history, main
+    clearinghouse AND every HIP-3 clearinghouse (a missing dex would otherwise
+    replace the day's l4x scope with an incomplete snapshot)."""
+    return name in _CORE_PULLS or name.startswith("chs:")
+
+
+def _iso_to_ms(iso: str) -> int:
+    return int(datetime.fromisoformat(iso).timestamp() * 1000)
 
 
 def _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding) -> dict:
@@ -296,11 +313,14 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     # HIP-3 builder dexes: each has its own margin account; positions there are
     # invisible to clearinghouseState(main). Fetch the list once per run.
     dexes: list[str] = []
+    collateral_by_prefix: dict = {}
+    collateral_report: dict[str, str] = {}
     if hip3:
         try:
             dexes = client.perp_dexs()
         except Exception as e:  # noqa: BLE001
             log.warning("perpDexs failed — HIP-3 positions will not be snapshotted: %s", e)
+    price_start_ms = now_ms          # narrowed to the earliest processed window
 
     # --- shared: spotMeta + live spot prices in ONE call ------------------------
     try:
@@ -309,6 +329,22 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     except Exception as e:  # noqa: BLE001
         log.warning("spotMetaAndAssetCtxs failed — decimals=0 fallback, no spot prices: %s", e)
         spot_meta, spot_ctxs, resolver = {}, [], empty_resolver()
+
+    # Each HIP-3 dex denominates PnL/funding/accountValue in ITS collateral token
+    # (xyz=USDC, flx/vntl/km=USDH, hyna=USDE, cash=USDT0 as of 2026-10). Needs the
+    # spotMeta resolver, so it runs after it.
+    for dx in dexes:
+        try:
+            idx = (client.meta(dx) or {}).get("collateralToken")
+            ti = resolver.token(int(idx)) if idx is not None else None
+        except Exception as e:  # noqa: BLE001
+            log.warning("meta(dex=%s) failed — assuming USDC collateral: %s", dx, e)
+            ti = None
+        if ti is not None:
+            collateral_by_prefix[f"{dx}:"] = ti
+            collateral_report[dx] = ti.symbol
+        else:
+            collateral_report[dx] = "USDC(assumed)"
 
     registry = mappers.TokenRegistry()
     all_l1: list[dict] = []
@@ -325,7 +361,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         w_start_ms = compute_start_ms(default_start_ms,
                                       (watermarks.get(wallet) or {}).get("through_ms"))
         d = _fetch_wallet(client, wallet, w_start_ms, now_ms, max_workers, dexes)
-        core_errors = {k: v for k, v in d["_errors"].items() if k in _CORE_PULLS}
+        core_errors = {k: v for k, v in d["_errors"].items() if _is_core_pull(k)}
         if core_errors:
             log.error("[%s] SKIPPED — core pull(s) failed: %s", wallet[:10], core_errors)
             recon_by_wallet[wallet] = {"skipped": True, "errors": d["_errors"]}
@@ -339,27 +375,32 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         if fills_saturated and s3_backfill:
             # The API served only its ~10k most recent fills: fetch the rest of the
             # window from S3 node data. Same key scheme -> overlap dedups itself.
+            # The window counts as complete ONLY if every hour file was read.
             from .s3_backfill import fetch_fills_s3, merge_fills, load_dotenv
             load_dotenv()
             oldest_api = min(int(f.get("time", 0) or 0) for f in fills)
-            s3_fills = fetch_fills_s3([wallet], w_start_ms, oldest_api).get(wallet, [])
+            res = fetch_fills_s3([wallet], w_start_ms, oldest_api)
+            s3_fills = res.fills.get(wallet, [])
             fills = merge_fills(fills, s3_fills)
-            fills_saturated = False          # window is now complete
+            fills_saturated = not res.complete
             s3_report = {"gap_start_ms": w_start_ms, "gap_end_ms": oldest_api,
-                         "s3_fills": len(s3_fills), "merged_fills": len(fills)}
-            log.info("[%s] s3 backfill: +%d fills for the truncated gap", wallet[:10], len(s3_fills))
+                         "s3_fills": len(s3_fills), "merged_fills": len(fills), **res.summary()}
+            log.info("[%s] s3 backfill: +%d fills for the truncated gap (complete=%s)",
+                     wallet[:10], len(s3_fills), res.complete)
         elif fills_saturated:
             log.warning("[%s] fills truncated at the 10k API cap — pass --s3-backfill to "
-                        "complete the window", wallet[:10])
-        start_ms = w_start_ms
+                        "complete the window (watermark NOT advanced)", wallet[:10])
+        price_start_ms = min(price_start_ms, w_start_ms)
         log.info("[%s] fetched: %d fills, %d funding, %d ledger, %d positions%s",
                  wallet[:10], len(fills), len(funding), len(ledger_updates),
                  len(chs.get("assetPositions", [])),
                  "  [FILLS TRUNCATED @10k cap]" if fills_saturated else "")
 
         # --- L1 --------------------------------------------------------------
-        l1_rows = mappers.map_fills_to_ledger(fills, wallet, now_iso, resolver, registry)
-        l1_rows += mappers.map_funding_to_ledger(funding, wallet, now_iso, registry)
+        l1_rows = mappers.map_fills_to_ledger(fills, wallet, now_iso, resolver, registry,
+                                              collateral_by_prefix=collateral_by_prefix)
+        l1_rows += mappers.map_funding_to_ledger(funding, wallet, now_iso, registry,
+                                                 collateral_by_prefix=collateral_by_prefix)
         ledger_rows, unknown = mappers.map_non_funding_ledger(
             ledger_updates, wallet, now_iso, resolver, registry)
         l1_rows += ledger_rows
@@ -367,13 +408,13 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             unknown_types_all[k] = unknown_types_all.get(k, 0) + v
 
         # --- L4x snapshot (main dex + every HIP-3 dex) ---------------------------
-        snap_rows = prices.clearinghouse_to_snapshot(chs, wallet, now_ms, now_iso)
+        snap_rows = prices.clearinghouse_to_snapshot(chs, wallet, now_ms, now_iso, dex="main")
         account_value_by_dex: dict[str, float] = {}
         for dx, dchs in chs_by_dex.items():
             if not dchs:
                 continue
             av = float((dchs.get("marginSummary", {}) or {}).get("accountValue", 0) or 0)
-            dex_rows = prices.clearinghouse_to_snapshot(dchs, wallet, now_ms, now_iso)
+            dex_rows = prices.clearinghouse_to_snapshot(dchs, wallet, now_ms, now_iso, dex=dx)
             if av or dex_rows:
                 account_value_by_dex[dx] = av
                 snap_rows += dex_rows
@@ -392,8 +433,13 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         prior_wm = watermarks.get(wallet) or {}
         coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
         if incremental:
-            analysis_rows = merge_rows_by_key(
-                _load_wallet_ledger_rows(ns_dir / "l1_wallet_ledger.csv", wallet), l1_rows)
+            disk_rows = _load_wallet_ledger_rows(ns_dir / "l1_wallet_ledger.csv", wallet)
+            if disk_rows and not prior_wm.get("coverage_start_ms"):
+                # pre-existing data without a coverage watermark: coverage begins at
+                # the earliest row we actually hold, not at this (short) window
+                coverage_start_ms = min(coverage_start_ms,
+                                        min(_iso_to_ms(r["block_timestamp"]) for r in disk_rows))
+            analysis_rows = merge_rows_by_key(disk_rows, l1_rows)
         else:
             analysis_rows = l1_rows
         # price every symbol the ACCUMULATED ledger touched (fee/quote legs), not
@@ -424,11 +470,23 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         recon["analysis_rows"] = len(analysis_rows)
         recon["s3_backfill"] = s3_report
         recon["hip3_dexes_with_equity"] = sorted(account_value_by_dex)
-        # A truncated window (no S3 backfill) poisons coverage for good: remember it
-        # so later incremental runs keep reporting *_complete=false honestly.
-        watermarks[wallet] = {"through_ms": now_ms, "coverage_start_ms": coverage_start_ms,
-                              "fills_truncated": bool(fills_saturated or prior_wm.get("fills_truncated")),
-                              "updated_at": now_iso}
+        # Watermark rules:
+        #  * a window that is still truncated (no/incomplete S3 backfill) does NOT
+        #    advance through_ms, so a later --s3-backfill run re-pulls the same
+        #    window from S3 and genuinely repairs the hole;
+        #  * fills_truncated is sticky until a run that is complete AND contiguous
+        #    with the prior watermark (w_start_ms <= prior through_ms) clears it.
+        prior_through = prior_wm.get("through_ms")
+        repaired = (not fills_saturated) and (prior_through is None or w_start_ms <= int(prior_through))
+        sticky = fills_saturated or (bool(prior_wm.get("fills_truncated")) and not repaired)
+        watermarks[wallet] = {
+            "through_ms": (prior_through if fills_saturated else now_ms),
+            "coverage_start_ms": coverage_start_ms,
+            "fills_truncated": sticky,
+            "updated_at": now_iso,
+        }
+        if fills_saturated:
+            log.warning("[%s] window incomplete — watermark kept at %s", wallet[:10], prior_through)
         recon["spot_price_source"] = "spotMetaAndAssetCtxs"
         recon["unpriced_held_symbols"] = sorted(s for s in syms
                                                if s and s.upper() not in _STABLE_SYMBOLS
@@ -525,7 +583,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         stable_addrs = {a for a, m in reg_items.items() if m.get("is_stablecoin")}
         price_rows, price_report = build_price_rows(
             client, resolver, spot_symbols=held_symbols, perp_coins=perp_coins,
-            start_ms=start_ms, end_ms=now_ms, now_iso=now_iso, stable_addrs=stable_addrs)
+            start_ms=(price_start_ms if price_start_ms < now_ms else default_start_ms),
+            end_ms=now_ms, now_iso=now_iso, stable_addrs=stable_addrs)
         upsert_csv(ns_dir / "l3_token_price_usd_1m.csv", S.L3_TOKEN_PRICE_USD_1M_COLUMNS,
                    price_rows,
                    key_fn=lambda r: (s(r["token_address"]), s(r["bucket_minute"])),
@@ -575,6 +634,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "price_job": price_report,
         "iceberg": iceberg_report,
         "hip3_dexes_checked": dexes,
+        "hip3_collateral_by_dex": collateral_report,
         "by_wallet": prev_by_wallet,
     }
     recon_path.write_text(json.dumps(recon, indent=2), encoding="utf-8")

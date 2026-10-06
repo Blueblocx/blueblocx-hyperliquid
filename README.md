@@ -48,7 +48,8 @@ numbers exact. This repo covers HyperCore only.
 
 ## Run
 ```bash
-python -m venv .venv && ./.venv/Scripts/python -m pip install requests xxhash boto3 lz4 pyarrow "pyiceberg[sql-sqlite]"
+python -m venv .venv && ./.venv/Scripts/python -m pip install requests xxhash boto3 lz4 pyarrow "pyiceberg[sql-sqlite]" tzdata
+# (tzdata: pyarrow needs the IANA zone database for timestamptz columns on Windows)
 ./.venv/Scripts/python -m unittest discover -s tests -t . -v
 
 # full history for a 10k-capped wallet, resumable, lifted into Iceberg (local catalog by default)

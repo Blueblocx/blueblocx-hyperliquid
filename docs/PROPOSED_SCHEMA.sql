@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS nessie.hypercore.l4x_perp_position_snapshot (
     wallet_address          STRING,
     wallet_group            INT,
     coin                    STRING,
+    dex                     STRING,   -- main | HIP-3 dex (xyz, flx, ...); margin account per dex
     szi                     DOUBLE,   -- signed size: + long / - short
     entry_px                DOUBLE,   -- AVERAGE entry (not FIFO lots)
     position_value          DOUBLE,
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS nessie.hypercore.l4x_perp_position_snapshot (
     leverage_value          DOUBLE,
     cum_funding_all_time    DOUBLE,
     cum_funding_since_open  DOUBLE,   -- resets to 0 when the position closes
-    account_value_usd       DOUBLE,   -- whole-account marginSummary.accountValue
+    account_value_usd       DOUBLE,   -- marginSummary.accountValue of THIS dex's margin account
     withdrawable_usd        DOUBLE,
     created_at              TIMESTAMP
 ) USING iceberg

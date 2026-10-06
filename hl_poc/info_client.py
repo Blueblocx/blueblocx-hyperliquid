@@ -153,6 +153,15 @@ class InfoClient:
             body["dex"] = dex
         return self._post(body)
 
+    def meta(self, dex: str | None = None) -> dict:
+        """Perp universe metadata. For a HIP-3 dex includes `collateralToken`
+        (spot token index: 0 = USDC; flx/vntl/km = USDH, hyna = USDE, cash = USDT0
+        as of 2026-10) — the token perp PnL/funding/accountValue are denominated in."""
+        body = {"type": "meta"}
+        if dex:
+            body["dex"] = dex
+        return self._post(body, est_items=300)
+
     def perp_dexs(self) -> list[str]:
         """Names of HIP-3 perp dexes (excluding the main dex, reported as null)."""
         out = self._post({"type": "perpDexs"})

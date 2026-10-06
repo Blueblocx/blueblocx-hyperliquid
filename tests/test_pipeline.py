@@ -42,10 +42,26 @@ class S3BackfillTests(unittest.TestCase):
 
     def test_merge_fills_dedups_on_tid_api_wins(self):
         api = [{"tid": 1, "time": 10, "src": "api"}]
-        s3 = [{"tid": 1, "time": 10, "src": "s3"}, {"tid": 0, "time": 5, "src": "s3"}]
+        s3 = [{"tid": 1, "time": 10, "src": "s3"}, {"tid": 0, "time": 5, "coin": "@1", "sz": "1", "src": "s3"}]
         merged = s3_backfill.merge_fills(api, s3)
         self.assertEqual([f["tid"] for f in merged], [0, 1])
         self.assertEqual(merged[1]["src"], "api")
+
+    def test_merge_keeps_distinct_dust_fills(self):
+        # tid=0 dust conversions: several per midnight, one per dust coin
+        s3 = [{"tid": 0, "time": 5, "coin": "@142", "sz": "0.006"},
+              {"tid": 0, "time": 5, "coin": "@166", "sz": "1.0"},
+              {"tid": 0, "time": 6, "coin": "@142", "sz": "0.006"}]
+        api = [{"tid": 0, "time": 5, "coin": "@142", "sz": "0.006", "src": "api"}]
+        merged = s3_backfill.merge_fills(api, s3)
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(len({s3_backfill.fill_key(f) for f in merged}), 3)
+
+    def test_result_completeness_is_reported_not_assumed(self):
+        res = s3_backfill.S3Result(fills={}, keys_requested=["a", "b"], keys_missing=["b"])
+        self.assertFalse(res.complete)
+        self.assertEqual(res.summary()["keys_missing"], ["b"])
+        self.assertTrue(s3_backfill.S3Result(fills={}, keys_requested=["a"]).complete)
 
 
 class IcebergLoadTests(unittest.TestCase):
@@ -71,9 +87,13 @@ class IcebergLoadTests(unittest.TestCase):
         self.assertEqual(r["c"], 1.5)
         self.assertTrue(r["d"])
         self.assertEqual(r["e"], dt.date(2026, 10, 5))
-        self.assertEqual(r["f"], dt.datetime(2026, 10, 5, 1, 2, 3, 4000))   # naive UTC
+        # data tables: timestamptz (UTC) — matches Spark TIMESTAMP_LTZ / python-ingestion
+        self.assertEqual(r["f"], dt.datetime(2026, 10, 5, 1, 2, 3, 4000, tzinfo=dt.timezone.utc))
         self.assertIsNone(r["g"])
-        self.assertEqual(t.schema.field("f").type, pa.timestamp("us"))
+        self.assertEqual(t.schema.field("f").type, pa.timestamp("us", tz="UTC"))
+        # control.table_watermarks: naive
+        t2 = iceberg_load.rows_to_arrow([{"f": "2026-10-05T01:02:03+00:00"}], [("f", "TIMESTAMP")], tz=False)
+        self.assertEqual(t2.to_pylist()[0]["f"], dt.datetime(2026, 10, 5, 1, 2, 3))
 
 
 class EvmMapperTests(unittest.TestCase):
@@ -113,11 +133,75 @@ class IncrementalWindowTests(unittest.TestCase):
     def test_no_watermark_uses_default(self):
         self.assertEqual(extract.compute_start_ms(1000, None), 1000)
 
-    def test_watermark_resumes_with_overlap_but_not_before_default(self):
+    def test_watermark_always_resumes_from_watermark_never_clamped(self):
+        # a missed day must NOT open a hole between the watermark and now-days
         self.assertEqual(extract.compute_start_ms(1000, 10_000_000, overlap_ms=3_600_000),
                          10_000_000 - 3_600_000)
         self.assertEqual(extract.compute_start_ms(9_000_000, 10_000_000, overlap_ms=3_600_000),
-                         9_000_000)
+                         10_000_000 - 3_600_000)
+
+
+class ClosedCandleTests(unittest.TestCase):
+    def test_in_progress_candle_is_not_emitted(self):
+        from hl_poc import prices
+        now = 1_700_000_000_000
+        candles = [{"t": now - 120_000, "T": now - 60_001, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1},
+                   {"t": now - 60_000, "T": now + 59_999, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1}]
+        rows = prices.candles_to_price_1m("hlcore:token:150", candles, NOW, closed_before_ms=now)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(prices.candles_to_price_1m("x", candles, NOW)), 2)
+
+
+class IcebergPredicateSafetyTests(unittest.TestCase):
+    def test_empty_key_list_never_becomes_a_delete_predicate(self):
+        self.assertIsNone(iceberg_load._in_filter("k", []))
+
+    def test_null_key_raises(self):
+        with self.assertRaises(ValueError):
+            iceberg_load._in_filter("k", ["a", None])
+
+    def test_watermark_schema_has_required_fields_like_python_ingestion(self):
+        sch = iceberg_load.arrow_schema(iceberg_load._WM_COLS, tz=False)
+        required = {f.name for f in sch if not f.nullable}
+        self.assertEqual(required, {"namespace", "table_name", "watermark_col", "updated_at", "status"})
+        self.assertEqual(sch.field("updated_at").type, pa.timestamp("us"))
+
+    def test_data_tables_use_timestamptz(self):
+        cols = [("block_timestamp", "TIMESTAMP")]
+        self.assertEqual(iceberg_load.arrow_schema(cols, tz=True).field("block_timestamp").type,
+                         pa.timestamp("us", tz="UTC"))
+        v = iceberg_load._coerce("2026-10-05T01:02:03+00:00", "TIMESTAMP", tz=True)
+        self.assertIsNotNone(v.tzinfo)
+
+
+class CollateralTokenTests(unittest.TestCase):
+    def test_hip3_coin_uses_dex_collateral(self):
+        from hl_poc import mappers
+        from hl_poc.spot_meta import TokenInfo
+        usdh = TokenInfo(index=360, symbol="USDH", decimals=8, token_address="hlcore:token:360",
+                         is_stablecoin=True)
+        t = mappers.perp_cash_token("flx:TSLA", {"flx:": usdh})
+        self.assertEqual(t[0], "hlcore:token:360")
+        self.assertEqual(mappers.perp_cash_token("BTC", {"flx:": usdh})[0], S.USDC_ADDRESS)
+        self.assertEqual(mappers.perp_cash_token("xyz:SP500", {"flx:": usdh})[0], S.USDC_ADDRESS)
+
+
+class EvmDecimalsTests(unittest.TestCase):
+    def test_unresolved_decimals_stay_null_in_metadata(self):
+        from hl_poc import prices
+        rows = prices.token_metadata_rows({"0xabc": {"symbol": "X", "decimals": None, "is_stablecoin": False}}, NOW)
+        self.assertIsNone(rows[0]["decimals"])
+
+    def test_missing_block_timestamp_drops_row_and_counts(self):
+        TRANSFER = EvmMapperTests.TRANSFER
+        pad = lambda a: "0x" + a[2:].rjust(64, "0")  # noqa: E731
+        lg = {"address": "0x" + "11" * 20, "topics": [TRANSFER, pad(OTHER), pad(W)],
+              "data": "0x" + "1".rjust(64, "0"), "blockNumber": hex(5), "logIndex": "0x0",
+              "transactionIndex": "0x0", "transactionHash": "0x" + "ab" * 32}
+        stats = {}
+        rows = evm_mapper.map_evm_transfers_to_ledger([lg], W, {}, {}, NOW, stats=stats)
+        self.assertEqual(rows, [])
+        self.assertEqual(stats["dropped_no_timestamp"], 1)
 
 
 class MergeRowsTests(unittest.TestCase):
@@ -131,16 +215,35 @@ class MergeRowsTests(unittest.TestCase):
 
 
 class Hip3NetWorthTests(unittest.TestCase):
-    def test_other_dex_equity_added_without_overlap(self):
+    def test_overlap_applies_to_total_perp_equity_with_spot_hold(self):
         from hl_poc import analytics
         chs = {"marginSummary": {"accountValue": "500"}, "assetPositions": []}
-        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "2000", "spotHold": "500"}]}
+        # unified account: collateral for main+xyz (800) is inside spot USDC total
+        spot = {"portfolioMarginEnabled": True,
+                "balances": [{"coin": "USDC", "token": 0, "total": "2000", "spotHold": "800"}]}
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
                                         account_value_by_dex={"xyz": 300.0, "flx": 0.0})
-        # main dex fully overlapped by spot USDC (portfolio margin); xyz adds 300
-        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 500.0)
+        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 800.0)
         self.assertAlmostEqual(a["account_value_other_dex_usd"], 300.0)
-        self.assertAlmostEqual(a["net_worth"], 2000 + 300)
+        self.assertAlmostEqual(a["net_worth"], 2000.0)
+
+    def test_hold_only_account_matching_perp_equity_is_overlap(self):
+        # live shape (HIP-3 trader): no spotHold, USDC.hold ≈ main + xyz equity
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "276477"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "603330", "hold": "421308"}]}
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
+                                        account_value_by_dex={"xyz": 145147.0})
+        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 421308.0)
+        self.assertAlmostEqual(a["net_worth"], 603330 + (421624 - 421308), places=0)
+
+    def test_hold_from_resting_spot_orders_is_not_overlap(self):
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "500"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "2000", "hold": "1500"}]}
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW)
+        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 0.0)
+        self.assertAlmostEqual(a["net_worth"], 2500.0)
 
 
 if __name__ == "__main__":

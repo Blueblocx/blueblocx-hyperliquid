@@ -155,19 +155,36 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
     # spotHold); non-unified accounts have no spotHold -> overlap 0 -> full
     # accountValue is added (verified: MM wallet net_worth == accountValue == oracle;
     # unified wallet residual == accountValue before this correction).
+    # HIP-3 builder dexes (xyz, flx, ...) each have their OWN margin account that
+    # clearinghouseState(main) does not report (verified live: perpAllTime ==
+    # main + Σ dex). Their equity is part of TOTAL perp equity.
+    other_dex_value = sum(float(v or 0) for k, v in (account_value_by_dex or {}).items() if k)
+    total_perp = account_value + other_dex_value
+
+    # Overlap rule (data-driven, validated on 3 wallets): unified accounts keep
+    # the perp collateral inside spot USDC.total and expose it as USDC.spotHold
+    # (portfolio-margin flag) or, on some accounts, only as USDC.hold ≈ perp
+    # equity. `hold` alone can also mean resting spot orders, so it is used only
+    # when the account is flagged portfolio-margin or hold matches total perp
+    # equity within 10%. The overlap applies to TOTAL perp equity (all dexes).
     spot_hold = 0.0
+    hold = 0.0
     for b in (spot_state.get("balances", []) if spot_state else []):
         if b.get("coin") == "USDC":
             try:
                 spot_hold = float(b.get("spotHold", 0) or 0)
+                hold = float(b.get("hold", 0) or 0)
             except (TypeError, ValueError):
-                spot_hold = 0.0
-    perp_overlap = min(account_value, spot_hold) if spot_hold > 0 else 0.0
-    # HIP-3 builder dexes (xyz, flx, ...) each have their OWN margin account that
-    # clearinghouseState(main) does not report. Their equity is added here; the
-    # portfolio-margin overlap applies to the main dex only.
-    other_dex_value = sum(float(v or 0) for k, v in (account_value_by_dex or {}).items() if k)
-    perp_contrib = (account_value - perp_overlap) + other_dex_value
+                spot_hold, hold = 0.0, 0.0
+    pm_flag = bool((spot_state or {}).get("portfolioMarginEnabled"))
+    if spot_hold > 0:
+        collateral = spot_hold
+    elif hold > 0 and total_perp > 0 and (pm_flag or abs(hold - total_perp) / total_perp <= 0.10):
+        collateral = hold
+    else:
+        collateral = 0.0
+    perp_overlap = min(total_perp, collateral)
+    perp_contrib = total_perp - perp_overlap
 
     net_worth = perp_contrib + spot_value + staked_value + vault_value
 
@@ -238,7 +255,9 @@ def validate_against_oracle(analytics, portfolio, now_ms, tol_pct=0.005,
     result["checked"] = True
 
     if perp_oracle is not None:
-        computed_perp = analytics.get("account_value_usd", 0.0)
+        # perpAllTime includes HIP-3 dex equity (verified live: == main + Σ dex)
+        computed_perp = (analytics.get("account_value_usd", 0.0)
+                         + analytics.get("account_value_other_dex_usd", 0.0))
         diff = abs(computed_perp - perp_oracle)
         denom = abs(perp_oracle) or 1.0
         result.update({

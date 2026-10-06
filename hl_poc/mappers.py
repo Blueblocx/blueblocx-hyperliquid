@@ -122,9 +122,21 @@ def _token_tuple(ti: TokenInfo | None, fallback_symbol: str):
 _USDC_TUPLE = (S.USDC_ADDRESS, S.USDC_TOKEN, S.USDC_DECIMALS, True)
 
 
+def perp_cash_token(coin: str, collateral_by_prefix: dict | None) -> tuple:
+    """(address, symbol, decimals, is_stable) that a perp coin's PnL/funding are
+    denominated in. Main-dex coins -> USDC. HIP-3 coins 'dex:COIN' -> that dex's
+    collateral token (USDH/USDE/USDT0/...), resolved from meta(dex) by the caller."""
+    if collateral_by_prefix and ":" in coin:
+        ti = collateral_by_prefix.get(coin.split(":", 1)[0] + ":")
+        if ti is not None:
+            return ti.token_address, ti.symbol, ti.decimals, ti.is_stablecoin
+    return _USDC_TUPLE
+
+
 def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
-                        resolver: SpotMetaResolver, registry: TokenRegistry) -> list[dict]:
-    """Perp + spot fills -> USDC cashflow rows (+ spot base/quote token legs).
+                        resolver: SpotMetaResolver, registry: TokenRegistry,
+                        collateral_by_prefix: dict | None = None) -> list[dict]:
+    """Perp + spot fills -> collateral cashflow rows (+ spot base/quote token legs).
 
     tx_hash = schema.fill_tx_hash (wallet + tid); event_index = fixed LEG_* ordinal.
     """
@@ -135,11 +147,13 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
         t = f["time"]
         h = S.fill_tx_hash(wallet, f.get("tid"), time_ms=t, coin=coin, sz=f.get("sz"))
         fee = float(f.get("fee", 0) or 0)
-        # builderFee: separate deduction present in node data (absent on the public
-        # Info API today). Read defensively; treated as an extra fee leg.
-        builder_fee = float(f.get("builderFee", 0) or 0)
+        # builderFee / deployerFee: separate deductions present in node data (absent
+        # on the public Info API today). Folded into ONE builder-fee leg.
+        builder_fee = (float(f.get("builderFee", 0) or 0)
+                       + float(f.get("deployerFee", 0) or 0))
         closed = float(f.get("closedPnl", 0) or 0)
         fee_token = f.get("feeToken", S.USDC_TOKEN)
+        cash = perp_cash_token(coin, collateral_by_prefix)
 
         if _is_spot(coin):
             pair = resolver.resolve_coin(coin)
@@ -178,10 +192,10 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
                 rows.append(_ledger_row(
                     block_timestamp_ms=t, tx_hash=h, event_index=S.LEG_PERP_PNL,
                     event_type=S.EVT_PERP_PNL, wallet=wallet, counterparty=coin,
-                    token_address=S.USDC_ADDRESS, token_symbol=S.USDC_TOKEN,
-                    decimals=S.USDC_DECIMALS, amount=abs(closed),
+                    token_address=cash[0], token_symbol=cash[1],
+                    decimals=cash[2], amount=abs(closed),
                     direction=S.DIRECTION_IN if closed > 0 else S.DIRECTION_OUT,
-                    now_iso=now_iso, registry=registry, is_stablecoin=True))
+                    now_iso=now_iso, registry=registry, is_stablecoin=cash[3]))
             fee_leg = S.LEG_PERP_FEE
 
         # Fee leg. HL charges the fee in the RECEIVED asset: USDC for perps and
@@ -209,17 +223,19 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
                 event_index=(S.LEG_SPOT_BUILDER_FEE if _is_spot(coin)
                              else S.LEG_PERP_BUILDER_FEE),
                 event_type=S.EVT_PERP_FEE, wallet=wallet, counterparty=coin,
-                token_address=S.USDC_ADDRESS, token_symbol=S.USDC_TOKEN,
-                decimals=S.USDC_DECIMALS, amount=abs(builder_fee),
+                token_address=cash[0], token_symbol=cash[1],
+                decimals=cash[2], amount=abs(builder_fee),
                 direction=S.DIRECTION_OUT if builder_fee > 0 else S.DIRECTION_IN,
-                now_iso=now_iso, registry=registry, is_stablecoin=True))
+                now_iso=now_iso, registry=registry, is_stablecoin=cash[3]))
 
     return rows
 
 
 def map_funding_to_ledger(funding: list[dict], wallet: str, now_iso: str,
-                          registry: TokenRegistry) -> list[dict]:
-    """Funding events -> signed USDC rows. delta.usdc is already signed.
+                          registry: TokenRegistry,
+                          collateral_by_prefix: dict | None = None) -> list[dict]:
+    """Funding events -> signed collateral rows (USDC on the main dex; the dex's
+    collateral token for HIP-3 coins). delta.usdc is already signed.
     tx_hash = schema.funding_tx_hash(wallet, coin, time); event_index = LEG_FUNDING."""
     rows: list[dict] = []
     for e in funding:
@@ -227,16 +243,17 @@ def map_funding_to_ledger(funding: list[dict], wallet: str, now_iso: str,
         usdc = float(d.get("usdc", 0) or 0)
         if usdc == 0.0:
             continue
-        coin = d.get("coin")
+        coin = d.get("coin") or ""
+        cash = perp_cash_token(coin, collateral_by_prefix)
         rows.append(_ledger_row(
             block_timestamp_ms=e["time"],
             tx_hash=S.funding_tx_hash(wallet, coin, e["time"]),
             event_index=S.LEG_FUNDING,
             event_type=S.EVT_FUNDING, wallet=wallet, counterparty=coin,
-            token_address=S.USDC_ADDRESS, token_symbol=S.USDC_TOKEN,
-            decimals=S.USDC_DECIMALS, amount=abs(usdc),
+            token_address=cash[0], token_symbol=cash[1],
+            decimals=cash[2], amount=abs(usdc),
             direction=S.DIRECTION_IN if usdc > 0 else S.DIRECTION_OUT,
-            now_iso=now_iso, registry=registry, is_stablecoin=True))
+            now_iso=now_iso, registry=registry, is_stablecoin=cash[3]))
     return rows
 
 

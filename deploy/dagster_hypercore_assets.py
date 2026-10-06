@@ -25,9 +25,10 @@ def _run(context: AssetExecutionContext, args: list[str]) -> None:
     cmd = [PY, "-m", *args]
     context.log.info("running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
-    context.log.info(proc.stdout[-4000:])
+    # Python logging goes to stderr: keep the tail on success as well.
+    context.log.info("stdout: %s", proc.stdout[-4000:])
+    context.log.info("stderr: %s", proc.stderr[-4000:])
     if proc.returncode != 0:
-        context.log.error(proc.stderr[-4000:])
         raise RuntimeError(f"{args[0]} exited {proc.returncode}")
 
 
