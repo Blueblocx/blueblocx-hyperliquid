@@ -123,6 +123,11 @@ production use**), `NESSIE_URI` + `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/
   `networth_matches` check will surface it.
 - **Bridge identity** (Core USDC ↔ HyperEVM USDC) is a pending product decision;
   the two namespaces are kept separate until then.
-- **S3 backfill cost**: one hour file ≈ 27 MB (Requester Pays); the extractor only
-  fetches the gap the API could not serve.
+- **S3 backfill is mandatory for market-maker wallets**: the demo MM wallet does
+  ~5,000–8,500 fills **per hour** (measured from node_fills hour files), so the
+  Info API's 10k cap covers only ~80 minutes of its history; any longer window
+  comes from S3. Hour files are 25–70 MB lz4 (Requester Pays) and publish ~1h
+  after the hour; the extractor fetches only the gap the API could not serve,
+  reports missing/failed hours, and does not advance the watermark until the
+  window is complete.
 - **`group hash`**: `xxh64(addr, seed=0).abs() % 4000` matches Rust production.
