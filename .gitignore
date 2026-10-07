@@ -15,3 +15,6 @@ out/
 *.lz4
 *.log
 wallets.txt
+
+# scratch runs
+out_*/

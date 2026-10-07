@@ -92,10 +92,11 @@ production use**), `NESSIE_URI` + `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/
    rows, Σ raw USDC fees == −Σ `fee` rows, Σ raw funding == Σ `funding` rows, and
    row counts match (±$1) → `fidelity_ok`. This compares the API input to the
    emitted rows, so dropped/duplicated/sign-flipped rows fail it.
-2. **External**: perp `account_value_usd` == `portfolio.perpAllTime` latest value
-   (the HL UI number) → `oracle.account_value_matches`; and computed net worth
-   (perp − portfolio-margin overlap + spot + staked HYPE + vault equity) ==
-   `portfolio.allTime` within 1% → `oracle.networth_matches`.
+2. **External**: perp equity (main + HIP-3 dexes) == `portfolio.perpAllTime` latest
+   value (the HL UI number) → `oracle.account_value_matches`; and computed net
+   worth (perp − overlap with spot USDC + spot + staked HYPE + vault equity +
+   borrow/lend supply) == `portfolio.allTime` within 1% → `oracle.networth_matches`.
+   Validated on 7 live wallets (light, MM, HIP-3 trader, 48M whale, two lenders).
 3. **Structural**: `natural_key_ok` — no `(tx_hash, event_index, direction)`
    collision across wallets, no duplicates within the run.
 

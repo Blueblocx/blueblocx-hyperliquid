@@ -174,6 +174,39 @@ class IcebergPredicateSafetyTests(unittest.TestCase):
         self.assertIsNotNone(v.tzinfo)
 
 
+class LendingPositionTests(unittest.TestCase):
+    def _bl(self, op, amount, interest="0"):
+        return {"time": 1, "hash": "0x" + "ab" * 32,
+                "delta": {"type": "borrowLend", "token": "USDC", "operation": op,
+                          "amount": amount, "interestAmount": interest}}
+
+    def test_supply_minus_withdraw_plus_interest_matches_live_shape(self):
+        from hl_poc import analytics
+        # live wallet 0x4fb2…: supplies 32,567.98, withdraws 26,968.58, interest 6.6044 -> 5,606.00 (== oracle gap)
+        led = [self._bl("supply", "32567.98"), self._bl("withdraw", "26968.58", "6.6044")]
+        pos = analytics.lending_position(led)
+        self.assertAlmostEqual(pos["USDC"], 5606.0044, places=3)
+
+    def test_non_pm_account_adds_lending_to_net_worth(self):
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "0.47", "hold": "0"}]}  # no `supplied` key
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
+                                        lending_by_token={"USDC": 5606.0})
+        self.assertAlmostEqual(a["lending_value_usd"], 5606.0)
+        self.assertAlmostEqual(a["net_worth"], 5606.47)
+
+    def test_pm_account_with_supplied_in_total_does_not_double_count(self):
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
+        spot = {"portfolioMarginEnabled": True,
+                "balances": [{"coin": "USDC", "token": 0, "total": "2603", "hold": "218", "spotHold": "358", "supplied": "2245"}]}
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
+                                        lending_by_token={"USDC": 2245.0})
+        self.assertEqual(a["lending_value_usd"], 0.0)
+        self.assertAlmostEqual(a["net_worth"], 2603.0)
+
+
 class CollateralTokenTests(unittest.TestCase):
     def test_hip3_coin_uses_dex_collateral(self):
         from hl_poc import mappers
@@ -227,23 +260,35 @@ class Hip3NetWorthTests(unittest.TestCase):
         self.assertAlmostEqual(a["account_value_other_dex_usd"], 300.0)
         self.assertAlmostEqual(a["net_worth"], 2000.0)
 
-    def test_hold_only_account_matching_perp_equity_is_overlap(self):
-        # live shape (HIP-3 trader): no spotHold, USDC.hold ≈ main + xyz equity
+    def test_hip3_trader_perp_equity_inside_spot_usdc_total(self):
+        # live shape (HIP-3 trader): no spotHold; oracle allTime == spot + staked,
+        # i.e. main+xyz perp equity (421,624) sits inside USDC.total (603,330)
         from hl_poc import analytics
         chs = {"marginSummary": {"accountValue": "276477"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "603330", "hold": "421308"}]}
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
                                         account_value_by_dex={"xyz": 145147.0})
-        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 421308.0)
-        self.assertAlmostEqual(a["net_worth"], 603330 + (421624 - 421308), places=0)
+        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 421624.0)
+        self.assertEqual(a["perp_spot_overlap_rule"], "usdc_total")
+        self.assertAlmostEqual(a["net_worth"], 603330.0)
 
-    def test_hold_from_resting_spot_orders_is_not_overlap(self):
+    def test_whale_perp_equity_inside_spot_usdc_total_even_when_hold_differs(self):
+        # live shape (48M whale): hold 4.57M != perp 6.79M, yet oracle == spot + staked
         from hl_poc import analytics
-        chs = {"marginSummary": {"accountValue": "500"}, "assetPositions": []}
-        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "2000", "hold": "1500"}]}
-        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW)
-        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 0.0)
-        self.assertAlmostEqual(a["net_worth"], 2500.0)
+        chs = {"marginSummary": {"accountValue": "6789174"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "23738617", "hold": "4572544"}]}
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
+                                        staking={"delegated": "249406"}, spot_price_by_symbol={"HYPE": 87.4})
+        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 6789174.0)
+        self.assertAlmostEqual(a["net_worth"], 23738617 + 249406 * 87.4, places=0)
+
+    def test_no_spot_usdc_row_means_no_overlap(self):
+        # live shape (market maker): equity only in the perp book
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "3182671"}, "assetPositions": []}
+        a = analytics.compute_analytics([], [], chs, {"balances": []}, 1_700_000_000_000, NOW)
+        self.assertEqual(a["perp_spot_overlap_rule"], "none")
+        self.assertAlmostEqual(a["net_worth"], 3182671.0)
 
 
 if __name__ == "__main__":

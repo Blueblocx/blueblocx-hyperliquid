@@ -91,16 +91,21 @@ total_perp      = clearinghouseState(main).accountValue + Σ clearinghouseState(
                                                                             -- HIP-3 dexes have their own margin
                                                                             --   accounts; portfolio.perpAllTime ==
                                                                             --   this sum (verified live)
-collateral      = spot USDC.spotHold if present                             -- portfolio-margin accounts
-                  else USDC.hold if (portfolioMarginEnabled or |hold − total_perp| ≤ 10%·total_perp)
-                  else 0                                                    -- plain `hold` = resting spot orders
-net_worth       = total_perp − min(total_perp, collateral)                  -- unified accounts keep perp collateral
-                                                                            --   inside spot USDC.total: never add twice
+overlap         = min(total_perp, spot USDC.total)                          -- a wallet WITH a spot USDC balance
+                                                                            --   reports its perp equity INSIDE that
+                                                                            --   total (spotHold == it when present);
+                                                                            --   `hold` is NOT a usable signal
+net_worth       = total_perp − overlap
                 + Σ spot balance × price  (stables at $1)                   -- spotClearinghouseState
                 + staked HYPE × HYPE price                                  -- delegatorSummary
                 + Σ vault equity                                            -- userVaultEquities
-                -- validated on 3 wallets (plain MM: no spot USDC row → overlap 0; portfolio-margin
-                -- wallet via spotHold; HIP-3 trader via hold ≈ main+xyz). networth_matches guards it.
+                + Σ lending supply                                          -- borrow/lend market: Σsupply − Σwithdraw
+                                                                            --   + Σinterest from the FULL ledger history
+                                                                            --   (no Info endpoint exists); skipped when
+                                                                            --   the USDC row exposes `supplied` (PM
+                                                                            --   accounts include it in total already)
+                -- validated on 7 live wallets incl. a 48M whale, a HIP-3 trader and two lenders;
+                -- networth_matches guards the rule per wallet every run.
 ```
 
 ## 4. Token identity, decimals, stables

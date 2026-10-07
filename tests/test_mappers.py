@@ -268,14 +268,18 @@ class NetWorthCompositionTests(unittest.TestCase):
             spot_price_by_symbol={"HYPE": 100.0},
             staking={"delegated": staked}, token_usd_price={}, vault_equities=vaults or [])
 
-    def test_plain_account_adds_full_perp_value(self):
-        a = self._analytics()  # no spotHold -> no overlap
-        self.assertEqual(a["perp_spot_overlap_usd"], 0.0)
-        self.assertAlmostEqual(a["net_worth"], 500 + 2000 + 200)
+    def test_spot_usdc_row_absorbs_perp_equity(self):
+        # a wallet WITH a spot USDC balance reports perp equity inside USDC.total
+        # (verified on 4 live wallets); the perp book is not added on top
+        a = self._analytics()
+        self.assertEqual(a["perp_spot_overlap_usd"], 500.0)
+        self.assertEqual(a["perp_spot_overlap_rule"], "usdc_total")
+        self.assertAlmostEqual(a["net_worth"], 2000 + 200)
 
     def test_portfolio_margin_account_does_not_double_count_perp(self):
-        a = self._analytics(spot_hold="500")  # perp collateral already in spot USDC
+        a = self._analytics(spot_hold="500")  # spotHold == perp equity
         self.assertAlmostEqual(a["perp_spot_overlap_usd"], 500.0)
+        self.assertEqual(a["perp_spot_overlap_rule"], "spotHold")
         self.assertAlmostEqual(a["net_worth"], 2000 + 200)
 
     def test_l4x_snapshot_carries_dex(self):
@@ -292,7 +296,8 @@ class NetWorthCompositionTests(unittest.TestCase):
         a = self._analytics(vaults=[{"equity": "1000"}, {"equity": "0.5"}], staked="3")
         self.assertAlmostEqual(a["vault_value_usd"], 1000.5)
         self.assertAlmostEqual(a["staked_value_usd"], 300.0)
-        self.assertAlmostEqual(a["net_worth"], 500 + 2000 + 200 + 300 + 1000.5)
+        # perp (500) is inside the spot USDC total (2000) -> not added again
+        self.assertAlmostEqual(a["net_worth"], 2000 + 200 + 300 + 1000.5)
 
     def test_non_usdc_fee_leg_is_valued_not_summed_raw(self):
         from hl_poc import analytics

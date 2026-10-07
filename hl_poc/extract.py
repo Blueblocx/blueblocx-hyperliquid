@@ -186,6 +186,10 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
         "staking": guarded("staking", lambda: client.delegator_summary(wallet), {}),
         "portfolio": guarded("portfolio", lambda: client.portfolio(wallet), []),
         "vaults": guarded("vaults", lambda: client.user_vault_equities(wallet), []),
+        # full ledger history (cheap: few hundred entries even for whales) — the
+        # only source for the outstanding borrow/lend supply, which portfolio
+        # counts but spotClearinghouseState omits for non-PM accounts
+        "ledger_all": guarded("ledger_all", lambda: client.user_non_funding_ledger_updates(wallet, 0, now_ms), []),
     }
     for dex in (dexes or []):
         tasks[f"chs:{dex}"] = guarded(
@@ -460,7 +464,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                                          window_start_ms=coverage_start_ms,
                                          fills_truncated=(fills_saturated
                                                           or bool(prior_wm.get("fills_truncated"))),
-                                         account_value_by_dex=account_value_by_dex)
+                                         account_value_by_dex=account_value_by_dex,
+                                         lending_by_token=analytics.lending_position(d.get("ledger_all") or []))
         oracle = analytics.validate_against_oracle(wa, portfolio, now_ms)
         recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
         recon["unmapped_ledger_types"] = unknown

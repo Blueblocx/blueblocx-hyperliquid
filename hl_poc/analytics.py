@@ -47,11 +47,42 @@ def _window_sum(rows, event_types, now_ms, days, price_of=None):
     return total
 
 
+def lending_position(ledger_updates) -> dict[str, float]:
+    """Outstanding supply to Hyperliquid's borrow/lend market per token, derived
+    from the FULL ledger history: Σ supply − Σ withdraw + Σ realised interest.
+
+    There is no Info endpoint for lending state (all candidates return 422), and
+    for non-portfolio-margin accounts the supplied USDC is NOT in
+    spotClearinghouseState.balances — yet portfolio.allTime counts it. Verified:
+    0x4fb2… 5,599.40 + 6.60 interest = 5,606.00 == oracle gap exactly; 0xf481…
+    722,867 vs 724,023 (0.13% = accrued, not yet realised, interest).
+    """
+    pos: dict[str, float] = {}
+    for e in ledger_updates or []:
+        d = e.get("delta") or {}
+        if d.get("type") != "borrowLend":
+            continue
+        tok = d.get("token") or "USDC"
+        amt = float(d.get("amount", 0) or 0)
+        interest = float(d.get("interestAmount", 0) or 0)
+        op = (d.get("operation") or "").lower()
+        if op == "supply":
+            pos[tok] = pos.get(tok, 0.0) + amt
+        elif op in ("withdraw", "unsupply", "withdrawsupply"):
+            pos[tok] = pos.get(tok, 0.0) - amt
+        elif op in ("borrow",):
+            pos[tok] = pos.get(tok, 0.0) - amt          # a borrow is a liability
+        elif op in ("repay",):
+            pos[tok] = pos.get(tok, 0.0) + amt
+        pos[tok] = pos.get(tok, 0.0) + interest
+    return {k: v for k, v in pos.items() if abs(v) > 1e-9}
+
+
 def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
                       windows=(1, 7, 30), spot_price_by_symbol=None, staking=None,
                       token_usd_price=None, vault_equities=None,
                       window_start_ms=None, fills_truncated=False,
-                      account_value_by_dex=None):
+                      account_value_by_dex=None, lending_by_token=None):
     """Build the HyperCore contribution to all_chain.wallet_analytics.
 
     Every ledger row is valued in USD via token_usd_price (stables = $1, spot
@@ -161,36 +192,53 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
     other_dex_value = sum(float(v or 0) for k, v in (account_value_by_dex or {}).items() if k)
     total_perp = account_value + other_dex_value
 
-    # Overlap rule (data-driven, validated on 3 wallets): unified accounts keep
-    # the perp collateral inside spot USDC.total and expose it as USDC.spotHold
-    # (portfolio-margin flag) or, on some accounts, only as USDC.hold ≈ perp
-    # equity. `hold` alone can also mean resting spot orders, so it is used only
-    # when the account is flagged portfolio-margin or hold matches total perp
-    # equity within 10%. The overlap applies to TOTAL perp equity (all dexes).
+    # Overlap rule (data-driven; fits every wallet observed so far — light
+    # portfolio-margin wallet, plain MM, HIP-3 trader, 48M whale): when a wallet
+    # HAS a spot USDC balance, Hyperliquid reports its perp equity INSIDE that
+    # USDC.total (unified balance; `spotHold`, when present, equals it). A wallet
+    # with no spot USDC row keeps its equity only in the perp book. So:
+    #     overlap = min(total_perp, spot USDC.total)
+    # `hold` (resting-order / margin hold) is NOT a reliable signal (whale: hold
+    # 4.57M vs perp 6.79M, yet the full 6.79M was inside USDC.total). The
+    # networth oracle guards the rule per wallet; the rule that fired is reported.
+    usdc_total = 0.0
     spot_hold = 0.0
-    hold = 0.0
     for b in (spot_state.get("balances", []) if spot_state else []):
         if b.get("coin") == "USDC":
             try:
+                usdc_total = float(b.get("total", 0) or 0)
                 spot_hold = float(b.get("spotHold", 0) or 0)
-                hold = float(b.get("hold", 0) or 0)
             except (TypeError, ValueError):
-                spot_hold, hold = 0.0, 0.0
-    pm_flag = bool((spot_state or {}).get("portfolioMarginEnabled"))
-    if spot_hold > 0:
-        collateral = spot_hold
-    elif hold > 0 and total_perp > 0 and (pm_flag or abs(hold - total_perp) / total_perp <= 0.10):
-        collateral = hold
-    else:
-        collateral = 0.0
-    perp_overlap = min(total_perp, collateral)
+                usdc_total, spot_hold = 0.0, 0.0
+    perp_overlap = min(total_perp, usdc_total) if usdc_total > 0 else 0.0
+    overlap_rule = ("none" if perp_overlap == 0 else
+                    ("spotHold" if spot_hold and abs(spot_hold - perp_overlap) / perp_overlap < 0.05
+                     else "usdc_total"))
     perp_contrib = total_perp - perp_overlap
 
-    net_worth = perp_contrib + spot_value + staked_value + vault_value
+    # --- lending market supply (not in spot balances for non-PM accounts) --------
+    # For portfolio-margin accounts the USDC row carries `supplied` and USDC.total
+    # already includes it (light wallet: oracle matched without this term), so the
+    # ledger-derived position is added only when the balance row does NOT expose it.
+    lending_value = 0.0
+    lending_detail: dict[str, float] = {}
+    exposes_supplied = any("supplied" in b for b in (spot_state.get("balances", []) if spot_state else []))
+    if not exposes_supplied:
+        for tok, qty in (lending_by_token or {}).items():
+            px = 1.0 if tok.upper() in stables else prices_by_sym.get(tok)
+            if px is None:
+                unvalued["count"] += 1
+                unvalued["token_addresses"].add(f"lending:{tok}")
+                continue
+            lending_detail[tok] = round(qty * px, 6)
+            lending_value += qty * px
+
+    net_worth = perp_contrib + spot_value + staked_value + vault_value + lending_value
 
     # --- stable_coin_pct: stable holdings (spot stables + perp USDC) / net worth
     # perp accountValue is USDC-denominated collateral, so it counts as stable.
-    stable_total = stable_value + perp_contrib + vault_value
+    stable_total = stable_value + perp_contrib + vault_value + sum(
+        v for t, v in lending_detail.items() if t.upper() in stables)
     stable_pct = (stable_total / net_worth) if net_worth else 0.0
     all_priced = all(b["priced"] for b in spot_balances)
 
@@ -217,7 +265,10 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
         "staked_hype": round(staked_hype, 6),
         "staked_value_usd": round(staked_value, 6),
         "vault_value_usd": round(vault_value, 6),
+        "lending_value_usd": round(lending_value, 6),
+        "lending_by_token_usd": lending_detail,
         "perp_spot_overlap_usd": round(perp_overlap, 6),
+        "perp_spot_overlap_rule": overlap_rule,
         "account_value_other_dex_usd": round(other_dex_value, 6),
         "account_value_by_dex": {k: round(float(v or 0), 6)
                                  for k, v in (account_value_by_dex or {}).items()},
