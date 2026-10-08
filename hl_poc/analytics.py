@@ -221,14 +221,18 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
                 spot_bid_lock += float(o.get("sz", 0) or 0) * float(o.get("limitPx", 0) or 0)
             except (TypeError, ValueError):
                 pass
+    # USDC.hold not explained by resting spot BUY orders is USDC reserved for the
+    # perp account: ≈ totalMarginUsed while positions are open (whale 4.57M vs
+    # 4.44M), == perp accountValue when none are (0xfe35…: 34,618.95 both). Any
+    # material unexplained hold therefore marks a unified account; margin used
+    # alone cannot be the test because it is 0 for a flat unified account.
     hold_perp = max(0.0, hold - spot_bid_lock)
-    margin_used = float((chs.get("marginSummary", {}) or {}).get("totalMarginUsed", 0) or 0)
     if usdc_total <= 0 or total_perp <= 0:
         unified, overlap_rule = False, "none"
     elif spot_hold > 0:
         unified, overlap_rule = True, "spotHold"
-    elif margin_used > 0 and hold_perp >= 0.5 * margin_used:
-        unified, overlap_rule = True, "hold_margin"
+    elif hold_perp >= max(1.0, 0.02 * total_perp):
+        unified, overlap_rule = True, "hold_reserved"
     else:
         unified, overlap_rule = False, "separate"
     perp_overlap = min(total_perp, usdc_total) if unified else 0.0

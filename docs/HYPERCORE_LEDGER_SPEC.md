@@ -92,9 +92,11 @@ total_perp      = clearinghouseState(main).accountValue + Σ clearinghouseState(
                                                                             --   accounts; portfolio.perpAllTime ==
                                                                             --   this sum (verified live)
 unified         = USDC.spotHold > 0                                         -- portfolio-margin flag, or
-                  or (USDC.hold − Σ spot BUY order notional) ≥ ½·perp totalMarginUsed
-                                                                            -- spot USDC reserved as perp margin
-                                                                            --   (48M whale: 4.57M vs 4.44M)
+                  or (USDC.hold − Σ spot BUY order notional) ≥ max(1, 2%·total_perp)
+                                                                            -- spot USDC reserved for the perp account:
+                                                                            --   ≈ margin used while positions are open
+                                                                            --   (whale 4.57M vs 4.44M), == perp equity
+                                                                            --   when flat (0xfe35…: 34,618.95 both)
 overlap         = min(total_perp, spot USDC.total) if unified else 0        -- unified accounts report perp equity
                                                                             --   INSIDE spot USDC.total; separate
                                                                             --   accounts (hold == 0, MM with no

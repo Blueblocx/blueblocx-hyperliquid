@@ -268,9 +268,19 @@ class Hip3NetWorthTests(unittest.TestCase):
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "603330", "hold": "421308"}]}
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
                                         account_value_by_dex={"xyz": 145147.0})
-        self.assertEqual(a["perp_spot_overlap_rule"], "hold_margin")
+        self.assertEqual(a["perp_spot_overlap_rule"], "hold_reserved")
         self.assertAlmostEqual(a["perp_spot_overlap_usd"], 421624.0)
         self.assertAlmostEqual(a["net_worth"], 603330.0)
+
+    def test_flat_unified_account_hold_equals_perp_equity(self):
+        # live shape (0xfe35…): no open positions (margin used 0) but hold == perp
+        # accountValue; oracle allTime == spot USDC total (46,392)
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "34618.945332", "totalMarginUsed": "0.0"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "46392.2910905", "hold": "34618.945332"}]}
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW)
+        self.assertEqual(a["perp_spot_overlap_rule"], "hold_reserved")
+        self.assertAlmostEqual(a["net_worth"], 46392.2910905, places=4)
 
     def test_whale_unified_hold_minus_spot_bids_matches_margin(self):
         # live shape (48M whale): hold 4.63M, spot bids lock 0.06M, margin used 4.44M
@@ -281,7 +291,7 @@ class Hip3NetWorthTests(unittest.TestCase):
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
                                         staking={"delegated": "249406"}, spot_price_by_symbol={"HYPE": 87.4},
                                         open_orders=orders)
-        self.assertEqual(a["perp_spot_overlap_rule"], "hold_margin")
+        self.assertEqual(a["perp_spot_overlap_rule"], "hold_reserved")
         self.assertAlmostEqual(a["perp_spot_overlap_usd"], 7407327.0)
         self.assertAlmostEqual(a["net_worth"], 24531182 + 249406 * 87.4, places=0)
 
