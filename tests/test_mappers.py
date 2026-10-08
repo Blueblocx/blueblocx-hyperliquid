@@ -262,19 +262,19 @@ class NetWorthCompositionTests(unittest.TestCase):
         if spot_hold is not None:
             usdc["spotHold"] = spot_hold
         spot_state = {"balances": [usdc, {"coin": "HYPE", "token": 150, "total": "2"}]}
-        chs = {"marginSummary": {"accountValue": account_value}, "assetPositions": []}
+        chs = {"marginSummary": {"accountValue": account_value, "totalMarginUsed": "100"},
+               "assetPositions": []}
         return analytics.compute_analytics(
             [], [], chs, spot_state, 1_700_000_000_000, NOW,
             spot_price_by_symbol={"HYPE": 100.0},
             staking={"delegated": staked}, token_usd_price={}, vault_equities=vaults or [])
 
-    def test_spot_usdc_row_absorbs_perp_equity(self):
-        # a wallet WITH a spot USDC balance reports perp equity inside USDC.total
-        # (verified on 4 live wallets); the perp book is not added on top
+    def test_separate_account_adds_perp_on_top_of_spot(self):
+        # spot USDC with hold 0 and perp margin > 0 -> accounts are separate
         a = self._analytics()
-        self.assertEqual(a["perp_spot_overlap_usd"], 500.0)
-        self.assertEqual(a["perp_spot_overlap_rule"], "usdc_total")
-        self.assertAlmostEqual(a["net_worth"], 2000 + 200)
+        self.assertEqual(a["perp_spot_overlap_usd"], 0.0)
+        self.assertEqual(a["perp_spot_overlap_rule"], "separate")
+        self.assertAlmostEqual(a["net_worth"], 500 + 2000 + 200)
 
     def test_portfolio_margin_account_does_not_double_count_perp(self):
         a = self._analytics(spot_hold="500")  # spotHold == perp equity
@@ -296,8 +296,7 @@ class NetWorthCompositionTests(unittest.TestCase):
         a = self._analytics(vaults=[{"equity": "1000"}, {"equity": "0.5"}], staked="3")
         self.assertAlmostEqual(a["vault_value_usd"], 1000.5)
         self.assertAlmostEqual(a["staked_value_usd"], 300.0)
-        # perp (500) is inside the spot USDC total (2000) -> not added again
-        self.assertAlmostEqual(a["net_worth"], 2000 + 200 + 300 + 1000.5)
+        self.assertAlmostEqual(a["net_worth"], 500 + 2000 + 200 + 300 + 1000.5)
 
     def test_non_usdc_fee_leg_is_valued_not_summed_raw(self):
         from hl_poc import analytics

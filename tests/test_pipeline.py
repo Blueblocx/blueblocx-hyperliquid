@@ -250,7 +250,7 @@ class MergeRowsTests(unittest.TestCase):
 class Hip3NetWorthTests(unittest.TestCase):
     def test_overlap_applies_to_total_perp_equity_with_spot_hold(self):
         from hl_poc import analytics
-        chs = {"marginSummary": {"accountValue": "500"}, "assetPositions": []}
+        chs = {"marginSummary": {"accountValue": "500", "totalMarginUsed": "50"}, "assetPositions": []}
         # unified account: collateral for main+xyz (800) is inside spot USDC total
         spot = {"portfolioMarginEnabled": True,
                 "balances": [{"coin": "USDC", "token": 0, "total": "2000", "spotHold": "800"}]}
@@ -260,27 +260,43 @@ class Hip3NetWorthTests(unittest.TestCase):
         self.assertAlmostEqual(a["account_value_other_dex_usd"], 300.0)
         self.assertAlmostEqual(a["net_worth"], 2000.0)
 
-    def test_hip3_trader_perp_equity_inside_spot_usdc_total(self):
-        # live shape (HIP-3 trader): no spotHold; oracle allTime == spot + staked,
-        # i.e. main+xyz perp equity (421,624) sits inside USDC.total (603,330)
+    def test_hip3_trader_unified_via_hold_margin(self):
+        # live shape (HIP-3 trader): no spotHold; hold ≈ perp margin reserved from
+        # spot; oracle allTime == spot + staked (perp not additive)
         from hl_poc import analytics
-        chs = {"marginSummary": {"accountValue": "276477"}, "assetPositions": []}
+        chs = {"marginSummary": {"accountValue": "276477", "totalMarginUsed": "400000"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "603330", "hold": "421308"}]}
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
                                         account_value_by_dex={"xyz": 145147.0})
+        self.assertEqual(a["perp_spot_overlap_rule"], "hold_margin")
         self.assertAlmostEqual(a["perp_spot_overlap_usd"], 421624.0)
-        self.assertEqual(a["perp_spot_overlap_rule"], "usdc_total")
         self.assertAlmostEqual(a["net_worth"], 603330.0)
 
-    def test_whale_perp_equity_inside_spot_usdc_total_even_when_hold_differs(self):
-        # live shape (48M whale): hold 4.57M != perp 6.79M, yet oracle == spot + staked
+    def test_whale_unified_hold_minus_spot_bids_matches_margin(self):
+        # live shape (48M whale): hold 4.63M, spot bids lock 0.06M, margin used 4.44M
         from hl_poc import analytics
-        chs = {"marginSummary": {"accountValue": "6789174"}, "assetPositions": []}
-        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "23738617", "hold": "4572544"}]}
+        chs = {"marginSummary": {"accountValue": "7407327", "totalMarginUsed": "4435961"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "24531182", "hold": "4633671"}]}
+        orders = [{"coin": "@292", "side": "B", "sz": "47784.01", "limitPx": "0.0402"}] * 30
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
-                                        staking={"delegated": "249406"}, spot_price_by_symbol={"HYPE": 87.4})
-        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 6789174.0)
-        self.assertAlmostEqual(a["net_worth"], 23738617 + 249406 * 87.4, places=0)
+                                        staking={"delegated": "249406"}, spot_price_by_symbol={"HYPE": 87.4},
+                                        open_orders=orders)
+        self.assertEqual(a["perp_spot_overlap_rule"], "hold_margin")
+        self.assertAlmostEqual(a["perp_spot_overlap_usd"], 7407327.0)
+        self.assertAlmostEqual(a["net_worth"], 24531182 + 249406 * 87.4, places=0)
+
+    def test_separate_accounts_hold_zero_no_overlap(self):
+        # live shape (0x16c9…): perp 257k funded in the perp book, spot USDC 58k with
+        # hold 0 -> oracle == perp + spot; nothing overlaps
+        from hl_poc import analytics
+        chs = {"marginSummary": {"accountValue": "257454", "totalMarginUsed": "48392"}, "assetPositions": []}
+        spot = {"balances": [{"coin": "USDC", "token": 0, "total": "58260", "hold": "0"},
+                             {"coin": "HYPE", "token": 150, "total": "3710"}]}
+        a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
+                                        spot_price_by_symbol={"HYPE": 88.0})
+        self.assertEqual(a["perp_spot_overlap_rule"], "separate")
+        self.assertEqual(a["perp_spot_overlap_usd"], 0.0)
+        self.assertAlmostEqual(a["net_worth"], 257454 + 58260 + 3710 * 88.0)
 
     def test_no_spot_usdc_row_means_no_overlap(self):
         # live shape (market maker): equity only in the perp book

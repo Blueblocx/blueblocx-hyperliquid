@@ -91,10 +91,14 @@ total_perp      = clearinghouseState(main).accountValue + Σ clearinghouseState(
                                                                             -- HIP-3 dexes have their own margin
                                                                             --   accounts; portfolio.perpAllTime ==
                                                                             --   this sum (verified live)
-overlap         = min(total_perp, spot USDC.total)                          -- a wallet WITH a spot USDC balance
-                                                                            --   reports its perp equity INSIDE that
-                                                                            --   total (spotHold == it when present);
-                                                                            --   `hold` is NOT a usable signal
+unified         = USDC.spotHold > 0                                         -- portfolio-margin flag, or
+                  or (USDC.hold − Σ spot BUY order notional) ≥ ½·perp totalMarginUsed
+                                                                            -- spot USDC reserved as perp margin
+                                                                            --   (48M whale: 4.57M vs 4.44M)
+overlap         = min(total_perp, spot USDC.total) if unified else 0        -- unified accounts report perp equity
+                                                                            --   INSIDE spot USDC.total; separate
+                                                                            --   accounts (hold == 0, MM with no
+                                                                            --   spot row) add perp on top
 net_worth       = total_perp − overlap
                 + Σ spot balance × price  (stables at $1)                   -- spotClearinghouseState
                 + staked HYPE × HYPE price                                  -- delegatorSummary

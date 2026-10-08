@@ -198,6 +198,12 @@ class InfoClient:
         Staked HYPE is real net worth NOT reflected in spotClearinghouseState."""
         return self._post({"type": "delegatorSummary", "user": user})
 
+    def open_orders(self, user: str) -> list[dict]:
+        """Resting orders (perp + spot). Spot BUY orders lock USDC in
+        spotClearinghouseState.USDC.hold; subtracting them isolates the part of
+        `hold` that is perp margin reserved from spot (unified-account signal)."""
+        return self._post({"type": "openOrders", "user": user}, est_items=200)
+
     def user_vault_equities(self, user: str) -> list[dict]:
         """Equity the user holds in vaults: [{vaultAddress, equity, lockedUntil...}].
         Vault deposits leave the perp/spot books, so this is net worth that NO

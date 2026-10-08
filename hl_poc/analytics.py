@@ -82,7 +82,7 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
                       windows=(1, 7, 30), spot_price_by_symbol=None, staking=None,
                       token_usd_price=None, vault_equities=None,
                       window_start_ms=None, fills_truncated=False,
-                      account_value_by_dex=None, lending_by_token=None):
+                      account_value_by_dex=None, lending_by_token=None, open_orders=None):
     """Build the HyperCore contribution to all_chain.wallet_analytics.
 
     Every ledger row is valued in USD via token_usd_price (stables = $1, spot
@@ -192,28 +192,46 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
     other_dex_value = sum(float(v or 0) for k, v in (account_value_by_dex or {}).items() if k)
     total_perp = account_value + other_dex_value
 
-    # Overlap rule (data-driven; fits every wallet observed so far — light
-    # portfolio-margin wallet, plain MM, HIP-3 trader, 48M whale): when a wallet
-    # HAS a spot USDC balance, Hyperliquid reports its perp equity INSIDE that
-    # USDC.total (unified balance; `spotHold`, when present, equals it). A wallet
-    # with no spot USDC row keeps its equity only in the perp book. So:
-    #     overlap = min(total_perp, spot USDC.total)
-    # `hold` (resting-order / margin hold) is NOT a reliable signal (whale: hold
-    # 4.57M vs perp 6.79M, yet the full 6.79M was inside USDC.total). The
-    # networth oracle guards the rule per wallet; the rule that fired is reported.
+    # Overlap rule — is this a UNIFIED account (perp margin drawn from spot USDC,
+    # so perp equity is already inside spot USDC.total) or a SEPARATE one (perp
+    # book funded on its own)? Verified on 6 live wallets:
+    #   * unified: USDC.spotHold present (portfolio-margin flag), OR the part of
+    #     USDC.hold not explained by resting spot BUY orders ≈ perp totalMarginUsed
+    #     (48M whale: hold 4.63M − bids 0.06M = 4.57M vs margin 4.44M; oracle ==
+    #     spot + staked, perp not additive)
+    #   * separate: no USDC row (MM) or hold == 0 while perp margin > 0 (0x16c9…:
+    #     oracle == perp + spot, no overlap)
+    # For unified accounts overlap = min(total_perp, USDC.total); else 0.
     usdc_total = 0.0
     spot_hold = 0.0
+    hold = 0.0
     for b in (spot_state.get("balances", []) if spot_state else []):
         if b.get("coin") == "USDC":
             try:
                 usdc_total = float(b.get("total", 0) or 0)
                 spot_hold = float(b.get("spotHold", 0) or 0)
+                hold = float(b.get("hold", 0) or 0)
             except (TypeError, ValueError):
-                usdc_total, spot_hold = 0.0, 0.0
-    perp_overlap = min(total_perp, usdc_total) if usdc_total > 0 else 0.0
-    overlap_rule = ("none" if perp_overlap == 0 else
-                    ("spotHold" if spot_hold and abs(spot_hold - perp_overlap) / perp_overlap < 0.05
-                     else "usdc_total"))
+                usdc_total, spot_hold, hold = 0.0, 0.0, 0.0
+    spot_bid_lock = 0.0
+    for o in (open_orders or []):
+        c = o.get("coin", "")
+        if ("/" in c or c.startswith("@")) and o.get("side") == "B":
+            try:
+                spot_bid_lock += float(o.get("sz", 0) or 0) * float(o.get("limitPx", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    hold_perp = max(0.0, hold - spot_bid_lock)
+    margin_used = float((chs.get("marginSummary", {}) or {}).get("totalMarginUsed", 0) or 0)
+    if usdc_total <= 0 or total_perp <= 0:
+        unified, overlap_rule = False, "none"
+    elif spot_hold > 0:
+        unified, overlap_rule = True, "spotHold"
+    elif margin_used > 0 and hold_perp >= 0.5 * margin_used:
+        unified, overlap_rule = True, "hold_margin"
+    else:
+        unified, overlap_rule = False, "separate"
+    perp_overlap = min(total_perp, usdc_total) if unified else 0.0
     perp_contrib = total_perp - perp_overlap
 
     # --- lending market supply (not in spot balances for non-PM accounts) --------

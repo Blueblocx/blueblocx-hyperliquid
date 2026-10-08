@@ -186,17 +186,36 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
         "staking": guarded("staking", lambda: client.delegator_summary(wallet), {}),
         "portfolio": guarded("portfolio", lambda: client.portfolio(wallet), []),
         "vaults": guarded("vaults", lambda: client.user_vault_equities(wallet), []),
+        "open_orders": guarded("open_orders", lambda: client.open_orders(wallet), []),
         # full ledger history (cheap: few hundred entries even for whales) — the
         # only source for the outstanding borrow/lend supply, which portfolio
         # counts but spotClearinghouseState omits for non-PM accounts
         "ledger_all": guarded("ledger_all", lambda: client.user_non_funding_ledger_updates(wallet, 0, now_ms), []),
     }
-    for dex in (dexes or []):
-        tasks[f"chs:{dex}"] = guarded(
-            f"chs:{dex}", (lambda dx: lambda: client.clearinghouse_state(wallet, dex=dx))(dex), {})
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futs = {k: pool.submit(fn) for k, fn in tasks.items()}
         out = {k: f.result() for k, f in futs.items()}
+    # HIP-3 dexes: query a dex's clearinghouse ONLY if the wallet touched it in
+    # this window (fills or funding coin prefixed "dex:"). Funding accrues hourly
+    # on every open position, so any open HIP-3 position surfaces in funding for
+    # windows >= 1h — this skips ~10 calls per wallet for the ~75% that never
+    # trade HIP-3 without missing open positions.
+    touched = set()
+    for f in (out.get("fills") or []):
+        c = f.get("coin", "")
+        if ":" in c:
+            touched.add(c.split(":", 1)[0])
+    for e in (out.get("funding") or []):
+        c = ((e.get("delta") or {}).get("coin") or "")
+        if ":" in c:
+            touched.add(c.split(":", 1)[0])
+    dex_tasks = {f"chs:{dx}": guarded(f"chs:{dx}", (lambda d: lambda: client.clearinghouse_state(wallet, dex=d))(dx), {})
+                 for dx in (dexes or []) if dx in touched}
+    if dex_tasks:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = {k: pool.submit(fn) for k, fn in dex_tasks.items()}
+            out.update({k: f.result() for k, f in futs.items()})
+    out["_dexes_queried"] = sorted(touched & set(dexes or []))
     out["_errors"] = errors
     return out
 
@@ -373,7 +392,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         fills, funding, ledger_updates = d["fills"], d["funding"], d["ledger"]
         chs, spot_state, staking, portfolio = d["chs"], d["spot_state"], d["staking"], d["portfolio"]
         vaults = d["vaults"]
-        chs_by_dex = {dx: d.get(f"chs:{dx}") or {} for dx in dexes}
+        chs_by_dex = {dx: d.get(f"chs:{dx}") or {} for dx in d.get("_dexes_queried", [])}
         fills_saturated = client.user_fills_saturated(fills, w_start_ms)
         s3_report = None
         if fills_saturated and s3_backfill:
@@ -465,7 +484,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                                          fills_truncated=(fills_saturated
                                                           or bool(prior_wm.get("fills_truncated"))),
                                          account_value_by_dex=account_value_by_dex,
-                                         lending_by_token=analytics.lending_position(d.get("ledger_all") or []))
+                                         lending_by_token=analytics.lending_position(d.get("ledger_all") or []),
+                                         open_orders=d.get("open_orders") or [])
         oracle = analytics.validate_against_oracle(wa, portfolio, now_ms)
         recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
         recon["unmapped_ledger_types"] = unknown
@@ -475,6 +495,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         recon["analysis_rows"] = len(analysis_rows)
         recon["s3_backfill"] = s3_report
         recon["hip3_dexes_with_equity"] = sorted(account_value_by_dex)
+        recon["hip3_dexes_queried"] = d.get("_dexes_queried", [])
         # Watermark rules:
         #  * a window that is still truncated (no/incomplete S3 backfill) does NOT
         #    advance through_ms, so a later --s3-backfill run re-pulls the same
