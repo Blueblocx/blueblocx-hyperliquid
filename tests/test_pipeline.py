@@ -141,6 +141,36 @@ class IncrementalWindowTests(unittest.TestCase):
                          10_000_000 - 3_600_000)
 
 
+class TruncationFlagTests(unittest.TestCase):
+    def _c(self):
+        from hl_poc.info_client import InfoClient
+        return InfoClient()
+
+    def test_cap_sized_but_window_covered_is_not_truncated(self):
+        # live: 12,757 fills whose oldest is 1.4 min after the window start
+        start = 1_700_000_000_000
+        fills = [{"time": start + 84_000}] * 12_757
+        self.assertFalse(self._c().user_fills_saturated(fills, start))
+
+    def test_cap_sized_with_hours_missing_is_truncated(self):
+        start = 1_700_000_000_000
+        fills = [{"time": start + 9 * 3_600_000}] * 12_954
+        self.assertTrue(self._c().user_fills_saturated(fills, start))
+
+    def test_new_wallet_below_count_is_not_truncated(self):
+        start = 1_700_000_000_000
+        fills = [{"time": start + 33 * 3_600_000}] * 9_300
+        self.assertFalse(self._c().user_fills_saturated(fills, start))
+
+
+class WeightModelTests(unittest.TestCase):
+    def test_documented_weights(self):
+        from hl_poc.info_client import InfoClient
+        self.assertEqual(InfoClient._weight_of({"type": "clearinghouseState"}, {}), 2)
+        self.assertEqual(InfoClient._weight_of({"type": "portfolio"}, [["day", {}]]), 20)
+        self.assertEqual(InfoClient._weight_of({"type": "userFillsByTime"}, [{}] * 2000), 120)
+
+
 class ClosedCandleTests(unittest.TestCase):
     def test_in_progress_candle_is_not_emitted(self):
         from hl_poc import prices

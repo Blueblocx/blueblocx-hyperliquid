@@ -110,13 +110,35 @@ class InfoClient:
             self._local.session = s
         return s
 
-    @staticmethod
-    def _weight_of(resp: Any) -> int:
-        n = len(resp) if isinstance(resp, list) else 0
-        return 20 + n // 20
+    # Hyperliquid's documented per-request weights (rate-limits page):
+    #   clearinghouseState / spotClearinghouseState ............ 2
+    #   paginated history (userFillsByTime, userFunding,
+    #     userNonFundingLedgerUpdates, candleSnapshot) .......... 20 + items/20
+    #   everything else (meta, portfolio, openOrders, ...) ...... 20 flat
+    # Booking 20 + items/20 for every call overstated light wallets ~2.3x and
+    # halved throughput for nothing.
+    _WEIGHT_STATE = {"clearinghouseState", "spotClearinghouseState"}
+    _WEIGHT_PAGED = {"userFillsByTime", "userFills", "userFunding",
+                     "userNonFundingLedgerUpdates", "candleSnapshot"}
+
+    @classmethod
+    def _weight_of(cls, body: dict[str, Any], resp: Any) -> int:
+        t = body.get("type")
+        if t in cls._WEIGHT_STATE:
+            return 2
+        if t in cls._WEIGHT_PAGED:
+            n = len(resp) if isinstance(resp, list) else 0
+            return 20 + n // 20
+        return 20
 
     def _post(self, body: dict[str, Any], est_items: int = 0) -> Any:
-        est = 20 + est_items // 20
+        t = body.get("type")
+        if t in self._WEIGHT_STATE:
+            est = 2
+        elif t in self._WEIGHT_PAGED:
+            est = 20 + est_items // 20
+        else:
+            est = 20
         backoff = 1.0
         last_err: Exception | None = None
         for attempt in range(1, _MAX_RETRIES + 1):
@@ -129,7 +151,7 @@ class InfoClient:
                     raise requests.HTTPError(f"HTTP {r.status_code}")
                 r.raise_for_status()
                 data = r.json()
-                self._budget.settle(slot, self._weight_of(data))
+                self._budget.settle(slot, self._weight_of(body, data))
                 return data
             except Exception as e:  # noqa: BLE001 — POC: retry everything transient
                 last_err = e
@@ -256,11 +278,22 @@ class InfoClient:
             time.sleep(_PAGE_SLEEP_S)
         return out
 
-    def user_fills_saturated(self, fills: list[dict], start_ms: int) -> bool:
-        """True if the 10k-fill API cap likely truncated history (the API never
-        returns fills older than the ~10,000 most recent, so hitting that count
-        means the requested window was not fully served)."""
-        return len(fills) >= 10000
+    def user_fills_saturated(self, fills: list[dict], start_ms: int,
+                             gap_tolerance_ms: int = 3_600_000) -> bool:
+        """True if the API cap truncated the requested window.
+
+        The cap is NOT exactly 10k: live runs returned 10,773–21,596 fills for
+        capped wallets. So two conditions are required: a cap-sized response
+        (>= 10,000 fills) AND the oldest returned fill lying more than
+        `gap_tolerance_ms` after the window start. A cap-sized response whose
+        oldest fill is within minutes of the window start covered the window
+        (3 of 8 flagged wallets in a 39-wallet sample were such false positives);
+        a wallet that simply started trading mid-window is below the count and
+        is never flagged."""
+        if len(fills) < 10000:
+            return False
+        oldest = min((int(f.get("time", 0) or 0) for f in fills), default=start_ms)
+        return oldest - start_ms > gap_tolerance_ms
 
     def user_funding(self, user: str, start_ms: int, end_ms: int) -> list[dict]:
         return self._paged_ledger("userFunding", user, start_ms, end_ms)
