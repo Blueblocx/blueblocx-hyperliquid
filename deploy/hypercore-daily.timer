@@ -1,0 +1,15 @@
+# /etc/systemd/system/hypercore-daily.timer
+#
+# 00:20 UTC: Hyperliquid's midnight dust conversions have settled and the 23:00
+# S3 hour file (published ~00:02) is available, so the previous day is complete.
+[Unit]
+Description=Run hypercore-daily.service once a day
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=hypercore-daily.service
+
+[Install]
+WantedBy=timers.target

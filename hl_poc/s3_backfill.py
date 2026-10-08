@@ -70,17 +70,11 @@ class S3Result:
                 "fills": {w: len(v) for w, v in self.fills.items()}}
 
 
-def load_dotenv(path: str | Path = ".env") -> None:
-    """Minimal .env loader (no dependency). Never logs values."""
-    p = Path(path)
-    if not p.exists():
-        return
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+def load_dotenv(path: str | Path | None = None) -> None:
+    """Back-compat shim for config.load_env (explicit path, $HL_ENV_FILE, ./.env,
+    <repo>/.env; never overrides the process environment; never logs values)."""
+    from . import config
+    config.load_env(path)
 
 
 def _client():

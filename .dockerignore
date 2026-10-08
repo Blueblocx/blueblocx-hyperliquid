@@ -1,0 +1,20 @@
+# secrets — never inside an image layer
+.env
+.env.*
+!.env.example
+key
+*.pem
+*.key
+credentials*
+
+# local state / scratch
+.venv/
+out/
+out_*/
+*.lz4
+*.log
+wallets.txt
+__pycache__/
+*.pyc
+.git/
+.claude/

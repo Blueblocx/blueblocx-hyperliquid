@@ -39,8 +39,11 @@ _PER_RESP_LEDGER = 500
 _CANDLE_CAP = 5000            # API returns at most this many, most recent first
 
 # Default budget below the documented 1200/min to leave headroom for other
-# clients on the same IP (e.g. the TS platform-backend poller).
-DEFAULT_WEIGHT_BUDGET = int(os.environ.get("HL_WEIGHT_BUDGET", "900"))
+# clients on the same IP (e.g. the TS platform-backend poller). HL_WEIGHT_BUDGET /
+# HL_INFO_URL / HL_HTTP_TIMEOUT are read when a client is CONSTRUCTED (after the
+# .env file has been loaded), never at import time.
+DEFAULT_WEIGHT_BUDGET = 900
+DEFAULT_TIMEOUT_S = 30
 
 
 def interval_for_range(days: float) -> str:
@@ -95,12 +98,15 @@ class _WeightBudget:
 
 
 class InfoClient:
-    def __init__(self, url: str = DEFAULT_URL, timeout: int = 30,
-                 weight_budget: int = DEFAULT_WEIGHT_BUDGET):
-        self.url = url
-        self.timeout = timeout
+    def __init__(self, url: str | None = None, timeout: int | None = None,
+                 weight_budget: int | None = None):
+        self.url = url or os.environ.get("HL_INFO_URL") or DEFAULT_URL
+        self.timeout = int(timeout if timeout is not None
+                           else (os.environ.get("HL_HTTP_TIMEOUT") or DEFAULT_TIMEOUT_S))
+        budget = (weight_budget if weight_budget is not None
+                  else int(os.environ.get("HL_WEIGHT_BUDGET") or DEFAULT_WEIGHT_BUDGET))
         self._local = threading.local()
-        self._budget = _WeightBudget(weight_budget)
+        self._budget = _WeightBudget(budget)
 
     def _session(self) -> requests.Session:
         s = getattr(self._local, "session", None)

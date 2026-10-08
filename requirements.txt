@@ -1,0 +1,11 @@
+# Runtime dependencies (direct), pinned to the versions the pipeline was validated
+# with (39-wallet live run, 2026-10-08). Install together with constraints.txt to
+# pin the transitive closure too:
+#     pip install -r requirements.txt -c constraints.txt
+requests==2.34.2
+xxhash==3.8.1
+boto3==1.43.108
+lz4==4.4.5
+pyarrow==25.0.1
+pyiceberg[sql-sqlite]==0.12.0
+tzdata==2026.5

@@ -37,7 +37,8 @@ numbers exact. This repo covers HyperCore only.
 | `hl_poc/extract.py` | per-wallet (or multi-wallet) extract → L1 / L4x / gates / analytics contribution; thread-pooled Info API calls under a weight budget; **upserts** every CSV by natural key; `--incremental` (per-wallet watermark, 1h overlap), `--s3-backfill` (fills beyond the 10k API cap), `--iceberg` (lift), HIP-3 dexes snapshotted per `perpDexs` |
 | `hl_poc/s3_backfill.py` | fills from `s3://hl-mainnet-node-data/node_fills_by_block/hourly/` (lz4 JSON lines, Requester Pays); same fill shape as the API plus `builderFee`; verified tid-for-tid equal to the API on an overlapping hour |
 | `hl_poc/iceberg_load.py` | lift CSVs into Iceberg via pyiceberg — schemas parsed from `docs/PROPOSED_SCHEMA.sql`; REST/Nessie when `NESSIE_URI` is set, else a local SQLite catalog under `out/iceberg/`; facts are insert-if-absent, snapshots/dimensions replace-by-key; writes `control.table_watermarks` |
-| `hl_poc/daily.py` | one-command daily run for a wallet list (incremental + HIP-3 + optional S3/Iceberg); `deploy/dagster_hypercore_assets.py` is the dagster asset template that wraps it |
+| `hl_poc/daily.py` | one-command daily run for a wallet list (incremental + HIP-3 + optional S3/Iceberg) under a single-flight lock; writes the run summary and POSTs the alert webhook; `deploy/dagster_hypercore_assets.py` is the dagster asset template that wraps it |
+| `hl_poc/config.py`, `hl_poc/ops.py`, `hl_poc/preflight.py` | env/.env/logging (`ENV_VARS` is the authoritative list), atomic writes + lock + summary + alert, pre-run health check |
 | `hl_poc/evm_extract.py` | **HyperEVM** per-wallet ERC-20 extract → `out/hyperevm/*` (separate namespace; same `standard="ERC20"` / metadata / upsert invariants; production should use the atlas EVM path) |
 | `hl_poc/price_job.py` | **shared per-token** L3 price asset (`l3_token_price_usd_1m`); interval chosen from range because `candleSnapshot` only serves the ~5000 most recent candles |
 | `hl_poc/mappers.py` | fills / funding / ledger → `l1_wallet_ledger` rows (the spec, executable) |
@@ -46,11 +47,27 @@ numbers exact. This repo covers HyperCore only.
 | `hl_poc/info_client.py` | Info API client: retries, **proactive weight budget**, thread-safe sessions, pagination |
 | `tests/test_mappers.py` | cross-wallet key uniqueness, fixed ordinals, idempotency, dust tid=0, net-zero internal moves, non-USDC quote pairs |
 
+## Production
+**Server deployment is documented in [`docs/DEPLOY.md`](docs/DEPLOY.md)** (host
+requirements, install, env, preflight, first run, systemd/cron/Docker scheduling,
+monitoring, upgrade, what still lives in atlas). The pieces:
+
+| piece | where |
+|---|---|
+| pinned dependencies | `requirements.txt` + `constraints.txt` (full transitive pin set) |
+| configuration | environment variables only, documented in `hl_poc/config.py` (`ENV_VARS`); `deploy/.env.example` mirrors it; `.env` is loaded without overriding the process env |
+| health check | `python -m hl_poc.preflight [--offline] [--iceberg --s3]` — deps, tzdata, DDL, paths, env sanity, HL API + clock skew, S3 requester-pays, Nessie REST; never prints secrets |
+| scheduler entry point | `python -m hl_poc.daily` — lock, incremental run, run summary (`_run_summary.json`, `_run_history.jsonl`), webhook alert; exit 0/1/2/3 |
+| scheduling | `deploy/hypercore-daily.{service,timer}` (systemd), `deploy/run_daily.sh` + `deploy/crontab.example` (cron), `Dockerfile` (batch image), `deploy/dagster_hypercore_assets.py` (template) |
+| state hygiene | atomic writes for every state file; staged CSVs pruned to `HL_RETENTION_DAYS` after a successful Iceberg lift |
+| CI | `.github/workflows/ci.yml` — tests on Python 3.12/3.13, offline preflight, Docker image build + in-container smoke |
+
 ## Run
 ```bash
-python -m venv .venv && ./.venv/Scripts/python -m pip install requests xxhash boto3 lz4 pyarrow "pyiceberg[sql-sqlite]" tzdata
-# (tzdata: pyarrow needs the IANA zone database for timestamptz columns on Windows)
+python -m venv .venv && ./.venv/Scripts/python -m pip install -r requirements.txt -c constraints.txt
+# (tzdata is in there: pyarrow needs the IANA zone database for timestamptz columns on Windows)
 ./.venv/Scripts/python -m unittest discover -s tests -t . -v
+./.venv/Scripts/python -m hl_poc.preflight --offline            # deps / DDL / env sanity
 
 # full history for a 10k-capped wallet, resumable, lifted into Iceberg (local catalog by default)
 ./.venv/Scripts/python -m hl_poc.extract --wallet 0xA --days 30 --s3-backfill --incremental --iceberg
@@ -68,12 +85,15 @@ python -m venv .venv && ./.venv/Scripts/python -m pip install requests xxhash bo
 # shared L3 price asset on its own
 ./.venv/Scripts/python -m hl_poc.price_job --spot HYPE,UBTC --perp BTC --days 30
 ```
-Env (`.env` is auto-loaded, never committed): `HL_INFO_URL` (default mainnet),
-`HL_WEIGHT_BUDGET` (default 900/min; HL caps at 1200 per IP — leave headroom for
-other pollers on the same IP), `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (S3
-backfill, Requester Pays — **rotate the key that was pasted in chat before any
-production use**), `NESSIE_URI` + `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/
-`S3_SECRET_KEY` (Iceberg REST; unset → local catalog), `HYPEREVM_RPC_URL`.
+Env (`.env` is auto-loaded, never committed; full list with defaults in
+`hl_poc/config.py`): `HL_INFO_URL` (default mainnet), `HL_WEIGHT_BUDGET` (default
+900/min; HL caps at 1200 per IP — leave headroom for other pollers on the same
+IP), `HL_OUT_DIR` (state directory), `HL_RETENTION_DAYS` (staged-CSV retention
+after a lift, ≥ 31), `HL_ALERT_WEBHOOK_URL`, `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY` (S3 backfill, Requester Pays — **rotate the key that was
+pasted in chat before any production use**), `NESSIE_URI` + `NESSIE_BRANCH`/
+`WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` (Iceberg REST; unset →
+local catalog), `HYPEREVM_RPC_URL`.
 
 ### Outputs (`out/hypercore/`)
 | file | key | contents |
@@ -86,6 +106,8 @@ production use**), `NESSIE_URI` + `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/
 | `l3_token_price_usd_1m.csv` | (token_address, bucket_minute) | only with `--with-prices` or `price_job` |
 | `wallet_analytics_contrib.json` | wallet | contribution to `all_chain.wallet_analytics` (the Rust `wallet-analytics` crate owns the table) |
 | `_reconciliation.json` | — | per-wallet cashflow identity assert, `portfolio` oracle check, **chain-wide natural-key collision check**, unmapped ledger types, unpriced symbols |
+| `_run_summary.json`, `_run_history.jsonl` | — | written by `hl_poc.daily`: verdict per run (hard problems vs warnings, per-wallet status, iceberg/retention counts); the history file gets one line per run |
+| `_watermarks.json` | wallet | incremental state: `through_ms`, `coverage_start_ms`, sticky `fills_truncated`, cached lending position |
 
 ### Validation
 1. **Mapping fidelity (raw vs mapped)**: Σ raw `closedPnl` == Σ `perp_realized_pnl`

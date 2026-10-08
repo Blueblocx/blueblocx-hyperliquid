@@ -1,0 +1,41 @@
+# /etc/systemd/system/hypercore-daily.service
+#
+# One daily HyperCore run (incremental extract -> Iceberg lift -> summary/alert).
+# Started by hypercore-daily.timer; systemd never starts a second instance while
+# one is still running, and the runner's own lock file covers manual starts.
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hypercore-daily.timer
+#   sudo systemctl start hypercore-daily.service      # run once, now
+#   journalctl -u hypercore-daily -f                  # logs
+[Unit]
+Description=HyperCore daily extract (Hyperliquid -> lakehouse)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hypercore
+Group=hypercore
+WorkingDirectory=/opt/hyperliquid-poc
+EnvironmentFile=/etc/hypercore/hypercore.env
+ExecStartPre=/opt/hyperliquid-poc/.venv/bin/python -m hl_poc.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
+ExecStart=/opt/hyperliquid-poc/.venv/bin/python -m hl_poc.daily --wallets-file /etc/hypercore/wallets.txt --iceberg --s3-backfill
+# a 24h window of S3 hour files for market-maker wallets takes ~35 min; whales with
+# a lazy full-ledger pull add ~10 min. Anything past this is stuck, not slow.
+TimeoutStartSec=4h
+# S3 hour files are parsed one at a time (<= ~330 MB decompressed); peak RSS ~1.5 GB
+MemoryMax=3G
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hypercore
+StateDirectory=hypercore
+
+[Install]
+WantedBy=multi-user.target

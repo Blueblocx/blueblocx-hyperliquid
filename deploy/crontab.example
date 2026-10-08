@@ -1,0 +1,8 @@
+# crontab -u hypercore -e        (times are UTC if the host clock is UTC — check `timedatectl`)
+#
+# daily extract + lift at 00:20 UTC; the wrapper loads /etc/hypercore/hypercore.env
+# and takes a flock so a long run never overlaps the next one.
+20 0 * * *  /opt/hyperliquid-poc/deploy/run_daily.sh >> /var/log/hypercore/daily.log 2>&1
+
+# shared L3 price asset for the tokens the watchlist holds (after the daily run)
+40 0 * * *  cd /opt/hyperliquid-poc && HL_ENV_FILE=/etc/hypercore/hypercore.env ./.venv/bin/python -m hl_poc.price_job --spot HYPE,UBTC,UETH --perp BTC,ETH,HYPE --days 3 >> /var/log/hypercore/prices.log 2>&1

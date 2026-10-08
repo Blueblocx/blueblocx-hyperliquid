@@ -45,13 +45,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import schema as S
-from . import analytics, mappers, prices
+from . import analytics, config, mappers, prices
 from .info_client import InfoClient
+from .ops import atomic_write_text
 from .spot_meta import SpotMetaResolver, empty as empty_resolver
 
 log = logging.getLogger("hl_poc.extract")
 
-OUT_ROOT = Path(__file__).resolve().parent.parent / "out"
+OUT_ROOT = Path(__file__).resolve().parent.parent / "out"     # repo default; HL_OUT_DIR overrides (config.out_root)
 
 # Reconciliation tolerance for the USDC cashflow identity (float rounding).
 _RECON_EPSILON = 1.0  # USD
@@ -86,13 +87,53 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
     out = list(merged.values())
     if sort_fn is not None:
         out.sort(key=sort_fn)
-    with path.open("w", newline="", encoding="utf-8") as fh:
+    # atomic: a crash mid-write must not leave a truncated state file behind
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
         w.writeheader()
         for r in out:
             w.writerow({c: ("" if r.get(c) in (None, "") else r[c]) for c in columns})
+    os.replace(tmp, path)
     log.info("upserted %-34s +%6d -> %6d rows", path.name, len(rows), len(out))
     return len(out)
+
+
+def prune_csv(path: Path, ts_col: str, cutoff_ms: int) -> dict:
+    """Staged-CSV retention: drop rows whose `ts_col` is older than `cutoff_ms`.
+
+    Only called after a SUCCESSFUL Iceberg lift (the lake is the durable store;
+    the CSV is a staging + analytics-window buffer), so the file stays bounded at
+    retention_days of history instead of growing forever — an MM wallet stages
+    ~180k fills/day. Unparseable timestamps are kept, never dropped blindly.
+    Atomic rewrite; returns counts."""
+    if not path.exists():
+        return {"kept": 0, "dropped": 0}
+    kept: list[dict] = []
+    dropped = 0
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        columns = reader.fieldnames or []
+        for r in reader:
+            ts = r.get(ts_col)
+            try:
+                old = bool(ts) and _iso_to_ms(ts) < cutoff_ms
+            except ValueError:
+                old = False
+            if old:
+                dropped += 1
+            else:
+                kept.append(r)
+    if dropped:
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=columns)
+            w.writeheader()
+            w.writerows(kept)
+        os.replace(tmp, path)
+        log.info("retention %-33s -%6d rows older than %s -> %6d rows", path.name, dropped,
+                 datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).date(), len(kept))
+    return {"kept": len(kept), "dropped": dropped}
 
 
 def compute_start_ms(default_start_ms: int, watermark_through_ms: int | None,
@@ -359,9 +400,9 @@ def _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding) -> dict
 def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = False,
         max_workers: int = 4, max_perp_price_coins: int = 30,
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
-        hip3: bool = True) -> dict:
+        hip3: bool = True, retention_days: int = 0) -> dict:
     wallets = [w.lower() for w in wallets]
-    client = InfoClient(url=os.environ.get("HL_INFO_URL", InfoClient().url))
+    client = InfoClient()        # HL_INFO_URL / HL_WEIGHT_BUDGET / HL_HTTP_TIMEOUT from the env
     now_iso = _now_iso()
     now_ms = int(time.time() * 1000)
     default_start_ms = now_ms - days * 86400 * 1000
@@ -456,8 +497,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     # keeps the fills inside its own [w_start, oldest_api).
     trunc = [p for p in pending if p["fills_saturated"]]
     if trunc and s3_backfill:
-        from .s3_backfill import fetch_fills_s3, load_dotenv
-        load_dotenv()
+        from .s3_backfill import fetch_fills_s3
+        config.load_env()
         window = plan_s3_window([(p["w_start_ms"], p["oldest_api"]) for p in trunc])
         if window:
             res = fetch_fills_s3([p["wallet"] for p in trunc], window[0], window[1])
@@ -734,15 +775,28 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
     # --- optional: lift straight into Iceberg (nessie.hypercore.* or local) ----
     iceberg_report = None
+    retention_report = None
     if iceberg:
         from .iceberg_load import lift_directory
-        from .s3_backfill import load_dotenv
-        load_dotenv()
-        iceberg_report = lift_directory(ns_dir)
+        config.load_env()
+        iceberg_report = lift_directory(ns_dir)       # raises on failure -> nothing below runs
+        # Staged-CSV retention: the lake now holds these rows durably, so the
+        # staging files only need to keep the analytics windows (30d) + margin.
+        if retention_days and retention_days > 0:
+            cutoff_ms = now_ms - retention_days * 86_400_000
+            retention_report = {
+                "retention_days": retention_days,
+                "cutoff": datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).isoformat(),
+                "l1_wallet_ledger": prune_csv(ns_dir / "l1_wallet_ledger.csv", "block_timestamp", cutoff_ms),
+                "l3_token_price_usd_1m": prune_csv(ns_dir / "l3_token_price_usd_1m.csv", "bucket_minute", cutoff_ms),
+            }
+    elif retention_days:
+        log.warning("retention_days=%d ignored: staged CSVs are the only store without --iceberg",
+                    retention_days)
 
     # --- incremental watermarks (per wallet) -----------------------------------
     if incremental:
-        wm_path.write_text(json.dumps(watermarks, indent=2), encoding="utf-8")
+        atomic_write_text(wm_path, json.dumps(watermarks, indent=2))
 
     # Per-wallet contribution to all_chain.wallet_analytics. NOT the sink itself:
     # the Rust wallet-analytics crate owns that table; this is input/validation.
@@ -754,7 +808,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         except Exception:  # noqa: BLE001
             existing = {}
     existing.update(contrib)
-    contrib_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    atomic_write_text(contrib_path, json.dumps(existing, indent=2))
 
     # Reconciliation is merged per wallet across runs (like the contrib file), so
     # earlier wallets' audit evidence is not overwritten by a later single-wallet run.
@@ -775,11 +829,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "unmapped_ledger_types": unknown_types_all,
         "price_job": price_report,
         "iceberg": iceberg_report,
+        "retention": retention_report,
         "hip3_dexes_checked": dexes,
         "hip3_collateral_by_dex": collateral_report,
         "by_wallet": prev_by_wallet,
     }
-    recon_path.write_text(json.dumps(recon, indent=2), encoding="utf-8")
+    atomic_write_text(recon_path, json.dumps(recon, indent=2))
     done = [r for w, r in recon_by_wallet.items() if not r.get("skipped")]
     log.info("done: natural_key_ok=%s fidelity_ok=%s perp_oracle_ok=%s networth_oracle_ok=%s skipped=%d",
              recon["natural_key_ok"],
@@ -791,8 +846,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    config.load_env()
+    config.setup_logging()
     ap = argparse.ArgumentParser(description="Hyperliquid HyperCore -> CSV POC")
     ap.add_argument("--wallet", required=True, help="one address or comma-separated list")
     ap.add_argument("--days", type=int, default=7)
@@ -809,15 +864,15 @@ def main() -> None:
                     help="resume each wallet from its watermark (out/hypercore/_watermarks.json)")
     ap.add_argument("--no-hip3", action="store_true",
                     help="skip per-dex clearinghouseState for HIP-3 builder dexes")
-    ap.add_argument("--out", default=str(OUT_ROOT))
+    ap.add_argument("--retention-days", type=int, default=config.env_int("HL_RETENTION_DAYS"),
+                    help="with --iceberg: prune staged l1/l3 CSV rows older than this (0 = never)")
+    ap.add_argument("--out", default=str(config.out_root()))
     args = ap.parse_args()
-    from .s3_backfill import load_dotenv
-    load_dotenv()
     wallets = [w.strip() for w in args.wallet.split(",") if w.strip()]
     run(wallets, args.days, Path(args.out), with_prices=args.with_prices,
         max_workers=args.workers, max_perp_price_coins=args.max_price_coins,
         s3_backfill=args.s3_backfill, iceberg=args.iceberg, incremental=args.incremental,
-        hip3=not args.no_hip3)
+        hip3=not args.no_hip3, retention_days=args.retention_days)
 
 
 if __name__ == "__main__":

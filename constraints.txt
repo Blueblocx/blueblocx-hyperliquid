@@ -1,0 +1,38 @@
+# Full transitive pin set (pip freeze of the validated environment, 2026-10-09).
+# Used as `pip install -r requirements.txt -c constraints.txt`; constraints never
+# install anything by themselves, they only fix versions of what gets pulled in.
+annotated-types==0.8.0
+boto3==1.43.108
+botocore==1.43.108
+cachetools==7.2.1
+certifi==2026.6.17
+charset-normalizer==3.4.9
+click==8.5.0
+fsspec==2026.9.0
+idna==3.18
+jmespath==1.1.0
+lz4==4.4.5
+markdown-it-py==4.2.0
+mdurl==0.1.2
+mmh3==5.3.1
+pyarrow==25.0.1
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+pyiceberg==0.12.0
+pyparsing==3.3.3
+pyroaring==1.2.0
+python-dateutil==2.9.0.post0
+requests==2.34.2
+rich==15.0.0
+s3transfer==0.19.2
+six==1.17.0
+SQLAlchemy==2.1.3
+strictyaml==1.7.3
+tenacity==9.1.4
+typing_extensions==4.16.0
+typing-inspection==0.4.4
+tzdata==2026.5
+urllib3==2.7.0
+xxhash==3.8.1
+zstandard==0.25.0

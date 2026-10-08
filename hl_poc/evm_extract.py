@@ -101,14 +101,14 @@ def run(wallets: list[str], blocks: int, out_dir: Path, rpc_url: str | None = No
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from . import config
+    config.load_env()
+    config.setup_logging()
     ap = argparse.ArgumentParser(description="HyperEVM per-wallet ERC-20 extract")
     ap.add_argument("--wallet", required=True)
     ap.add_argument("--blocks", type=int, default=2000)
-    ap.add_argument("--out", default=str(OUT_ROOT))
+    ap.add_argument("--out", default=str(config.out_root()))
     args = ap.parse_args()
-    from .s3_backfill import load_dotenv
-    load_dotenv()
     wallets = [w.strip() for w in args.wallet.split(",") if w.strip()]
     rep = run(wallets, args.blocks, Path(args.out))
     log.info("done: %s", rep)

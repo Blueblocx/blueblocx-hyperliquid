@@ -50,10 +50,12 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from . import config
+
 log = logging.getLogger("hl_poc.iceberg_load")
 
 ROOT = Path(__file__).resolve().parent.parent
-DDL_PATH = ROOT / "docs" / "PROPOSED_SCHEMA.sql"
+DDL_PATH = ROOT / "docs" / "PROPOSED_SCHEMA.sql"      # overridable with HL_DDL_PATH
 DDL_NAMESPACE = "hypercore"          # the namespace whose DDL blocks define the shapes
 CONTROL_NS = "control"
 
@@ -91,8 +93,10 @@ def _arrow_type(sql_type: str, tz: bool) -> pa.DataType:
 
 # --- DDL parsing -----------------------------------------------------------------
 
-def parse_ddl(path: Path = DDL_PATH, namespace: str = DDL_NAMESPACE) -> dict[str, dict]:
-    """{table: {"columns": [(name, SQLTYPE), ...], "partition": [cols]}} from the DDL."""
+def parse_ddl(path: Path | None = None, namespace: str = DDL_NAMESPACE) -> dict[str, dict]:
+    """{table: {"columns": [(name, SQLTYPE), ...], "partition": [cols]}} from the DDL
+    (docs/PROPOSED_SCHEMA.sql by default, HL_DDL_PATH when set)."""
+    path = Path(path) if path else config.ddl_path()
     text = path.read_text(encoding="utf-8")
     out: dict[str, dict] = {}
     pat = re.compile(
@@ -177,7 +181,7 @@ def load_catalog_from_env(local_dir: Path | None = None):
             props["s3.region"] = region
         log.info("iceberg catalog: REST %s (prefix/branch %s)", uri, branch)
         return load_catalog("nessie", **props), "rest"
-    local = Path(local_dir or (ROOT / "out" / "iceberg")).resolve()
+    local = Path(local_dir or (config.out_root() / "iceberg")).resolve()
     local.mkdir(parents=True, exist_ok=True)
     wh = local.as_posix()
     log.info("iceberg catalog: LOCAL sqlite at %s", wh)
@@ -378,15 +382,14 @@ def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    config.load_env()
+    config.setup_logging()
     ap = argparse.ArgumentParser(description="Lift HyperCore/HyperEVM CSVs into Iceberg")
-    ap.add_argument("--from", dest="src", default=str(ROOT / "out" / DDL_NAMESPACE))
+    ap.add_argument("--from", dest="src", default=str(config.out_root() / DDL_NAMESPACE))
     ap.add_argument("--namespace", default=DDL_NAMESPACE, help="target namespace (hypercore | hyperevm)")
-    ap.add_argument("--local-dir", default=None, help="local catalog dir (default out/iceberg)")
+    ap.add_argument("--local-dir", default=None, help="local catalog dir (default HL_OUT_DIR/iceberg)")
     ap.add_argument("--tables", default=None, help="comma-separated subset")
     args = ap.parse_args()
-    from .s3_backfill import load_dotenv
-    load_dotenv()
     tables = [t for t in args.tables.split(",") if t] if args.tables else None
     rep = lift_directory(Path(args.src), local_dir=Path(args.local_dir) if args.local_dir else None,
                          tables=tables, namespace=args.namespace)

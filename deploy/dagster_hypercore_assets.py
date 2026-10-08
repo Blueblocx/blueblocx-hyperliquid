@@ -36,7 +36,10 @@ def _run(context: AssetExecutionContext, args: list[str]) -> None:
 def hypercore_l1_daily(context: AssetExecutionContext) -> None:
     """l1_wallet_ledger / l1_token_metadata / l4x snapshot / gates for the wallet
     list — incremental, HIP-3 aware, S3 backfill for 10k-capped wallets, lifted
-    into nessie.hypercore.* (NESSIE_URI from the environment)."""
+    into nessie.hypercore.* (NESSIE_URI from the environment). Preflight first so a
+    bad key / unreachable catalog fails before any API weight is spent; the daily
+    runner writes _run_summary.json and POSTs HL_ALERT_WEBHOOK_URL on problems."""
+    _run(context, ["hl_poc.preflight", "--iceberg", "--s3", "--wallets-file", WALLETS])
     _run(context, ["hl_poc.daily", "--wallets-file", WALLETS, "--iceberg", "--s3-backfill"])
 
 

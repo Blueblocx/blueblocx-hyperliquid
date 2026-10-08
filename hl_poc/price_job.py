@@ -102,18 +102,19 @@ def build_price_rows(client: InfoClient, resolver: SpotMetaResolver, *,
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from . import config
+    config.load_env()
+    config.setup_logging()
     ap = argparse.ArgumentParser(description="HyperCore shared L3 price job")
     ap.add_argument("--spot", default="", help="comma-separated spot base symbols")
     ap.add_argument("--perp", default="", help="comma-separated perp coins")
     ap.add_argument("--days", type=float, default=7)
-    ap.add_argument("--out", default=str(OUT_ROOT))
+    ap.add_argument("--out", default=str(config.out_root()))
     args = ap.parse_args()
 
     from .extract import upsert_csv  # shared writer (avoid circular import at top)
 
-    client = InfoClient(url=os.environ.get("HL_INFO_URL", InfoClient().url))
+    client = InfoClient()           # HL_INFO_URL / HL_WEIGHT_BUDGET read at construction
     resolver = SpotMetaResolver(client.spot_meta())
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - int(args.days * 86_400_000)
