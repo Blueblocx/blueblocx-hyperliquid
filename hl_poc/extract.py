@@ -144,6 +144,39 @@ def _load_token_meta(path: Path) -> dict[str, dict]:
                 for r in csv.DictReader(fh)}
 
 
+def plan_s3_window(gaps: list[tuple[int, int]]) -> tuple[int, int] | None:
+    """One S3 window covering every truncated wallet's gap [w_start, oldest_api):
+    hour files are shared across wallets, so they are fetched ONCE per run and
+    each wallet keeps only the fills inside its own gap."""
+    gaps = [(s, e) for s, e in gaps if e > s]
+    if not gaps:
+        return None
+    return min(s for s, _ in gaps), max(e for _, e in gaps)
+
+
+def _load_prior_unrealized(path: Path, wallet: str, now_ms: int,
+                           min_age_h: float = 20.0, max_age_h: float = 28.0):
+    """Σ unrealized_pnl_usd from the wallet's l4x snapshot taken ~24h ago (the
+    previous daily run). Returns (value, age_hours) or (None, None)."""
+    if not path.exists():
+        return None, None
+    best_ts, total = None, 0.0
+    rows = []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            if r.get("wallet_address") != wallet:
+                continue
+            ts = _iso_to_ms(r["as_of_ts"])
+            age_h = (now_ms - ts) / 3_600_000
+            if min_age_h <= age_h <= max_age_h:
+                rows.append((ts, float(r.get("unrealized_pnl_usd") or 0)))
+    if not rows:
+        return None, None
+    best_ts = max(ts for ts, _ in rows)            # the latest snapshot in the band
+    total = sum(v for ts, v in rows if ts == best_ts)
+    return total, (now_ms - best_ts) / 3_600_000
+
+
 def merge_rows_by_key(existing: list[dict], new: list[dict]) -> list[dict]:
     """Union by the natural key; new rows win (same semantics as upsert_csv)."""
     merged = {mappers.natural_key(r): r for r in existing}
@@ -153,7 +186,8 @@ def merge_rows_by_key(existing: list[dict], new: list[dict]) -> list[dict]:
 
 
 def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
-                  max_workers: int, dexes: list[str] | None = None) -> dict:
+                  max_workers: int, dexes: list[str] | None = None,
+                  need_ledger_all: bool = True) -> dict:
     """Run the independent Info API pulls for one wallet concurrently (7 core +
     one clearinghouseState per HIP-3 dex)."""
     def safe(fn, default):
@@ -179,6 +213,8 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
     # caller skips a wallet whose CORE pulls (fills/funding/ledger/chs) failed.
     tasks = {
         "fills": guarded("fills", lambda: client.user_fills_by_time(wallet, start_ms, now_ms), None),
+        # TWAP executions are NOT in userFillsByTime (verified live) — separate pull
+        "twap_fills": guarded("twap_fills", lambda: client.user_twap_slice_fills_by_time(wallet, start_ms, now_ms), None),
         "funding": guarded("funding", lambda: client.user_funding(wallet, start_ms, now_ms), None),
         "ledger": guarded("ledger", lambda: client.user_non_funding_ledger_updates(wallet, start_ms, now_ms), None),
         "chs": guarded("chs", lambda: client.clearinghouse_state(wallet), None),
@@ -187,11 +223,15 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
         "portfolio": guarded("portfolio", lambda: client.portfolio(wallet), []),
         "vaults": guarded("vaults", lambda: client.user_vault_equities(wallet), []),
         "open_orders": guarded("open_orders", lambda: client.open_orders(wallet), []),
-        # full ledger history (cheap: few hundred entries even for whales) — the
-        # only source for the outstanding borrow/lend supply, which portfolio
-        # counts but spotClearinghouseState omits for non-PM accounts
-        "ledger_all": guarded("ledger_all", lambda: client.user_non_funding_ledger_updates(wallet, 0, now_ms), []),
     }
+    if need_ledger_all:
+        # Full ledger history — the only source for the outstanding borrow/lend
+        # supply (portfolio counts it; spotClearinghouseState omits it for non-PM
+        # accounts). NOT cheap for old whales (one took 541 s = ~170 pages), so in
+        # incremental mode it is pulled once and the position is cached in the
+        # watermark; later runs apply only the window's new borrowLend deltas.
+        tasks["ledger_all"] = guarded(
+            "ledger_all", lambda: client.user_non_funding_ledger_updates(wallet, 0, now_ms), [])
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futs = {k: pool.submit(fn) for k, fn in tasks.items()}
         out = {k: f.result() for k, f in futs.items()}
@@ -220,7 +260,7 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
     return out
 
 
-_CORE_PULLS = ("fills", "funding", "ledger", "chs")
+_CORE_PULLS = ("fills", "twap_fills", "funding", "ledger", "chs")
 
 
 def _is_core_pull(name: str) -> bool:
@@ -380,39 +420,69 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     held_symbols: set[str] = set()
     perp_coins_open: set[str] = set()
 
+    # ---- phase 1: pull every wallet's API data -----------------------------------
+    from .s3_backfill import merge_fills as _merge
+    pending: list[dict] = []
     for wallet in wallets:
-        w_start_ms = compute_start_ms(default_start_ms,
-                                      (watermarks.get(wallet) or {}).get("through_ms"))
-        d = _fetch_wallet(client, wallet, w_start_ms, now_ms, max_workers, dexes)
+        prior = watermarks.get(wallet) or {}
+        w_start_ms = compute_start_ms(default_start_ms, prior.get("through_ms"))
+        # lending position is cached in the watermark after the first full pull
+        need_ledger_all = not (incremental and prior.get("lending_through_ms") is not None)
+        d = _fetch_wallet(client, wallet, w_start_ms, now_ms, max_workers, dexes,
+                          need_ledger_all=need_ledger_all)
         core_errors = {k: v for k, v in d["_errors"].items() if _is_core_pull(k)}
         if core_errors:
             log.error("[%s] SKIPPED — core pull(s) failed: %s", wallet[:10], core_errors)
             recon_by_wallet[wallet] = {"skipped": True, "errors": d["_errors"]}
             continue
-        fills, funding, ledger_updates = d["fills"], d["funding"], d["ledger"]
+        fills = d["fills"]
+        # truncation is judged on the regular fills pull BEFORE merging TWAP slices
+        fills_saturated = client.user_fills_saturated(fills, w_start_ms)
+        oldest_api = min((int(f.get("time", 0) or 0) for f in fills), default=now_ms)
+        twap_fills = d.get("twap_fills") or []
+        if twap_fills:
+            fills = _merge(fills, twap_fills)
+            log.info("[%s] +%d TWAP slice fills merged", wallet[:10], len(twap_fills))
+        pending.append(dict(wallet=wallet, prior=prior, w_start_ms=w_start_ms, d=d, fills=fills,
+                            fills_saturated=fills_saturated, oldest_api=oldest_api,
+                            twap_fills=twap_fills, need_ledger_all=need_ledger_all,
+                            s3_report=None))
+
+    # ---- phase 1b: ONE shared S3 pass for every truncated wallet -------------------
+    # Hour files are per chain, not per wallet: N truncated wallets used to download
+    # the same ~20 files N times. Now one window covers all gaps and each wallet
+    # keeps the fills inside its own [w_start, oldest_api).
+    trunc = [p for p in pending if p["fills_saturated"]]
+    if trunc and s3_backfill:
+        from .s3_backfill import fetch_fills_s3, load_dotenv
+        load_dotenv()
+        window = plan_s3_window([(p["w_start_ms"], p["oldest_api"]) for p in trunc])
+        if window:
+            res = fetch_fills_s3([p["wallet"] for p in trunc], window[0], window[1])
+            for p in trunc:
+                mine = [f for f in res.fills.get(p["wallet"], [])
+                        if p["w_start_ms"] <= int(f.get("time", 0) or 0) < p["oldest_api"]]
+                p["fills"] = _merge(p["fills"], mine)
+                p["fills_saturated"] = not res.complete
+                p["s3_report"] = {"gap_start_ms": p["w_start_ms"], "gap_end_ms": p["oldest_api"],
+                                  "s3_fills": len(mine), "merged_fills": len(p["fills"]),
+                                  "shared_window": list(window), **res.summary()}
+                log.info("[%s] s3 backfill: +%d fills for the truncated gap (complete=%s)",
+                         p["wallet"][:10], len(mine), res.complete)
+    elif trunc:
+        for p in trunc:
+            log.warning("[%s] fills truncated at the API cap — pass --s3-backfill to complete "
+                        "the window (watermark NOT advanced)", p["wallet"][:10])
+
+    # ---- phase 2: map, snapshot, analyse ---------------------------------------
+    for p in pending:
+        wallet, prior_wm, w_start_ms, d = p["wallet"], p["prior"], p["w_start_ms"], p["d"]
+        fills, fills_saturated, twap_fills, s3_report = (p["fills"], p["fills_saturated"],
+                                                        p["twap_fills"], p["s3_report"])
+        funding, ledger_updates = d["funding"], d["ledger"]
         chs, spot_state, staking, portfolio = d["chs"], d["spot_state"], d["staking"], d["portfolio"]
         vaults = d["vaults"]
         chs_by_dex = {dx: d.get(f"chs:{dx}") or {} for dx in d.get("_dexes_queried", [])}
-        fills_saturated = client.user_fills_saturated(fills, w_start_ms)
-        s3_report = None
-        if fills_saturated and s3_backfill:
-            # The API served only its ~10k most recent fills: fetch the rest of the
-            # window from S3 node data. Same key scheme -> overlap dedups itself.
-            # The window counts as complete ONLY if every hour file was read.
-            from .s3_backfill import fetch_fills_s3, merge_fills, load_dotenv
-            load_dotenv()
-            oldest_api = min(int(f.get("time", 0) or 0) for f in fills)
-            res = fetch_fills_s3([wallet], w_start_ms, oldest_api)
-            s3_fills = res.fills.get(wallet, [])
-            fills = merge_fills(fills, s3_fills)
-            fills_saturated = not res.complete
-            s3_report = {"gap_start_ms": w_start_ms, "gap_end_ms": oldest_api,
-                         "s3_fills": len(s3_fills), "merged_fills": len(fills), **res.summary()}
-            log.info("[%s] s3 backfill: +%d fills for the truncated gap (complete=%s)",
-                     wallet[:10], len(s3_fills), res.complete)
-        elif fills_saturated:
-            log.warning("[%s] fills truncated at the 10k API cap — pass --s3-backfill to "
-                        "complete the window (watermark NOT advanced)", wallet[:10])
         price_start_ms = min(price_start_ms, w_start_ms)
         log.info("[%s] fetched: %d fills, %d funding, %d ledger, %d positions%s",
                  wallet[:10], len(fills), len(funding), len(ledger_updates),
@@ -449,11 +519,19 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         if float(staking.get("delegated", 0) or 0) or float(staking.get("undelegated", 0) or 0):
             syms.add("HYPE")
         held_symbols |= {s for s in syms if s and s.upper() not in _STABLE_SYMBOLS}
+        # --- lending position: full history once, then cached + window deltas ------
+        if p["need_ledger_all"]:
+            lending_by_token = analytics.lending_position(d.get("ledger_all") or [])
+        else:
+            since = int(prior_wm.get("lending_through_ms") or 0)
+            new_deltas = [e for e in ledger_updates if int(e.get("time", 0) or 0) > since]
+            lending_by_token = analytics.merge_lending(prior_wm.get("lending_by_token") or {},
+                                                      analytics.lending_position(new_deltas))
+
         # Analytics run over the wallet's ACCUMULATED ledger (disk + this run), not
         # just this pull: in incremental mode the pull window is ~1h, but
         # realized_7d/30d must be computed over everything we hold. Coverage
         # starts at the earliest window ever pulled for the wallet (watermark).
-        prior_wm = watermarks.get(wallet) or {}
         coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
         if incremental:
             disk_rows = _load_wallet_ledger_rows(ns_dir / "l1_wallet_ledger.csv", wallet)
@@ -484,13 +562,19 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                                          fills_truncated=(fills_saturated
                                                           or bool(prior_wm.get("fills_truncated"))),
                                          account_value_by_dex=account_value_by_dex,
-                                         lending_by_token=analytics.lending_position(d.get("ledger_all") or []),
+                                         lending_by_token=lending_by_token,
                                          open_orders=d.get("open_orders") or [])
-        oracle = analytics.validate_against_oracle(wa, portfolio, now_ms)
+        # PnL oracle: HL's own 24h pnlHistory (perpDay) vs our realized perp cashflow
+        # + change in unrealized since the previous daily snapshot (~24h ago)
+        prior_unreal, prior_age_h = _load_prior_unrealized(
+            ns_dir / "l4x_perp_position_snapshot.csv", wallet, now_ms)
+        oracle = analytics.validate_against_oracle(
+            wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
         recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
         recon["unmapped_ledger_types"] = unknown
         recon["fetch_errors"] = d["_errors"]
         recon["window_start_ms"] = w_start_ms
+        recon["twap_slice_fills"] = len(twap_fills)
         recon["coverage_start_ms"] = coverage_start_ms
         recon["analysis_rows"] = len(analysis_rows)
         recon["s3_backfill"] = s3_report
@@ -509,6 +593,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             "through_ms": (prior_through if fills_saturated else now_ms),
             "coverage_start_ms": coverage_start_ms,
             "fills_truncated": sticky,
+            "lending_by_token": lending_by_token,
+            "lending_through_ms": now_ms,
             "updated_at": now_iso,
         }
         if fills_saturated:

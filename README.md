@@ -99,6 +99,16 @@ production use**), `NESSIE_URI` + `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/
    Validated on 7 live wallets (light, MM, HIP-3 trader, 48M whale, two lenders).
 3. **Structural**: `natural_key_ok` — no `(tx_hash, event_index, direction)`
    collision across wallets, no duplicates within the run.
+4. **PnL (external, from the 2nd daily run)**: HL `perpDay.pnlHistory` change over
+   24h == our realized perp cashflow (closedPnl + funding − fees) + change in
+   unrealized since the previous day's l4x snapshot → `oracle.pnl.pnl_matches`
+   (reported as pending until a ~24h-old snapshot exists — never as passed).
+
+Source completeness traps the checks above cannot see on their own, now handled:
+`userFillsByTime` omits **TWAP slice fills** (6% of all fills chain-wide; pulled
+from `userTwapSliceFillsByTime` and merged by tid), and the fills cap is not
+exactly 10k (12.8k–21.6k observed), so truncation requires a cap-sized response
+**and** a >1h gap after the window start.
 
 ### Demo wallets
 - `0x04d4ffc796a9b9244ccd00459fe2785880dcf399` — spot + staked HYPE + light perps.

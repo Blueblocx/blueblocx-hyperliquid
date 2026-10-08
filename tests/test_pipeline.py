@@ -163,6 +163,55 @@ class TruncationFlagTests(unittest.TestCase):
         self.assertFalse(self._c().user_fills_saturated(fills, start))
 
 
+class TwapSliceFillTests(unittest.TestCase):
+    def test_twap_slice_normalised_and_merged_by_tid(self):
+        from hl_poc import mappers
+        from hl_poc.spot_meta import SpotMetaResolver
+        # live shape from userTwapSliceFillsByTime (twapId null INSIDE, set outside)
+        slice_ = {"fill": {"coin": "HYPE/USDC", "px": "0.30087", "sz": "38.74", "side": "B",
+                           "time": 1_700_000_000_000, "startPosition": "1", "dir": "Buy",
+                           "closedPnl": "0.0", "hash": S.ZERO_HASH, "oid": 1, "crossed": True,
+                           "fee": "0.026", "tid": 651818585970396, "feeToken": "HYPE", "twapId": None},
+                  "twapId": 2287760}
+        f = dict(slice_["fill"]); f["twapId"] = slice_["twapId"]
+        merged = s3_backfill.merge_fills([{"tid": 1, "time": 1, "coin": "BTC", "sz": "1"}], [f])
+        self.assertEqual(len(merged), 2)
+        rows = mappers.map_fills_to_ledger([f], W, NOW, SpotMetaResolver(
+            {"tokens": [{"name": "USDC", "index": 0, "weiDecimals": 8}, {"name": "HYPE", "index": 150, "weiDecimals": 8}],
+             "universe": [{"name": "HYPE/USDC", "index": 1, "tokens": [150, 0]}]}), mappers.TokenRegistry())
+        self.assertEqual(len(rows), 3)                     # base, quote, base-token fee
+        self.assertTrue(all(r["tx_hash"].startswith(f"hlcore:{W}:tid:651818585970396") for r in rows))
+
+
+class SharedS3WindowTests(unittest.TestCase):
+    def test_window_covers_all_gaps_and_ignores_empty(self):
+        self.assertEqual(extract.plan_s3_window([(10, 50), (30, 70), (90, 90)]), (10, 70))
+        self.assertIsNone(extract.plan_s3_window([(5, 5)]))
+
+
+class LendingCacheTests(unittest.TestCase):
+    def test_merge_lending_adds_deltas_and_drops_zero(self):
+        from hl_poc import analytics
+        self.assertEqual(analytics.merge_lending({"USDC": 100.0}, {"USDC": -100.0, "USDT0": 5.0}),
+                         {"USDT0": 5.0})
+
+
+class PnlOracleTests(unittest.TestCase):
+    def test_pending_without_prior_snapshot(self):
+        from hl_poc import analytics
+        r = analytics.pnl_oracle({"perpDay": {"pnlHistory": [[0, "10"], [1, "25"]]}}, 10.0, 5.0, None, None)
+        self.assertFalse(r["checked"])
+
+    def test_matches_when_realized_plus_unrealized_delta_equals_history(self):
+        from hl_poc import analytics
+        pf = {"perpDay": {"pnlHistory": [[0, "100.0"], [1, "160.0"]]}}      # +60 in 24h
+        r = analytics.pnl_oracle(pf, realized_perp_24h=45.0, unrealized_now=30.0,
+                                 prior_unrealized=15.0, prior_age_h=24.0)        # 45 + 15 = 60
+        self.assertTrue(r["checked"]); self.assertTrue(r["pnl_matches"])
+        r2 = analytics.pnl_oracle(pf, 45.0, 30.0, 25.0, 24.0)                  # 45 + 5 = 50 != 60
+        self.assertFalse(r2["pnl_matches"])
+
+
 class WeightModelTests(unittest.TestCase):
     def test_documented_weights(self):
         from hl_poc.info_client import InfoClient

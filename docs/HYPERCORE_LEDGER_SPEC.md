@@ -173,8 +173,12 @@ net_worth       = total_perp − overlap
 
 ## 6b. Sources, HIP-3 dexes, fallbacks
 
-* **Sources**: Info API for the recent window (`userFillsByTime` ≤ ~10k fills,
-  `userFunding`, `userNonFundingLedgerUpdates`); S3
+* **Sources**: Info API for the recent window (`userFillsByTime` ≤ ~10k fills
+  **plus `userTwapSliceFillsByTime`** — TWAP executions are NOT included in
+  `userFillsByTime`; verified live: 46 slice fills in one hour, 6% of all fills
+  chain-wide, present in node data and at the counterparty but absent from the
+  regular endpoint. They are flattened to the fill shape with `twapId` set and
+  merged by tid); `userFunding`, `userNonFundingLedgerUpdates`; S3
   `hl-mainnet-node-data/node_fills_by_block/hourly/{YYYYMMDD}/{h}.lz4` for fills
   beyond the cap. Node fills carry the same fields plus `builderFee`/`builder`/
   `cloid`; `block_number` is available there but left **NULL** on the row so

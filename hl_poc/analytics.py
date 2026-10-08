@@ -78,6 +78,14 @@ def lending_position(ledger_updates) -> dict[str, float]:
     return {k: v for k, v in pos.items() if abs(v) > 1e-9}
 
 
+def merge_lending(stored: dict, delta: dict) -> dict[str, float]:
+    """Cached lending position + position change from new borrowLend deltas."""
+    out = {k: float(v) for k, v in (stored or {}).items()}
+    for k, v in (delta or {}).items():
+        out[k] = out.get(k, 0.0) + float(v)
+    return {k: v for k, v in out.items() if abs(v) > 1e-9}
+
+
 def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
                       windows=(1, 7, 30), spot_price_by_symbol=None, staking=None,
                       token_usd_price=None, vault_equities=None,
@@ -129,6 +137,9 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
     net_flow = {d: (_window_sum(l1_rows, S.FLOW_EVENT_TYPES, now_ms, d,
                                 price_of=usd_price) if complete(d) else None)
                 for d in windows}
+    # perp-book cashflow over the last 24h (closedPnl + funding − fees), for the
+    # PnL oracle: HL perpDay.pnlHistory Δ == this + Δ unrealized
+    realized_perp_24h = _window_sum(l1_rows, S.PERP_CASHFLOW_TYPES, now_ms, 1, price_of=usd_price)
 
     def _r(v):
         return None if v is None else round(v, 6)
@@ -276,6 +287,7 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
         "realized_pnl_7d_complete": complete(7),
         "realized_pnl_30d_complete": complete(30),
         "unrealized_pnl": round(unrealized, 6),
+        "realized_perp_24h": round(realized_perp_24h, 6),
         "net_flow_24h": _r(net_flow.get(1)),
         "net_flow_7d": _r(net_flow.get(7)),
         "net_flow_30d": _r(net_flow.get(30)),
@@ -301,8 +313,32 @@ def compute_analytics(l1_rows, snap_rows, chs, spot_state, now_ms, now_iso,
     }
 
 
+def pnl_oracle(portfolio_map: dict, realized_perp_24h: float, unrealized_now: float,
+               prior_unrealized, prior_age_h, tol_abs: float = 5.0, tol_pct: float = 0.02) -> dict:
+    """EXTERNAL PnL check (the headline number). HL's perpDay.pnlHistory is the
+    cumulative perp PnL series the UI shows (net of deposits/withdrawals); its
+    change over the last 24h must equal our realized perp cashflow (closedPnl +
+    funding − fees) plus the change in unrealized PnL since the previous daily
+    snapshot. Needs a prior l4x snapshot 20–28h old, so it activates from the
+    second daily run; until then it is reported as pending, never as passed."""
+    hist = ((portfolio_map.get("perpDay") or {}).get("pnlHistory") or [])
+    if len(hist) < 2:
+        return {"checked": False, "reason": "no perpDay pnlHistory"}
+    if prior_unrealized is None:
+        return {"checked": False, "reason": "no prior snapshot (~24h) yet"}
+    oracle_delta = float(hist[-1][1]) - float(hist[0][1])
+    ours = realized_perp_24h + (unrealized_now - prior_unrealized)
+    diff = abs(oracle_delta - ours)
+    tol = max(tol_abs, tol_pct * abs(oracle_delta))
+    return {"checked": True, "oracle_pnl_24h": round(oracle_delta, 6), "computed_pnl_24h": round(ours, 6),
+            "realized_perp_24h": round(realized_perp_24h, 6),
+            "unrealized_delta_24h": round(unrealized_now - prior_unrealized, 6),
+            "prior_snapshot_age_h": round(prior_age_h or 0, 2), "abs_diff": round(diff, 6),
+            "pnl_matches": diff <= tol}
+
+
 def validate_against_oracle(analytics, portfolio, now_ms, tol_pct=0.005,
-                            networth_tol_pct=0.01):
+                            networth_tol_pct=0.01, prior_unrealized=None, prior_age_h=None):
     """Compare computed values to Hyperliquid's own portfolio series (the HL UI
     numbers). Two ASSERTED checks:
 
@@ -350,4 +386,6 @@ def validate_against_oracle(analytics, portfolio, now_ms, tol_pct=0.005,
             "networth_pct_diff": round(abs(gap) / denom, 6),
             "networth_matches": (abs(gap) / denom) <= networth_tol_pct,
         })
+    result["pnl"] = pnl_oracle(d, analytics.get("realized_perp_24h", 0.0),
+                               analytics.get("unrealized_pnl", 0.0), prior_unrealized, prior_age_h)
     return result

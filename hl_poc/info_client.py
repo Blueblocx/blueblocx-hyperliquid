@@ -119,7 +119,8 @@ class InfoClient:
     # halved throughput for nothing.
     _WEIGHT_STATE = {"clearinghouseState", "spotClearinghouseState"}
     _WEIGHT_PAGED = {"userFillsByTime", "userFills", "userFunding",
-                     "userNonFundingLedgerUpdates", "candleSnapshot"}
+                     "userNonFundingLedgerUpdates", "candleSnapshot",
+                     "userTwapSliceFillsByTime", "userTwapSliceFills"}
 
     @classmethod
     def _weight_of(cls, body: dict[str, Any], resp: Any) -> int:
@@ -294,6 +295,44 @@ class InfoClient:
             return False
         oldest = min((int(f.get("time", 0) or 0) for f in fills), default=start_ms)
         return oldest - start_ms > gap_tolerance_ms
+
+    def user_twap_slice_fills_by_time(self, user: str, start_ms: int, end_ms: int) -> list[dict]:
+        """TWAP slice fills in [start, end], NORMALISED to the plain fill shape.
+
+        userFillsByTime does NOT include TWAP executions (verified live: 46 slice
+        fills in one hour present in node data and at the counterparty, absent from
+        userFillsByTime); they are served by userTwapSliceFillsByTime as
+        {"fill": {...}, "twapId": N} with twapId null inside the fill. We flatten
+        each item to the fill dict with twapId set, so the mapper sees one fill
+        shape. Dedup against userFillsByTime is by tid (disjoint in practice).
+        """
+        out: list[dict] = []
+        seen: set = set()
+        cursor = start_ms
+        while True:
+            batch = self._post({
+                "type": "userTwapSliceFillsByTime", "user": user,
+                "startTime": cursor, "endTime": end_ms,
+            }, est_items=_PER_RESP_FILLS)
+            if not isinstance(batch, list) or not batch:
+                break
+            new = 0
+            for item in batch:
+                f = dict(item.get("fill") or item)
+                if item.get("twapId") is not None:
+                    f["twapId"] = item.get("twapId")
+                key = (f.get("tid"), f.get("time"), f.get("oid"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(f)
+                new += 1
+            last_t = int((batch[-1].get("fill") or batch[-1]).get("time", 0) or 0)
+            if len(batch) < _PER_RESP_FILLS or new == 0 or last_t >= end_ms:
+                break
+            cursor = last_t
+            time.sleep(_PAGE_SLEEP_S)
+        return out
 
     def user_funding(self, user: str, start_ms: int, end_ms: int) -> list[dict]:
         return self._paged_ledger("userFunding", user, start_ms, end_ms)
