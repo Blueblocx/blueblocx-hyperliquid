@@ -426,10 +426,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     for wallet in wallets:
         prior = watermarks.get(wallet) or {}
         w_start_ms = compute_start_ms(default_start_ms, prior.get("through_ms"))
-        # lending position is cached in the watermark after the first full pull
+        # The full ledger history (lending position) is pulled LAZILY in phase 2:
+        # only if the net worth without it does not already match the oracle (then
+        # lending is the only unexplained component). Cached afterwards.
         need_ledger_all = not (incremental and prior.get("lending_through_ms") is not None)
         d = _fetch_wallet(client, wallet, w_start_ms, now_ms, max_workers, dexes,
-                          need_ledger_all=need_ledger_all)
+                          need_ledger_all=False)
         core_errors = {k: v for k, v in d["_errors"].items() if _is_core_pull(k)}
         if core_errors:
             log.error("[%s] SKIPPED — core pull(s) failed: %s", wallet[:10], core_errors)
@@ -519,14 +521,15 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         if float(staking.get("delegated", 0) or 0) or float(staking.get("undelegated", 0) or 0):
             syms.add("HYPE")
         held_symbols |= {s for s in syms if s and s.upper() not in _STABLE_SYMBOLS}
-        # --- lending position: full history once, then cached + window deltas ------
-        if p["need_ledger_all"]:
-            lending_by_token = analytics.lending_position(d.get("ledger_all") or [])
-        else:
+        # --- lending position: cached + window deltas, else resolved lazily below ---
+        lending_resolved = not p["need_ledger_all"]
+        if lending_resolved:
             since = int(prior_wm.get("lending_through_ms") or 0)
             new_deltas = [e for e in ledger_updates if int(e.get("time", 0) or 0) > since]
             lending_by_token = analytics.merge_lending(prior_wm.get("lending_by_token") or {},
                                                       analytics.lending_position(new_deltas))
+        else:
+            lending_by_token = {}          # provisional; see lazy pull after the oracle
 
         # Analytics run over the wallet's ACCUMULATED ledger (disk + this run), not
         # just this pull: in incremental mode the pull window is ~1h, but
@@ -570,11 +573,38 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             ns_dir / "l4x_perp_position_snapshot.csv", wallet, now_ms)
         oracle = analytics.validate_against_oracle(
             wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
+        lending_lazy_pull = False
+        if (not lending_resolved) and oracle.get("checked") and oracle.get("networth_matches") is False:
+            # Net worth without lending does not match HL: the borrow/lend supply is
+            # the one component only the full ledger history reveals — pull it now
+            # (expensive for old whales, hence lazy) and recompute.
+            lending_lazy_pull = True
+            try:
+                ledger_all = client.user_non_funding_ledger_updates(wallet, 0, now_ms)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] ledger_all failed: %s", wallet[:10], e)
+                ledger_all = []
+            lending_by_token = analytics.lending_position(ledger_all)
+            wa = analytics.compute_analytics(analysis_rows, snap_rows, chs, spot_state, now_ms,
+                                             now_iso, spot_price_by_symbol=spot_px,
+                                             staking=staking, token_usd_price=token_usd_price,
+                                             vault_equities=vaults,
+                                             window_start_ms=coverage_start_ms,
+                                             fills_truncated=(fills_saturated
+                                                              or bool(prior_wm.get("fills_truncated"))),
+                                             account_value_by_dex=account_value_by_dex,
+                                             lending_by_token=lending_by_token,
+                                             open_orders=d.get("open_orders") or [])
+            oracle = analytics.validate_against_oracle(
+                wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
+            log.info("[%s] lazy ledger_all pull: lending=%s -> networth_matches=%s",
+                     wallet[:10], lending_by_token, oracle.get("networth_matches"))
         recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
         recon["unmapped_ledger_types"] = unknown
         recon["fetch_errors"] = d["_errors"]
         recon["window_start_ms"] = w_start_ms
         recon["twap_slice_fills"] = len(twap_fills)
+        recon["lending_lazy_pull"] = lending_lazy_pull
         recon["coverage_start_ms"] = coverage_start_ms
         recon["analysis_rows"] = len(analysis_rows)
         recon["s3_backfill"] = s3_report

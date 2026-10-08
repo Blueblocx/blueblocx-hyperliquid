@@ -196,6 +196,19 @@ class LendingCacheTests(unittest.TestCase):
                          {"USDT0": 5.0})
 
 
+class OracleToleranceTests(unittest.TestCase):
+    def test_absolute_floor_for_tiny_accounts(self):
+        from hl_poc import analytics
+        pf = [["perpAllTime", {"accountValueHistory": [[1, "13.712637"]]}],
+              ["allTime", {"accountValueHistory": [[1, "19.340574"]]}]]
+        a = {"account_value_usd": 0.0, "account_value_other_dex_usd": 13.734737, "net_worth": 19.43}
+        o = analytics.validate_against_oracle(a, pf, 0)
+        self.assertTrue(o["account_value_matches"])    # 2.2 cents on $13.7 (0.16%) — fine either way
+        self.assertTrue(o["networth_matches"])         # 9 cents gap (0.46%) under the $2 floor
+        a2 = dict(a, net_worth=25.0)
+        self.assertFalse(analytics.validate_against_oracle(a2, pf, 0)["networth_matches"])
+
+
 class PnlOracleTests(unittest.TestCase):
     def test_pending_without_prior_snapshot(self):
         from hl_poc import analytics

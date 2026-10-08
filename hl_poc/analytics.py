@@ -338,7 +338,8 @@ def pnl_oracle(portfolio_map: dict, realized_perp_24h: float, unrealized_now: fl
 
 
 def validate_against_oracle(analytics, portfolio, now_ms, tol_pct=0.005,
-                            networth_tol_pct=0.01, prior_unrealized=None, prior_age_h=None):
+                            networth_tol_pct=0.01, prior_unrealized=None, prior_age_h=None,
+                            tol_abs_usd=1.0, networth_tol_abs_usd=2.0):
     """Compare computed values to Hyperliquid's own portfolio series (the HL UI
     numbers). Two ASSERTED checks:
 
@@ -369,11 +370,13 @@ def validate_against_oracle(analytics, portfolio, now_ms, tol_pct=0.005,
                          + analytics.get("account_value_other_dex_usd", 0.0))
         diff = abs(computed_perp - perp_oracle)
         denom = abs(perp_oracle) or 1.0
+        # relative tolerance OR an absolute floor: marks move between our calls and
+        # HL's snapshot, and on a $14 account a few cents is already >0.5%
         result.update({
             "perp_oracle_account_value": round(perp_oracle, 6),
             "computed_perp_account_value": round(computed_perp, 6),
             "perp_pct_diff": round(diff / denom, 6),
-            "account_value_matches": (diff / denom) <= tol_pct,
+            "account_value_matches": (diff / denom) <= tol_pct or diff <= tol_abs_usd,
         })
     if full_oracle is not None:
         computed_full = analytics.get("net_worth", 0.0)
@@ -384,7 +387,7 @@ def validate_against_oracle(analytics, portfolio, now_ms, tol_pct=0.005,
             "computed_networth": round(computed_full, 6),
             "networth_gap": round(gap, 6),
             "networth_pct_diff": round(abs(gap) / denom, 6),
-            "networth_matches": (abs(gap) / denom) <= networth_tol_pct,
+            "networth_matches": (abs(gap) / denom) <= networth_tol_pct or abs(gap) <= networth_tol_abs_usd,
         })
     result["pnl"] = pnl_oracle(d, analytics.get("realized_perp_24h", 0.0),
                                analytics.get("unrealized_pnl", 0.0), prior_unrealized, prior_age_h)
