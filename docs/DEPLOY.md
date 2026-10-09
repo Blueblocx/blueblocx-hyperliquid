@@ -162,6 +162,12 @@ Three things the first real lift against Nessie will hit unless prepared:
   needs `s3fs`; this project pins `pyiceberg.io.pyarrow.PyArrowFileIO` instead
   (`HL_PY_IO_IMPL`), and defaults `S3_REGION` to `us-east-1` so PyArrow does not
   ask AWS for the bucket region. Preflight checks the effective class.
+- **S3 store interop.** PyArrow's S3 client sends chunked uploads with trailing
+  checksums. SeaweedFS releases up to 4.48 can reject those intermittently with
+  `400 InvalidDigest` (fixed upstream on 2026-10-03, after 4.48); MinIO and AWS
+  are fine. Before the first production lift against a new store, lift one small
+  table into a scratch namespace a few dozen times (`--tables l1_token_metadata`)
+  and watch for `InvalidDigest`. See `docs/MINIO_ASSESSMENT.md` §7.3.
 - **Lifts are bounded.** `_lift_state.json` in the staging dir records the last
   successful lift; the next run reads only rows updated after it (1h margin) and
   checks only those against the lake. Row counts come from table metadata, never
