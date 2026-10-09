@@ -777,9 +777,14 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     iceberg_report = None
     retention_report = None
     if iceberg:
-        from .iceberg_load import lift_directory
+        from .iceberg_load import lift_directory, read_lift_state, since_with_margin, write_lift_state
         config.load_env()
-        iceberg_report = lift_directory(ns_dir)       # raises on failure -> nothing below runs
+        # Bounded lift: only rows written since the previous successful lift (minus a
+        # 1h margin) are read from the staged CSVs and checked against the lake, so
+        # a daily run costs O(new rows), not O(45 days of staging) over the network.
+        prev_lift = read_lift_state(ns_dir).get("last_success_run_iso") if incremental else None
+        iceberg_report = lift_directory(ns_dir, since_iso=since_with_margin(prev_lift))  # raises on failure
+        write_lift_state(ns_dir, now_iso, iceberg_report)
         # Staged-CSV retention: the lake now holds these rows durably, so the
         # staging files only need to keep the analytics windows (30d) + margin.
         if retention_days and retention_days > 0:

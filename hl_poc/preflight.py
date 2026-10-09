@@ -280,6 +280,22 @@ def check_s3(required: bool) -> Check:
     return _warn("s3", f"credentials accepted but the recent hour files are not published yet (last tried {last_key})")
 
 
+def _tcp_reachable(url: str, timeout: float = 3.0) -> bool:
+    """Can this host open a TCP connection to the host:port of `url`?"""
+    import socket
+    from urllib.parse import urlsplit
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    host = parts.hostname
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def check_iceberg(required: bool) -> Check:
     uri = os.environ.get("NESSIE_URI")
     if not uri:
@@ -297,9 +313,30 @@ def check_iceberg(required: bool) -> Check:
             have = {t[-1] if isinstance(t, tuple) else str(t) for t in catalog.list_tables("hypercore")}
     except Exception as e:  # noqa: BLE001
         return _fail("iceberg", f"REST {uri}: {type(e).__name__}: {str(e)[:140]}")
+    # The REST server's /v1/config OVERRIDES win over our properties. Nessie pushes
+    # its `external-endpoint` as s3.endpoint: if that is a Docker-gateway or
+    # otherwise private address, listing namespaces works but every data read and
+    # write would hang. Same for the FileIO class: a server default of FsspecFileIO
+    # needs s3fs, which is not installed; our client property should have won.
+    props = dict(getattr(catalog, "properties", {}) or {})
+    s3_ep = props.get("s3.endpoint")
+    io_impl = props.get("py-io-impl") or ""
+    fails = []
+    if s3_ep and not _tcp_reachable(s3_ep):
+        fails.append(f"the catalog advertises S3 endpoint {s3_ep}, unreachable from this host - "
+                     f"Nessie external-endpoint must be an address this host can reach")
+    if "fsspec" in io_impl:
+        try:
+            import s3fs  # noqa: F401
+        except Exception:  # noqa: BLE001
+            fails.append(f"effective py-io-impl is {io_impl} but s3fs is not installed - "
+                         f"set HL_PY_IO_IMPL=pyiceberg.io.pyarrow.PyArrowFileIO or pip install s3fs")
     missing = [t for t in TABLE_PLAN if t not in have]
     detail = (f"REST {uri} branch {os.environ.get('NESSIE_BRANCH', 'main')}: {len(namespaces)} namespace(s), "
-              f"hypercore tables {len(have)}/{len(TABLE_PLAN)}")
+              f"hypercore tables {len(have)}/{len(TABLE_PLAN)}, s3 {s3_ep or '(none advertised)'}, "
+              f"io {io_impl.rsplit('.', 1)[-1] or '?'}")
+    if fails:
+        return _fail("iceberg", detail + "; " + "; ".join(fails))
     if missing:
         notes.append(f"missing {missing} - created from the DDL on the first lift (or create them via docs/PROPOSED_SCHEMA.sql first)")
     if notes:

@@ -110,7 +110,7 @@ Expected: every line `OK` or `WARN`, exit 0. It never prints secret values.
 | `hl_api` | no route to `api.hyperliquid.xyz` (egress firewall / proxy) |
 | `clock` (WARN) | host clock > 60 s off HL's — fix NTP before scheduling |
 | `s3` | the IAM key is invalid/rotated, or the policy lacks `s3:GetObject` with requester-pays; `--s3` makes a missing key a FAIL |
-| `iceberg` | the REST catalog is unreachable or rejects the credentials; `--iceberg` makes "no `NESSIE_URI`" a FAIL. `WARN missing […]` is fine on the first run (tables are created from the DDL) |
+| `iceberg` | the REST catalog is unreachable or rejects the credentials; the S3 endpoint it advertises cannot be reached from this host (fix Nessie `external-endpoint`); the effective FileIO needs a package that is not installed; `--iceberg` makes "no `NESSIE_URI`" a FAIL. `WARN missing […]` is fine on the first run (tables are created from the DDL) |
 
 ## 5. First run — small, then full
 
@@ -146,6 +146,27 @@ Verify from the lake side too (Trino / Spark SQL):
 SELECT count(*), min(block_date), max(block_date) FROM nessie.hypercore.l1_wallet_ledger;
 SELECT * FROM nessie.control.table_watermarks WHERE namespace = 'hypercore';
 ```
+
+### Talking to a Nessie REST catalog from another host
+
+Three things the first real lift against Nessie will hit unless prepared:
+
+- **The endpoint Nessie advertises wins.** Nessie pushes its
+  `nessie.catalog.service.s3.default-options.external-endpoint` to every client as
+  the S3 endpoint, and REST overrides beat the client's `S3_ENDPOINT`. On olympus
+  that value is the Docker gateway `172.17.0.1:9000`, unreachable from any other
+  host: listing namespaces works, every read/write hangs. Set it to a LAN address
+  (and open ports 19120 + 9000 to this host only). `preflight --iceberg` fails
+  with the advertised endpoint in the message when it cannot connect to it.
+- **FileIO.** Nessie's defaults name `pyiceberg.io.fsspec.FsspecFileIO`, which
+  needs `s3fs`; this project pins `pyiceberg.io.pyarrow.PyArrowFileIO` instead
+  (`HL_PY_IO_IMPL`), and defaults `S3_REGION` to `us-east-1` so PyArrow does not
+  ask AWS for the bucket region. Preflight checks the effective class.
+- **Lifts are bounded.** `_lift_state.json` in the staging dir records the last
+  successful lift; the next run reads only rows updated after it (1h margin) and
+  checks only those against the lake. Row counts come from table metadata, never
+  a scan. To re-lift everything (new lake, lost state): `python -m hl_poc.iceberg_load --from $HL_OUT_DIR/hypercore --full`.
+  To retry only the lift after a failed run: the same command without `--full`.
 
 ### Iceberg tables: who creates them
 

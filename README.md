@@ -108,6 +108,7 @@ local catalog), `HYPEREVM_RPC_URL`.
 | `_reconciliation.json` | — | per-wallet cashflow identity assert, `portfolio` oracle check, **chain-wide natural-key collision check**, unmapped ledger types, unpriced symbols |
 | `_run_summary.json`, `_run_history.jsonl` | — | written by `hl_poc.daily`: verdict per run (hard problems vs warnings, per-wallet status, iceberg/retention counts); the history file gets one line per run |
 | `_watermarks.json` | wallet | incremental state: `through_ms`, `coverage_start_ms`, sticky `fills_truncated`, cached lending position |
+| `_lift_state.json` | — | last successful Iceberg lift; the next lift reads only rows updated since (bounded incremental lift) |
 
 ### Validation
 1. **Mapping fidelity (raw vs mapped)**: Σ raw `closedPnl` == Σ `perp_realized_pnl`

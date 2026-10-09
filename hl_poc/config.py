@@ -58,6 +58,9 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                    "catalog under HL_OUT_DIR/iceberg (development only)"),
     "NESSIE_BRANCH": ("main", False, "Nessie branch (pyiceberg REST `prefix`)"),
     "NESSIE_TOKEN": ("", True, "bearer token when the REST catalog is authenticated"),
+    "HL_PY_IO_IMPL": ("pyiceberg.io.pyarrow.PyArrowFileIO", False,
+                      "pyiceberg FileIO class for the REST catalog. Nessie advertises FsspecFileIO, "
+                      "which needs the s3fs package this project does not install"),
     "WAREHOUSE": ("", False, "warehouse location, e.g. s3://warehouse"),
     "S3_ENDPOINT": ("", False, "object-store endpoint for the warehouse (MinIO or S3); unset = AWS"),
     "S3_ACCESS_KEY": ("", True, "warehouse object-store key"),

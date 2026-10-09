@@ -51,6 +51,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from . import config
+from .ops import atomic_write_text
 
 log = logging.getLogger("hl_poc.iceberg_load")
 
@@ -58,6 +59,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DDL_PATH = ROOT / "docs" / "PROPOSED_SCHEMA.sql"      # overridable with HL_DDL_PATH
 DDL_NAMESPACE = "hypercore"          # the namespace whose DDL blocks define the shapes
 CONTROL_NS = "control"
+LIFT_STATE_FILE = "_lift_state.json"  # last successful lift per staging dir (bounded incremental lifts)
+DEFAULT_PY_IO_IMPL = "pyiceberg.io.pyarrow.PyArrowFileIO"
 
 # table -> (natural key columns, mode, partition/scope columns)
 TABLE_PLAN = {
@@ -151,35 +154,113 @@ def rows_to_arrow(rows: list[dict], cols: list[tuple], tz: bool = True) -> pa.Ta
     return pa.Table.from_pydict(data, schema=arrow_schema(cols, tz))
 
 
-def read_csv_rows(path: Path) -> list[dict]:
+def _parse_iso(value) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        v = dt.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return v if v.tzinfo else v.replace(tzinfo=dt.timezone.utc)
+
+
+def read_csv_rows(path: Path, since_iso: str | None = None, fallback_ts_col: str | None = None) -> list[dict]:
+    """Rows of a staged CSV. With `since_iso`, only rows whose timestamp is later —
+    `updated_at` when the table has it (what the extractor wrote after the previous
+    successful lift), else `fallback_ts_col` (e.g. as_of_ts for the l4x snapshot,
+    whose rows carry no updated_at). The filter is applied while streaming, so
+    memory is bounded by the NEW rows, not by the file (a market-maker wallet
+    stages ~180k rows/day; 45 days of that is gigabytes as Python dicts). Rows
+    without a parseable timestamp are kept, never dropped."""
+    since = _parse_iso(since_iso)
+    out: list[dict] = []
     with path.open("r", newline="", encoding="utf-8") as fh:
-        return list(csv.DictReader(fh))
+        reader = csv.DictReader(fh)
+        header = reader.fieldnames or []
+        ts_col = "updated_at" if "updated_at" in header else (fallback_ts_col if fallback_ts_col in header else None)
+        for r in reader:
+            if since is not None and ts_col is not None:
+                ts = _parse_iso(r.get(ts_col))
+                if ts is not None and ts <= since:
+                    continue
+            out.append(r)
+    return out
+
+
+def since_with_margin(last_success_iso: str | None, hours: float = 1.0) -> str | None:
+    """Lift cut-off = previous successful run start minus a safety margin (clock
+    skew, a manual run that finished during the previous lift). Re-lifted rows are
+    skipped by insert-if-absent, so the margin costs little."""
+    t = _parse_iso(last_success_iso)
+    if t is None:
+        return None
+    return (t - dt.timedelta(hours=hours)).isoformat()
+
+
+def read_lift_state(src_dir: Path) -> dict:
+    p = Path(src_dir) / LIFT_STATE_FILE
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a corrupt marker just means a full lift
+        return {}
+
+
+def write_lift_state(src_dir: Path, run_iso: str, report: dict | None = None) -> None:
+    """Record a SUCCESSFUL lift (lift_directory raised otherwise). The next
+    incremental lift only reads rows updated after this run started."""
+    state = {"last_success_run_iso": run_iso,
+             "written_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+             "tables": {k: v.get("written") for k, v in (report or {}).items()
+                        if isinstance(v, dict) and "written" in v}}
+    atomic_write_text(Path(src_dir) / LIFT_STATE_FILE, json.dumps(state, indent=2))
 
 
 # --- catalog ---------------------------------------------------------------------
+
+def _rest_props(uri: str) -> dict:
+    """pyiceberg REST-catalog properties from the environment (the same variable
+    names the atlas Rust services read). Two defaults are deliberate:
+
+      * py-io-impl = PyArrowFileIO. Nessie's /v1/config DEFAULTS advertise
+        pyiceberg.io.fsspec.FsspecFileIO, which needs the s3fs package this project
+        does not install; client properties beat server defaults, and pyarrow is a
+        dependency anyway. HL_PY_IO_IMPL overrides.
+      * s3.region = us-east-1 when unset (like the Rust crates): PyArrowFileIO
+        otherwise asks AWS for the bucket's region, which fails against MinIO/
+        SeaweedFS endpoints.
+
+    Nessie's OVERRIDES — notably s3.endpoint = its configured external-endpoint —
+    beat anything set here, so the endpoint the catalog advertises must be
+    reachable from THIS host; `hl_poc.preflight --iceberg` checks exactly that.
+    """
+    branch = os.environ.get("NESSIE_BRANCH") or "main"
+    props = {"type": "rest", "uri": uri.rstrip("/"), "prefix": branch,
+             "warehouse": os.environ.get("WAREHOUSE") or "s3://warehouse",
+             "py-io-impl": os.environ.get("HL_PY_IO_IMPL") or DEFAULT_PY_IO_IMPL}
+    token = os.environ.get("NESSIE_TOKEN") or os.environ.get("ICEBERG_REST_TOKEN")
+    if token:
+        props["token"] = token
+    ep = os.environ.get("S3_ENDPOINT") or os.environ.get("MINIO_ENDPOINT") or os.environ.get("AWS_ENDPOINT_URL")
+    if ep:
+        props["s3.endpoint"] = ep
+    ak = os.environ.get("S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID")
+    sk = os.environ.get("S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if ak and sk:
+        props["s3.access-key-id"] = ak
+        props["s3.secret-access-key"] = sk
+    props["s3.region"] = os.environ.get("S3_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+    return props
+
 
 def load_catalog_from_env(local_dir: Path | None = None):
     from pyiceberg.catalog import load_catalog
     uri = os.environ.get("NESSIE_URI")
     if uri:
-        branch = os.environ.get("NESSIE_BRANCH", "main")
-        props = {"type": "rest", "uri": uri.rstrip("/"), "prefix": branch,
-                 "warehouse": os.environ.get("WAREHOUSE", "s3://warehouse")}
-        token = os.environ.get("NESSIE_TOKEN") or os.environ.get("ICEBERG_REST_TOKEN")
-        if token:
-            props["token"] = token
-        ep = os.environ.get("S3_ENDPOINT") or os.environ.get("MINIO_ENDPOINT") or os.environ.get("AWS_ENDPOINT_URL")
-        if ep:
-            props["s3.endpoint"] = ep
-        ak = os.environ.get("S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID")
-        sk = os.environ.get("S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
-        if ak and sk:
-            props["s3.access-key-id"] = ak
-            props["s3.secret-access-key"] = sk
-        region = os.environ.get("S3_REGION") or os.environ.get("AWS_REGION")
-        if region:
-            props["s3.region"] = region
-        log.info("iceberg catalog: REST %s (prefix/branch %s)", uri, branch)
+        props = _rest_props(uri)
+        log.info("iceberg catalog: REST %s (prefix/branch %s, io %s)", uri, props["prefix"],
+                 props["py-io-impl"].rsplit(".", 1)[-1])
         return load_catalog("nessie", **props), "rest"
     local = Path(local_dir or (config.out_root() / "iceberg")).resolve()
     local.mkdir(parents=True, exist_ok=True)
@@ -335,15 +416,39 @@ def write_watermark(catalog, namespace: str, table_name: str, watermark_col: str
 
 # --- driver ------------------------------------------------------------------------
 
+def _table_row_count(table) -> int | None:
+    """Row count from METADATA only: the snapshot summary's total-records, else the
+    sum of data-file record counts from the manifests. Never reads data — the old
+    `table.scan().to_arrow().num_rows` pulled every table in full over the network
+    on every daily run just to report a number."""
+    snap = table.current_snapshot()
+    if snap is None:
+        return 0
+    summary = getattr(snap, "summary", None)
+    if summary is not None:
+        try:
+            v = summary.get("total-records") if hasattr(summary, "get") else summary["total-records"]
+            if v is not None:
+                return int(v)
+        except (KeyError, TypeError, ValueError):
+            pass
+    try:
+        return sum(int(t.file.record_count) for t in table.scan().plan_files())
+    except Exception:  # noqa: BLE001 — a count is reporting, never worth failing a lift
+        return None
+
+
 def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
-                   tables: list[str] | None = None, namespace: str = DDL_NAMESPACE) -> dict:
+                   tables: list[str] | None = None, namespace: str = DDL_NAMESPACE,
+                   since_iso: str | None = None) -> dict:
     """Load every known CSV in src_dir into Iceberg `namespace`. Returns a report.
-    Data lifts first; watermarks are a final, non-fatal step."""
+    Data lifts first; watermarks are a final, non-fatal step. With `since_iso` only
+    rows updated after that instant are lifted (bounded incremental lift)."""
     if catalog is None:
         catalog, _ = load_catalog_from_env(local_dir)
     ddl = parse_ddl()
     run_id = uuid.uuid4().hex[:12]
-    report: dict[str, dict] = {}
+    report: dict[str, dict] = {"_since": since_iso}
     pending_wm: list[tuple] = []
     for name, (key_cols, mode, scope_cols) in TABLE_PLAN.items():
         if tables and name not in tables:
@@ -352,12 +457,12 @@ def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
         if not csv_path.exists():
             continue
         spec = ddl[name]
-        rows = read_csv_rows(csv_path)
+        rows = read_csv_rows(csv_path, since_iso, fallback_ts_col=_WATERMARK_COL[name])
         arrow = rows_to_arrow(rows, spec["columns"], tz=True)
         table = ensure_table(catalog, namespace, name, spec, tz=True)
         counts = load_table(table, arrow, key_cols, mode, scope_cols)
         table.refresh()
-        total = table.scan().to_arrow().num_rows
+        total = _table_row_count(table)
         snap = table.current_snapshot()
         wm_col = _WATERMARK_COL[name]
         wm_vals = [v for v in arrow.column(wm_col).to_pylist() if v is not None] if arrow.num_rows else []
@@ -367,8 +472,8 @@ def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
             pending_wm.append((name, wm_col, wm_ts, total, snap.snapshot_id if snap else None))
         counts["table_total"] = total
         report[name] = counts
-        log.info("lift %-28s incoming=%6d written=%6d total=%7d", name, counts["incoming"],
-                 counts["written"], total)
+        log.info("lift %-28s incoming=%6d written=%6d total=%7s", name, counts["incoming"],
+                 counts["written"], "?" if total is None else total)
     wm_status = {}
     for name, wm_col, wm_ts, total, snap_id in pending_wm:
         try:
@@ -389,10 +494,21 @@ def main() -> None:
     ap.add_argument("--namespace", default=DDL_NAMESPACE, help="target namespace (hypercore | hyperevm)")
     ap.add_argument("--local-dir", default=None, help="local catalog dir (default HL_OUT_DIR/iceberg)")
     ap.add_argument("--tables", default=None, help="comma-separated subset")
+    ap.add_argument("--since", default=None,
+                    help="lift only rows updated after this ISO instant (default: the last successful "
+                         f"lift recorded in {LIFT_STATE_FILE} minus 1h)")
+    ap.add_argument("--full", action="store_true", help="ignore the lift state: lift every staged row")
     args = ap.parse_args()
     tables = [t for t in args.tables.split(",") if t] if args.tables else None
-    rep = lift_directory(Path(args.src), local_dir=Path(args.local_dir) if args.local_dir else None,
-                         tables=tables, namespace=args.namespace)
+    src = Path(args.src)
+    run_iso = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+    since = None
+    if not args.full:
+        since = args.since or since_with_margin(read_lift_state(src).get("last_success_run_iso"))
+    rep = lift_directory(src, local_dir=Path(args.local_dir) if args.local_dir else None,
+                         tables=tables, namespace=args.namespace, since_iso=since)
+    if not tables:                    # a partial (subset) lift must not advance the marker
+        write_lift_state(src, run_iso, rep)
     print(json.dumps(rep, indent=2, default=str))
 
 
