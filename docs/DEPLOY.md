@@ -41,7 +41,7 @@ transfer; set a billing alert anyway.
 | OS | Linux x86_64 (Ubuntu 22.04+/Debian 12+) | Windows only for development |
 | Python | 3.12 or 3.13 | CI-tested; 3.14 works for development |
 | CPU / RAM | 2 vCPU / 4 GB | S3 hour files decompress to ~130–330 MB each and are parsed one at a time; peak RSS ~1.5 GB |
-| Disk | 20 GB for `HL_OUT_DIR` | staged CSVs are bounded by `HL_RETENTION_DAYS`; a MM wallet stages ~180k rows/day |
+| Disk | 20 GB for `HL_OUT_DIR` on a **local** disk | staged CSVs are bounded by `HL_RETENTION_DAYS`; a MM wallet stages ~180k rows/day. Not on an NFS/CIFS mount: every upsert rewrites the CSV whole and the dev catalog is SQLite (preflight warns) |
 | Network | outbound HTTPS to `api.hyperliquid.xyz`, `*.amazonaws.com`, and the Nessie / warehouse endpoints | no inbound ports |
 | Clock | NTP | time windows and watermarks depend on it; preflight checks skew against HL |
 
@@ -81,7 +81,7 @@ Every variable is documented in `hl_poc/config.py` (`ENV_VARS`); the important o
 
 | variable | set it to |
 |---|---|
-| `HL_OUT_DIR` | `/var/lib/hypercore` — the state directory (watermarks, staged CSVs, run summaries). Back it up or accept re-pulling on loss (see §9) |
+| `HL_OUT_DIR` | `/var/lib/hypercore` — the state directory (watermarks, staged CSVs, run summaries) on a local disk, never the NAS mount. Back it up or accept re-pulling on loss (see §9) |
 | `HL_WEIGHT_BUDGET` | `600` if anything else on this IP polls Hyperliquid, else up to `900` |
 | `HL_RETENTION_DAYS` | `45` (≥ 31; the 30-day analytics windows read the staged CSV) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | the new scoped key from §0 |
@@ -104,7 +104,7 @@ Expected: every line `OK` or `WARN`, exit 0. It never prints secret values.
 | check | FAIL means |
 |---|---|
 | `deps`, `tzdata`, `ddl` | the venv is incomplete (`pip install -r requirements.txt -c constraints.txt`) or `HL_DDL_PATH` is wrong |
-| `out_dir` | `HL_OUT_DIR` is not writable by the `hypercore` user |
+| `out_dir` | `HL_OUT_DIR` is not writable by the `hypercore` user. `WARN … network filesystem` means it sits on NFS/CIFS: move it to a local disk |
 | `weight_budget`, `retention` | out-of-range values (budget > 1200 is above HL's cap; 0 < retention < 31 would truncate the 30d windows) |
 | `wallets` | a line is not a 40-hex address |
 | `hl_api` | no route to `api.hyperliquid.xyz` (egress firewall / proxy) |

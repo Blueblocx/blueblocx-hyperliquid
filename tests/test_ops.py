@@ -343,6 +343,34 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(c.status, "WARN")                      # duplicate after lowercasing
             self.assertEqual(preflight.check_wallets(Path(d) / "missing.txt").status, "FAIL")
 
+    def test_mount_fstype_longest_prefix(self):
+        mounts = ("/dev/sda1 / ext4 rw,relatime 0 0\n"
+                  "nas:/volume1/blueblocx /mnt/blueblocx nfs4 rw,vers=4.1,wsize=1048576 0 0\n"
+                  "nas:/volume1/other /mnt/blueblocx/sub\\040dir nfs rw 0 0\n"
+                  "tmpfs /run tmpfs rw 0 0\n")
+        self.assertEqual(preflight.mount_fstype("/mnt/blueblocx/hypercore", mounts), ("/mnt/blueblocx", "nfs4"))
+        self.assertEqual(preflight.mount_fstype("/mnt/blueblocx", mounts), ("/mnt/blueblocx", "nfs4"))
+        self.assertEqual(preflight.mount_fstype("/mnt/blueblocx/sub dir/x", mounts), ("/mnt/blueblocx/sub dir", "nfs"))
+        self.assertEqual(preflight.mount_fstype("/var/lib/hypercore", mounts), ("/", "ext4"))
+        self.assertEqual(preflight.mount_fstype("/mnt/blueblocxfoo", mounts), ("/", "ext4"))   # no false prefix match
+        self.assertIn("nfs4", preflight._NETWORK_FS)
+        self.assertNotIn("ext4", preflight._NETWORK_FS)
+
+    def test_out_dir_on_network_fs_warns(self):
+        mounts = "/dev/sda1 / ext4 rw 0 0\nnas:/v /mnt/blueblocx nfs4 rw 0 0\n"
+        real_mount_fstype = preflight.mount_fstype          # the mock below must not recurse into itself
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(preflight, "mount_fstype",
+                                   side_effect=lambda target, mounts_text=None: real_mount_fstype(
+                                       "/mnt/blueblocx/hypercore", mounts)):
+                c = preflight.check_out_dir(Path(d))
+            self.assertEqual(c.status, "WARN")
+            self.assertIn("network filesystem (nfs4 at /mnt/blueblocx)", c.detail)
+            with mock.patch.object(preflight, "mount_fstype", return_value=("/", "ext4")):
+                c = preflight.check_out_dir(Path(d))
+            self.assertIn(c.status, ("OK", "WARN"))              # WARN only if the temp disk is nearly full
+            self.assertNotIn("network filesystem", c.detail)
+
     def test_iceberg_required_without_rest_fails(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("NESSIE_URI", None)

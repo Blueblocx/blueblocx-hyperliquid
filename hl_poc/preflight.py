@@ -27,6 +27,32 @@ from . import __version__, config
 _ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 _HL_MAX_WEIGHT = 1200          # documented per-IP cap
 _MIN_RETENTION_DAYS = 31       # the 30d analytics windows need this much staged history
+# Filesystem types where the state dir should NOT live: staged CSVs are rewritten
+# whole on every upsert, the dev catalog is SQLite, and every run does thousands
+# of small file operations - all slow or unsafe over a network filesystem.
+_NETWORK_FS = {"nfs", "nfs3", "nfs4", "cifs", "smb3", "smbfs", "9p", "fuse.sshfs", "fuse.rclone",
+               "fuse.s3fs", "fuse.juicefs", "glusterfs", "ceph", "lustre", "afs", "davfs", "fuse.davfs2"}
+
+
+def mount_fstype(target: str, mounts_text: str | None = None) -> tuple[str, str] | None:
+    """(mount_point, fstype) of the longest-prefix mount containing `target`, read from
+    /proc/mounts (Linux). None when the table is unavailable (Windows, macOS)."""
+    if mounts_text is None:
+        try:
+            mounts_text = Path("/proc/mounts").read_text(encoding="utf-8")
+        except OSError:
+            return None
+    target = target.rstrip("/") or "/"
+    best: tuple[str, str] | None = None
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mp = parts[1].replace("\\040", " ")
+        if mp == "/" or target == mp or target.startswith(mp.rstrip("/") + "/"):
+            if best is None or len(mp) > len(best[0]):
+                best = (mp, parts[2])
+    return best
 
 
 @dataclass
@@ -122,8 +148,20 @@ def check_out_dir(out_dir: Path) -> Check:
     wm = out_dir / "hypercore" / "_watermarks.json"
     state = "existing state (watermarks present)" if wm.exists() else "fresh (no watermarks yet)"
     detail = f"{out_dir} writable, {state}" + (f", {free_gb:.1f} GB free" if free_gb is not None else "")
+    notes = []
     if free_gb is not None and free_gb < 2.0:
-        return _warn("out_dir", detail + " - under 2 GB; S3 hour files decompress to ~330 MB each")
+        notes.append("under 2 GB; S3 hour files decompress to ~330 MB each")
+    try:
+        mount = mount_fstype(out_dir.resolve().as_posix())
+    except OSError:
+        mount = None
+    if mount and mount[1] in _NETWORK_FS:
+        notes.append(f"on a network filesystem ({mount[1]} at {mount[0]}): staged CSVs are rewritten "
+                     f"whole on every upsert and the dev catalog is SQLite - put HL_OUT_DIR on a local disk")
+    elif mount:
+        detail += f", {mount[1]}"
+    if notes:
+        return _warn("out_dir", detail + " - " + "; ".join(notes))
     return _ok("out_dir", detail)
 
 
