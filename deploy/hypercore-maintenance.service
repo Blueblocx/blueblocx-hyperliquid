@@ -1,0 +1,23 @@
+# /etc/systemd/system/hypercore-maintenance.service
+# Nightly: expire Iceberg snapshots older than 7 days on the pipeline's tables and
+# make sure the metadata-retention properties are set. Shares the run lock with the
+# scheduled extract, so it waits for (or is skipped by) a running lift.
+[Unit]
+Description=HyperCore lake maintenance (expire snapshots)
+After=network-online.target
+RequiresMountsFor=/mnt/blueblocx
+
+[Service]
+Type=oneshot
+User=hypercore
+Group=hypercore
+WorkingDirectory=/opt/hyperliquid-poc
+EnvironmentFile=/etc/hypercore/hypercore.env
+ExecStart=/opt/hyperliquid-poc/.venv/bin/python -m hl_poc.maintenance --expire-days 7
+TimeoutStartSec=30min
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hypercore /mnt/blueblocx/hypercore

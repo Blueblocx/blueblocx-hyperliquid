@@ -235,6 +235,154 @@ class CatalogModeTests(unittest.TestCase):
             self.assertIn("/cat2/warehouse", catalog.properties["warehouse"])
 
 
+class CommitFanOutTests(unittest.TestCase):
+    """Hourly cadence lives or dies by the number of Iceberg commits per lift."""
+
+    def _l4x_rows(self, wallets, as_of_date, as_of_ts):
+        from hl_poc import schema as S
+        rows = []
+        for w in wallets:
+            for coin in ("BTC", "ETH"):
+                r = {c: "" for c in S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS}
+                r.update({"as_of_date": as_of_date, "wallet_address": w, "coin": coin, "as_of_ts": as_of_ts,
+                          "dex": "main", "unrealized_pnl_usd": "1.5"})
+                rows.append(r)
+        return rows
+
+    def test_replace_scope_is_one_delete_per_day_and_watermarks_two_commits(self):
+        from hl_poc import schema as S
+        wallets = [f"0x{i:040x}" for i in range(1, 8)]          # 7 wallets, same day
+        day = "2026-10-12"
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            cols = S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS
+            ts1 = "2026-10-12T01:00:00+00:00"
+            with (src / "l4x_perp_position_snapshot.csv").open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=cols)
+                w.writeheader()
+                w.writerows(self._l4x_rows(wallets, day, ts1))
+            env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
+                   "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": ""}
+            with mock.patch.dict(os.environ, env):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    rep1 = il.lift_directory(src, catalog=catalog)                 # empty table: no delete commit
+                    ts2 = "2026-10-12T02:00:00+00:00"
+                    with (src / "l4x_perp_position_snapshot.csv").open("w", newline="", encoding="utf-8") as fh:
+                        w = csv.DictWriter(fh, fieldnames=cols)
+                        w.writeheader()
+                        w.writerows(self._l4x_rows(wallets, day, ts2))
+                    rep2 = il.lift_directory(src, catalog=catalog)                 # replaces the day for all 7
+                    l4x = catalog.load_table("hypercore.l4x_perp_position_snapshot")
+                    wm = catalog.load_table("control.table_watermarks")
+                    l4x_snaps = len(list(l4x.snapshots()))
+                    wm_snaps = len(list(wm.snapshots()))
+                    total = il._table_row_count(l4x)
+                finally:
+                    catalog.engine.dispose()
+            self.assertEqual(rep1["l4x_perp_position_snapshot"]["written"], 14)
+            self.assertEqual(rep2["l4x_perp_position_snapshot"]["delete_commits"], 1)     # not 7
+            self.assertEqual(rep2["l4x_perp_position_snapshot"]["replaced_scopes"], 7)
+            self.assertEqual(total, 14)                                                   # replaced, not doubled
+            self.assertLessEqual(l4x_snaps, 3)            # append, delete, append
+            self.assertLessEqual(wm_snaps, 3)             # (skipped delete +) append, then delete + append
+            self.assertEqual(rep2["_watermarks"], {"l4x_perp_position_snapshot": "written"})
+            self.assertEqual(l4x.properties.get("write.metadata.delete-after-commit.enabled"), "true")
+
+    def test_write_watermarks_batch_is_monotonic_per_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
+                   "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": ""}
+            t_new = dt.datetime(2026, 10, 12, 3, tzinfo=dt.timezone.utc)
+            t_old = dt.datetime(2026, 10, 11, 3, tzinfo=dt.timezone.utc)
+            with mock.patch.dict(os.environ, env):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    s1 = il.write_watermarks(catalog, "hypercore",
+                                             [("a", "block_timestamp", t_new, 10, 1), ("b", "block_timestamp", t_old, 5, 2)], "r1")
+                    s2 = il.write_watermarks(catalog, "hypercore",
+                                             [("a", "block_timestamp", t_old, 11, 3), ("b", "block_timestamp", t_new, 6, 4)], "r2")
+                    tbl = catalog.load_table("control.table_watermarks")
+                    rows = {r["table_name"]: r for r in tbl.scan().to_arrow().to_pylist()}
+                finally:
+                    catalog.engine.dispose()
+            self.assertEqual(s1, {"a": "written", "b": "written"})
+            self.assertEqual(s2, {"a": "kept_newer", "b": "written"})
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows["a"]["row_count"], 10)          # the older watermark did not overwrite
+            self.assertEqual(rows["b"]["row_count"], 6)
+
+
+class WarehouseMountTests(unittest.TestCase):
+    def test_require_warehouse_mount(self):
+        from hl_poc import ops
+        with mock.patch.dict(os.environ, {"HL_WAREHOUSE_MOUNT": "/mnt/blueblocx"}):
+            with mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
+                with self.assertRaises(RuntimeError) as cm:
+                    il.require_warehouse_mount(Path("/mnt/blueblocx/hypercore/warehouse"))
+                self.assertIn("is the NAS mounted", str(cm.exception))
+            with mock.patch.object(ops, "mount_fstype", return_value=("/mnt/blueblocx", "nfs4")):
+                il.require_warehouse_mount(Path("/mnt/blueblocx/hypercore/warehouse"))      # no raise
+            with mock.patch.object(ops, "mount_fstype", return_value=None):
+                il.require_warehouse_mount(Path("/mnt/blueblocx/hypercore/warehouse"))      # Windows: no table
+        with mock.patch.dict(os.environ, {"HL_WAREHOUSE_MOUNT": ""}):
+            with mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
+                il.require_warehouse_mount(Path("/anything"))                               # unset: no-op
+
+    def test_preflight_fails_when_nas_not_mounted(self):
+        from hl_poc import ops
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
+                   "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": "/mnt/blueblocx"}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
+                c = preflight.check_iceberg(required=True)
+            self.assertEqual(c.status, "FAIL")
+            self.assertIn("HL_WAREHOUSE_MOUNT=/mnt/blueblocx", c.detail)
+            self.assertFalse((root / "wh").exists())      # nothing was created on the wrong disk
+
+
+class MaintenanceTests(unittest.TestCase):
+    def test_expire_snapshots_keeps_current(self):
+        from hl_poc import maintenance
+        from hl_poc import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
+                   "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": ""}
+            with mock.patch.dict(os.environ, env):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    for i in range(3):                        # three lifts -> three append snapshots
+                        now = f"2026-10-12T0{i}:00:00+00:00"
+                        with (src / "token_whitelist.csv").open("w", newline="", encoding="utf-8") as fh:
+                            w = csv.DictWriter(fh, fieldnames=S.TOKEN_WHITELIST_COLUMNS)
+                            w.writeheader()
+                            w.writerow({"token_address": f"hlcore:token:{i}", "token_group": 1, "is_active": True,
+                                        "whitelist_reason": "x", "created_at": now, "updated_at": now})
+                        il.lift_directory(src, catalog=catalog, tables=["token_whitelist"])
+                    tbl = catalog.load_table("hypercore.token_whitelist")
+                    before = len(list(tbl.snapshots()))
+                    rep = maintenance.run("hypercore", expire_days=0.0, catalog=catalog)
+                    tbl.refresh()
+                    after = len(list(tbl.snapshots()))
+                    total = il._table_row_count(tbl)
+                finally:
+                    catalog.engine.dispose()
+            self.assertGreaterEqual(before, 3)
+            self.assertEqual(after, 1)                                   # only the current snapshot survives
+            self.assertEqual(total, 3)                                   # data intact
+            entry = rep["tables"]["hypercore.token_whitelist"]
+            self.assertEqual(entry["expired"], before - 1)
+            self.assertIn("skipped", rep["tables"]["hypercore.l1_wallet_ledger"])   # never created: skipped
+
+
 class PreflightSqlCatalogTests(unittest.TestCase):
     def test_sql_catalog_requires_warehouse(self):
         with mock.patch.dict(os.environ, {"NESSIE_URI": "", "HL_CATALOG_URI": "sqlite:///x.db", "WAREHOUSE": ""}):

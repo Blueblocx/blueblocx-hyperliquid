@@ -127,6 +127,37 @@ class OpsTests(unittest.TestCase):
                 self.assertNotEqual(p.read_text(encoding="utf-8"), '{"pid": 1}')
             self.assertFalse(p.exists())
 
+    def test_run_lock_discards_lock_of_dead_pid(self):
+        import socket
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / ".daily.lock"
+            p.write_text(json.dumps({"pid": 2_000_000_000, "host": socket.gethostname()}), encoding="utf-8")
+            if Path("/proc").is_dir():                     # Linux: liveness is known -> lock is abandoned
+                with ops.RunLock(p, stale_hours=12):
+                    self.assertNotIn("2000000000", p.read_text(encoding="utf-8"))
+            else:                                          # Windows: unknown -> fall back to the age rule
+                with self.assertRaises(ops.LockHeld):
+                    with ops.RunLock(p, stale_hours=12):
+                        pass
+
+    def test_should_alert_dedupes_unchanged_problems(self):
+        now = dt.datetime(2026, 10, 12, 10, tzinfo=dt.timezone.utc)
+        cur = {"ok": False, "problems": ["0xaaaa0000:fidelity"], "finished_at": now.isoformat()}
+        with mock.patch.dict(os.environ, {"HL_ALERT_ON_SUCCESS": "0", "HL_ALERT_REPEAT_HOURS": "6"}):
+            self.assertTrue(ops.should_alert(cur, None, now=now))                           # first time
+            prev = {"ok": False, "problems": ["0xaaaa0000:fidelity"], "alert_sent": True,
+                    "alert_sent_at": (now - dt.timedelta(hours=2)).isoformat()}
+            self.assertFalse(ops.should_alert(cur, prev, now=now))                          # same, 2h ago
+            prev_old = dict(prev, alert_sent_at=(now - dt.timedelta(hours=7)).isoformat())
+            self.assertTrue(ops.should_alert(cur, prev_old, now=now))                       # same, 7h ago
+            changed = dict(cur, problems=["0xaaaa0000:fidelity", "0xbbbb0000:perp_oracle"])
+            self.assertTrue(ops.should_alert(changed, prev, now=now))                       # new problem
+            prev_unsent = dict(prev, alert_sent=False)
+            self.assertTrue(ops.should_alert(cur, prev_unsent, now=now))                    # never actually sent
+            self.assertFalse(ops.should_alert({"ok": True, "problems": []}, None, now=now))
+        with mock.patch.dict(os.environ, {"HL_ALERT_ON_SUCCESS": "1"}):
+            self.assertTrue(ops.should_alert({"ok": True, "problems": []}, None, now=now))
+
     def test_build_summary_classifies_hard_problems_and_warnings(self):
         wallets = ["0xaaaa0000000000000000000000000000000000aa",
                    "0xbbbb0000000000000000000000000000000000bb",
@@ -245,6 +276,44 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(extract.prune_csv(Path("does/not/exist.csv"), "block_timestamp", 0), {"kept": 0, "dropped": 0})
 
 
+class StagingLoaderTests(unittest.TestCase):
+    def test_grouped_loaders_match_per_wallet_loaders(self):
+        from hl_poc import schema as S
+        a, b, c = "0x" + "a" * 40, "0x" + "b" * 40, "0x" + "c" * 40
+        now_ms = int(dt.datetime(2026, 10, 12, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as d:
+            l1 = Path(d) / "l1_wallet_ledger.csv"
+            with l1.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=S.L1_WALLET_LEDGER_COLUMNS)
+                w.writeheader()
+                for i, wallet in enumerate([a, a, b, c, c, c]):
+                    row = {col: "" for col in S.L1_WALLET_LEDGER_COLUMNS}
+                    row.update({"wallet_address": wallet, "tx_hash": f"h{i}", "event_index": i, "direction": "in",
+                                "amount_signed": str(i + 0.5), "block_timestamp": "2026-10-12T10:00:00+00:00"})
+                    w.writerow(row)
+            grouped = extract._load_ledger_rows_by_wallet(l1, {a, b, "0x" + "d" * 40})
+            self.assertEqual({k: len(v) for k, v in grouped.items()}, {a: 2, b: 1, "0x" + "d" * 40: 0})
+            self.assertEqual(grouped[a], extract._load_wallet_ledger_rows(l1, a))
+            self.assertEqual(grouped[a][1]["amount_signed"], 1.5)                   # typed
+            self.assertEqual(grouped[a][1]["event_index"], 1)
+
+            l4x = Path(d) / "l4x_perp_position_snapshot.csv"
+            with l4x.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS)
+                w.writeheader()
+                for wallet, hours_ago, pnl in [(a, 24, "3"), (a, 25, "100"), (a, 2, "7"), (b, 30, "9")]:
+                    row = {col: "" for col in S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS}
+                    ts = dt.datetime.fromtimestamp(now_ms / 1000, tz=dt.timezone.utc) - dt.timedelta(hours=hours_ago)
+                    row.update({"wallet_address": wallet, "coin": "BTC", "as_of_date": ts.date().isoformat(),
+                                "as_of_ts": ts.isoformat(), "unrealized_pnl_usd": pnl})
+                    w.writerow(row)
+            prior = extract._load_prior_unrealized_all(l4x, {a, b}, now_ms)
+            self.assertEqual(prior[a][0], 3.0)                                        # latest snapshot in the 20-28h band
+            self.assertAlmostEqual(prior[a][1], 24.0, places=3)
+            self.assertEqual(prior[b], (None, None))                                  # 30h: outside the band
+            self.assertEqual(prior[a], extract._load_prior_unrealized(l4x, a, now_ms))
+
+
 class DailyMainTests(unittest.TestCase):
     W = ["0xaaaa0000000000000000000000000000000000aa", "0xbbbb0000000000000000000000000000000000bb"]
 
@@ -300,15 +369,20 @@ class DailyMainTests(unittest.TestCase):
             code, _, _, _ = self._run(d, recon=_clean_recon([]), wallets=[])
             self.assertEqual(code, 2)
 
-    def test_lock_held_exit_three(self):
+    def test_lock_held_exit_three_but_summarised(self):
+        import socket
         with tempfile.TemporaryDirectory() as d:
             lock = Path(d) / "out" / "hypercore" / ".daily.lock"
             lock.parent.mkdir(parents=True)
-            lock.write_text('{"pid": 999}', encoding="utf-8")
+            # a LIVE holder (this process) so the lock is not discarded as abandoned
+            lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}), encoding="utf-8")
             code, summary, captured, _ = self._run(d, recon=_clean_recon(self.W))
             self.assertEqual(code, 3)
-            self.assertIsNone(summary)
             self.assertEqual(captured, {})           # extract.run never called
+            self.assertIsNotNone(summary)            # a stuck lock is never silent
+            self.assertTrue(summary["lock_held"])
+            self.assertTrue(summary["problems"][0].startswith("error:LockHeld"))
+            self.assertTrue(lock.exists())           # we did not steal a live lock
 
 
 class PreflightTests(unittest.TestCase):
@@ -328,10 +402,13 @@ class PreflightTests(unittest.TestCase):
             by = {c.name: c for c in preflight.check_env(None)}
             self.assertEqual(by["weight_budget"].status, "FAIL")
             self.assertEqual(by["retention"].status, "FAIL")
-        with mock.patch.dict(os.environ, {"HL_WEIGHT_BUDGET": "1000", "HL_RETENTION_DAYS": "0"}, clear=False):
+        with mock.patch.dict(os.environ, {"HL_WEIGHT_BUDGET": "1150", "HL_RETENTION_DAYS": "0"}, clear=False):
             by = {c.name: c for c in preflight.check_env(None)}
-            self.assertEqual(by["weight_budget"].status, "WARN")
+            self.assertEqual(by["weight_budget"].status, "WARN")               # no headroom under the 1200 cap
             self.assertEqual(by["retention"].status, "OK")
+        with mock.patch.dict(os.environ, {"HL_WEIGHT_BUDGET": "1000"}, clear=False):
+            by = {c.name: c for c in preflight.check_env(None)}
+            self.assertEqual(by["weight_budget"].status, "OK")                 # the TS poller is not on this IP
 
     def test_wallet_file_validation(self):
         with tempfile.TemporaryDirectory() as d:

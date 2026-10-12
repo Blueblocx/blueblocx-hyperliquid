@@ -160,19 +160,28 @@ def _load_watermarks(path: Path) -> dict:
     return {}
 
 
-def _load_wallet_ledger_rows(path: Path, wallet: str) -> list[dict]:
-    """Read a wallet's rows already on disk (typed enough for analytics)."""
-    if not path.exists():
-        return []
-    out = []
+def _load_ledger_rows_by_wallet(path: Path, wallets: set[str]) -> dict[str, list[dict]]:
+    """ONE pass over the staged ledger: rows of every wallet in `wallets`, typed
+    enough for analytics. The per-wallet variant below used to re-read the whole
+    file once per wallet (O(wallets x file): hours per run at a few hundred
+    wallets with 45 days of staging)."""
+    out: dict[str, list[dict]] = {w: [] for w in wallets}
+    if not path.exists() or not wallets:
+        return out
     with path.open("r", newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
-            if r.get("wallet_address") != wallet:
+            rows = out.get(r.get("wallet_address"))
+            if rows is None:
                 continue
             r["amount_signed"] = float(r["amount_signed"] or 0)
             r["event_index"] = int(r["event_index"] or 0)
-            out.append(r)
+            rows.append(r)
     return out
+
+
+def _load_wallet_ledger_rows(path: Path, wallet: str) -> list[dict]:
+    """Read a wallet's rows already on disk (typed enough for analytics)."""
+    return _load_ledger_rows_by_wallet(path, {wallet})[wallet]
 
 
 def _load_token_meta(path: Path) -> dict[str, dict]:
@@ -195,27 +204,35 @@ def plan_s3_window(gaps: list[tuple[int, int]]) -> tuple[int, int] | None:
     return min(s for s, _ in gaps), max(e for _, e in gaps)
 
 
-def _load_prior_unrealized(path: Path, wallet: str, now_ms: int,
-                           min_age_h: float = 20.0, max_age_h: float = 28.0):
-    """Σ unrealized_pnl_usd from the wallet's l4x snapshot taken ~24h ago (the
-    previous daily run). Returns (value, age_hours) or (None, None)."""
-    if not path.exists():
-        return None, None
-    best_ts, total = None, 0.0
-    rows = []
+def _load_prior_unrealized_all(path: Path, wallets: set[str], now_ms: int,
+                               min_age_h: float = 20.0, max_age_h: float = 28.0) -> dict[str, tuple]:
+    """ONE pass over the l4x snapshot CSV: for every wallet, Σ unrealized_pnl_usd of
+    its latest snapshot taken 20-28 h ago -> {wallet: (value, age_hours)}; wallets
+    without such a snapshot map to (None, None)."""
+    out: dict[str, tuple] = {w: (None, None) for w in wallets}
+    if not path.exists() or not wallets:
+        return out
+    rows_by_wallet: dict[str, list[tuple]] = {}
     with path.open("r", newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
-            if r.get("wallet_address") != wallet:
+            w = r.get("wallet_address")
+            if w not in out:
                 continue
             ts = _iso_to_ms(r["as_of_ts"])
             age_h = (now_ms - ts) / 3_600_000
             if min_age_h <= age_h <= max_age_h:
-                rows.append((ts, float(r.get("unrealized_pnl_usd") or 0)))
-    if not rows:
-        return None, None
-    best_ts = max(ts for ts, _ in rows)            # the latest snapshot in the band
-    total = sum(v for ts, v in rows if ts == best_ts)
-    return total, (now_ms - best_ts) / 3_600_000
+                rows_by_wallet.setdefault(w, []).append((ts, float(r.get("unrealized_pnl_usd") or 0)))
+    for w, rows in rows_by_wallet.items():
+        best_ts = max(ts for ts, _ in rows)            # the latest snapshot in the band
+        out[w] = (sum(v for ts, v in rows if ts == best_ts), (now_ms - best_ts) / 3_600_000)
+    return out
+
+
+def _load_prior_unrealized(path: Path, wallet: str, now_ms: int,
+                           min_age_h: float = 20.0, max_age_h: float = 28.0):
+    """Σ unrealized_pnl_usd from the wallet's l4x snapshot taken ~24h ago (the
+    previous daily run). Returns (value, age_hours) or (None, None)."""
+    return _load_prior_unrealized_all(path, {wallet}, now_ms, min_age_h, max_age_h)[wallet]
 
 
 def merge_rows_by_key(existing: list[dict], new: list[dict]) -> list[dict]:
@@ -518,6 +535,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                         "the window (watermark NOT advanced)", p["wallet"][:10])
 
     # ---- phase 2: map, snapshot, analyse ---------------------------------------
+    # The staged CSVs are read ONCE per run for all wallets (not once per wallet).
+    run_wallets = {p["wallet"] for p in pending}
+    disk_rows_by_wallet = (_load_ledger_rows_by_wallet(ns_dir / "l1_wallet_ledger.csv", run_wallets)
+                           if incremental else {})
+    prior_unreal_by_wallet = _load_prior_unrealized_all(ns_dir / "l4x_perp_position_snapshot.csv",
+                                                        run_wallets, now_ms)
     for p in pending:
         wallet, prior_wm, w_start_ms, d = p["wallet"], p["prior"], p["w_start_ms"], p["d"]
         fills, fills_saturated, twap_fills, s3_report = (p["fills"], p["fills_saturated"],
@@ -578,7 +601,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         # starts at the earliest window ever pulled for the wallet (watermark).
         coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
         if incremental:
-            disk_rows = _load_wallet_ledger_rows(ns_dir / "l1_wallet_ledger.csv", wallet)
+            disk_rows = disk_rows_by_wallet.get(wallet, [])
             if disk_rows and not prior_wm.get("coverage_start_ms"):
                 # pre-existing data without a coverage watermark: coverage begins at
                 # the earliest row we actually hold, not at this (short) window
@@ -610,8 +633,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                                          open_orders=d.get("open_orders") or [])
         # PnL oracle: HL's own 24h pnlHistory (perpDay) vs our realized perp cashflow
         # + change in unrealized since the previous daily snapshot (~24h ago)
-        prior_unreal, prior_age_h = _load_prior_unrealized(
-            ns_dir / "l4x_perp_position_snapshot.csv", wallet, now_ms)
+        prior_unreal, prior_age_h = prior_unreal_by_wallet.get(wallet, (None, None))
         oracle = analytics.validate_against_oracle(
             wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
         lending_lazy_pull = False
@@ -782,19 +804,34 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         # Bounded lift: only rows written since the previous successful lift (minus a
         # 1h margin) are read from the staged CSVs and checked against the lake, so
         # a daily run costs O(new rows), not O(45 days of staging) over the network.
-        prev_lift = read_lift_state(ns_dir).get("last_success_run_iso") if incremental else None
+        lift_state = read_lift_state(ns_dir) if incremental else {}
+        prev_lift = lift_state.get("last_success_run_iso")
         iceberg_report = lift_directory(ns_dir, since_iso=since_with_margin(prev_lift))  # raises on failure
-        write_lift_state(ns_dir, now_iso, iceberg_report)
         # Staged-CSV retention: the lake now holds these rows durably, so the
         # staging files only need to keep the analytics windows (30d) + margin.
+        # Pruning rewrites the files whole, so it runs at most once a day (hourly
+        # cadence would otherwise rewrite gigabytes every hour for nothing).
+        extra_state: dict = {}
         if retention_days and retention_days > 0:
-            cutoff_ms = now_ms - retention_days * 86_400_000
-            retention_report = {
-                "retention_days": retention_days,
-                "cutoff": datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).isoformat(),
-                "l1_wallet_ledger": prune_csv(ns_dir / "l1_wallet_ledger.csv", "block_timestamp", cutoff_ms),
-                "l3_token_price_usd_1m": prune_csv(ns_dir / "l3_token_price_usd_1m.csv", "bucket_minute", cutoff_ms),
-            }
+            last_prune = lift_state.get("last_prune_iso")
+            try:
+                prune_due = (last_prune is None
+                             or now_ms - _iso_to_ms(last_prune) >= 20 * 3_600_000)
+            except ValueError:
+                prune_due = True
+            if prune_due:
+                cutoff_ms = now_ms - retention_days * 86_400_000
+                retention_report = {
+                    "retention_days": retention_days,
+                    "cutoff": datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).isoformat(),
+                    "l1_wallet_ledger": prune_csv(ns_dir / "l1_wallet_ledger.csv", "block_timestamp", cutoff_ms),
+                    "l3_token_price_usd_1m": prune_csv(ns_dir / "l3_token_price_usd_1m.csv", "bucket_minute", cutoff_ms),
+                    "l4x_perp_position_snapshot": prune_csv(ns_dir / "l4x_perp_position_snapshot.csv", "as_of_ts", cutoff_ms),
+                }
+                extra_state["last_prune_iso"] = now_iso
+            else:
+                retention_report = {"retention_days": retention_days, "skipped": f"last prune {last_prune}"}
+        write_lift_state(ns_dir, now_iso, iceberg_report, extra=extra_state)
     elif retention_days:
         log.warning("retention_days=%d ignored: staged CSVs are the only store without --iceberg",
                     retention_days)

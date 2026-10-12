@@ -35,6 +35,47 @@ def atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+# --- filesystem introspection --------------------------------------------------------
+
+# Filesystem types where the STATE dir should not live: staged CSVs are rewritten
+# whole on every upsert, the dev catalog is SQLite, and every run does thousands of
+# small file operations - all slow or unsafe over a network filesystem. (The Iceberg
+# WAREHOUSE on NFS is fine: large sequential files, written once.)
+_NETWORK_FS = {"nfs", "nfs3", "nfs4", "cifs", "smb3", "smbfs", "9p", "fuse.sshfs", "fuse.rclone",
+               "fuse.s3fs", "fuse.juicefs", "glusterfs", "ceph", "lustre", "afs", "davfs", "fuse.davfs2"}
+
+
+def mount_fstype(target: str, mounts_text: str | None = None) -> tuple[str, str] | None:
+    """(mount_point, fstype) of the longest-prefix mount containing `target`, read from
+    /proc/mounts (Linux). None when the table is unavailable (Windows, macOS)."""
+    if mounts_text is None:
+        try:
+            mounts_text = Path("/proc/mounts").read_text(encoding="utf-8")
+        except OSError:
+            return None
+    target = target.rstrip("/") or "/"
+    best: tuple[str, str] | None = None
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mp = parts[1].replace("\\040", " ")
+        if mp == "/" or target == mp or target.startswith(mp.rstrip("/") + "/"):
+            if best is None or len(mp) > len(best[0]):
+                best = (mp, parts[2])
+    return best
+
+
+def pid_alive(pid: int) -> bool | None:
+    """True/False on Linux (via /proc), None where it cannot be told. Never uses
+    os.kill(pid, 0): on Windows that terminates the target."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if Path("/proc").is_dir():
+        return Path(f"/proc/{pid}").exists()
+    return None
+
+
 # --- single-flight lock ------------------------------------------------------------
 
 class LockHeld(RuntimeError):
@@ -42,13 +83,14 @@ class LockHeld(RuntimeError):
 
 
 class RunLock:
-    """Single-flight guard for the daily run.
+    """Single-flight guard for the scheduled run.
 
-    Atomic O_EXCL create of a small JSON lock file. A lock older than
-    HL_LOCK_STALE_HOURS is treated as left behind by a crashed run and replaced.
-    PID liveness is deliberately NOT probed (os.kill(pid, 0) terminates the target
-    on Windows); the stale-age rule is enough for a once-a-day job, and systemd
-    timers never overlap a running service anyway — cron does, hence the lock.
+    Atomic O_EXCL create of a small JSON lock file holding pid/host/started_at. A
+    lock is treated as abandoned - and replaced - when its recorded PID is no longer
+    alive on this host (Linux, via /proc; a SIGKILL/OOM-killed run never reaches
+    __exit__) or when it is older than HL_LOCK_STALE_HOURS. Liveness is never probed
+    with os.kill(pid, 0), which terminates the target on Windows. systemd timers
+    never overlap a running service anyway; cron does, hence the lock.
     """
 
     def __init__(self, path: Path, stale_hours: float | None = None):
@@ -56,11 +98,26 @@ class RunLock:
         hours = float(config.env("HL_LOCK_STALE_HOURS")) if stale_hours is None else stale_hours
         self.stale_s = hours * 3600.0
 
-    def _holder(self) -> str:
+    def _holder(self) -> dict:
         try:
-            return self.path.read_text(encoding="utf-8").strip()[:200]
-        except OSError:
-            return "?"
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _abandoned(self) -> str | None:
+        """Reason the existing lock can be discarded, else None."""
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return "vanished"
+        holder = self._holder()
+        if holder.get("host") in (None, socket.gethostname()):
+            alive = pid_alive(holder.get("pid")) if holder else None
+            if alive is False:
+                return f"pid {holder.get('pid')} is not running"
+        if age > self.stale_s:
+            return f"{age / 3600:.1f} h old"
+        return None
 
     def __enter__(self) -> "RunLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,15 +125,14 @@ class RunLock:
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                try:
-                    age = time.time() - self.path.stat().st_mtime
-                except FileNotFoundError:
+                reason = self._abandoned()
+                if reason == "vanished":
                     continue                         # released between our calls: retry once
-                if attempt == 1 and age > self.stale_s:
-                    log.warning("stale lock %s (%.1f h old) removed", self.path, age / 3600)
+                if attempt == 1 and reason:
+                    log.warning("abandoned lock %s removed (%s)", self.path, reason)
                     self.path.unlink(missing_ok=True)
                     continue
-                raise LockHeld(f"another run holds {self.path}: {self._holder()}")
+                raise LockHeld(f"another run holds {self.path}: {json.dumps(self._holder())[:200]}")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"pid": os.getpid(), "host": socket.gethostname(),
                            "started_at": utcnow().isoformat()}, fh)
@@ -213,6 +269,27 @@ def write_summary(ns_dir: Path, summary: dict) -> Path:
 
 
 # --- alerting ------------------------------------------------------------------------
+
+def should_alert(summary: dict, previous: dict | None, repeat_hours: float | None = None,
+                 now: dt.datetime | None = None) -> bool:
+    """Alert on a problem run, but not 24 times a day for the SAME problem: repeat
+    only when the problem set changed or the last alert for it is older than
+    HL_ALERT_REPEAT_HOURS. A clean run alerts only with HL_ALERT_ON_SUCCESS=1."""
+    if summary.get("ok"):
+        return config.env_bool("HL_ALERT_ON_SUCCESS")
+    hours = float(config.env("HL_ALERT_REPEAT_HOURS")) if repeat_hours is None else repeat_hours
+    if not previous or previous.get("ok") or not previous.get("alert_sent"):
+        return True
+    if sorted(previous.get("problems") or []) != sorted(summary.get("problems") or []):
+        return True
+    last = previous.get("alert_sent_at") or previous.get("finished_at")
+    try:
+        last_dt = dt.datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return True
+    now = now or utcnow()
+    return (now - last_dt).total_seconds() >= hours * 3600.0
+
 
 def format_alert_text(summary: dict) -> str:
     state = "OK" if summary.get("ok") else "PROBLEMS"

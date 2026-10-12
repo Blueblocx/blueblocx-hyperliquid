@@ -24,35 +24,11 @@ from pathlib import Path
 
 from . import __version__, config
 
+from .ops import _NETWORK_FS, mount_fstype  # noqa: F401  (re-exported; tests patch preflight.mount_fstype)
+
 _ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 _HL_MAX_WEIGHT = 1200          # documented per-IP cap
 _MIN_RETENTION_DAYS = 31       # the 30d analytics windows need this much staged history
-# Filesystem types where the state dir should NOT live: staged CSVs are rewritten
-# whole on every upsert, the dev catalog is SQLite, and every run does thousands
-# of small file operations - all slow or unsafe over a network filesystem.
-_NETWORK_FS = {"nfs", "nfs3", "nfs4", "cifs", "smb3", "smbfs", "9p", "fuse.sshfs", "fuse.rclone",
-               "fuse.s3fs", "fuse.juicefs", "glusterfs", "ceph", "lustre", "afs", "davfs", "fuse.davfs2"}
-
-
-def mount_fstype(target: str, mounts_text: str | None = None) -> tuple[str, str] | None:
-    """(mount_point, fstype) of the longest-prefix mount containing `target`, read from
-    /proc/mounts (Linux). None when the table is unavailable (Windows, macOS)."""
-    if mounts_text is None:
-        try:
-            mounts_text = Path("/proc/mounts").read_text(encoding="utf-8")
-        except OSError:
-            return None
-    target = target.rstrip("/") or "/"
-    best: tuple[str, str] | None = None
-    for line in mounts_text.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        mp = parts[1].replace("\\040", " ")
-        if mp == "/" or target == mp or target.startswith(mp.rstrip("/") + "/"):
-            if best is None or len(mp) > len(best[0]):
-                best = (mp, parts[2])
-    return best
 
 
 @dataclass
@@ -173,8 +149,9 @@ def check_env(env_file: Path | None) -> list[Check]:
         budget = config.env_int("HL_WEIGHT_BUDGET")
         if budget <= 0 or budget > _HL_MAX_WEIGHT:
             out.append(_fail("weight_budget", f"HL_WEIGHT_BUDGET={budget} - must be 1..{_HL_MAX_WEIGHT} (HL per-IP cap)"))
-        elif budget > 900:
-            out.append(_warn("weight_budget", f"{budget}/min - leaves <300 for other pollers on this IP (TS platform-backend)"))
+        elif budget > 1100:
+            out.append(_warn("weight_budget", f"{budget}/min - no headroom: any other process on this egress IP that "
+                                              f"calls api.hyperliquid.xyz will push both into 429s"))
         else:
             out.append(_ok("weight_budget", f"{budget}/min of {_HL_MAX_WEIGHT}"))
     except ValueError as e:
@@ -310,6 +287,14 @@ def _check_sql_catalog(required: bool) -> Check:
     if warehouse and wh_path is None and not warehouse.startswith(("s3://", "s3a://", "s3n://")):
         fails.append(f"WAREHOUSE {warehouse} is neither file:// nor s3://")
     if wh_path is not None:
+        from .iceberg_load import require_warehouse_mount
+        try:
+            require_warehouse_mount(wh_path)
+        except RuntimeError as e:
+            return _fail("iceberg", f"SQL catalog {_redacted_uri(uri)}: {e}")
+        if not os.environ.get("HL_WAREHOUSE_MOUNT"):
+            notes.append("HL_WAREHOUSE_MOUNT unset - set it (e.g. /mnt/blueblocx) so a run refuses to write "
+                         "to the root disk when the NAS is not mounted")
         try:
             wh_path.mkdir(parents=True, exist_ok=True)
             probe = wh_path / ".preflight_write_test"

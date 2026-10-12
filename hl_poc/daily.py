@@ -1,25 +1,30 @@
 """
-Daily runner: the one command a scheduler (systemd timer / cron / dagster) calls.
+Scheduled runner: the one command a timer (systemd / cron / dagster) calls, daily
+or hourly.
 
-    python -m hl_poc.daily --wallets-file /etc/hypercore/wallets.txt --iceberg --s3-backfill
+    python -m hl_poc.daily --wallets-file /etc/hypercore/wallets.txt --iceberg [--s3-backfill]
 
 Order of operations:
-  1. load .env + logging; take the single-flight lock (HL_OUT_DIR/hypercore/.daily.lock)
+  1. load .env + logging; install a SIGTERM handler (a systemd timeout must still
+     release the lock and write a summary); take the single-flight lock
+     (HL_OUT_DIR/hypercore/.daily.lock)
   2. extract.run(...) over the wallet list — incremental (per-wallet watermark, 1h
      overlap), HIP-3 dexes, today's l4x snapshot (replace-partition), S3 backfill
-     for API-capped wallets, lift into Iceberg, staged-CSV retention after a
-     successful lift
+     for API-capped wallets, lift into Iceberg, staged-CSV retention (once a day)
   3. build the run summary (hard problems vs warnings — see ops.build_summary),
-     write _run_summary.json, append _run_history.jsonl, POST the alert webhook
+     POST the alert webhook (deduplicated: an unchanged problem set repeats only
+     every HL_ALERT_REPEAT_HOURS), write _run_summary.json, append _run_history.jsonl
 
 Exit codes: 0 clean · 1 problems or error (details in _run_summary.json) · 2 bad
-configuration (wallet list missing/empty) · 3 another run holds the lock.
+configuration (wallet list missing/empty) · 3 another run holds the lock (also
+summarised and alerted, so a stuck lock is never silent).
 The dagster asset template in deploy/dagster_hypercore_assets.py wraps this.
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -27,6 +32,14 @@ from . import config, extract, ops
 from . import schema as S
 
 log = logging.getLogger("hl_poc.daily")
+
+
+class Terminated(Exception):
+    """SIGTERM/SIGINT received: unwind so the lock is released and a summary is written."""
+
+
+def _raise_terminated(signum, _frame):
+    raise Terminated(f"signal {signum}")
 
 
 def read_wallets(path: Path) -> list[str]:
@@ -38,18 +51,29 @@ def read_wallets(path: Path) -> list[str]:
     return out
 
 
+def _read_previous_summary(ns_dir: Path) -> dict | None:
+    p = ns_dir / ops.SUMMARY_FILE
+    if not p.exists():
+        return None
+    try:
+        import json
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main(argv=None) -> int:
     config.load_env()
     config.setup_logging()
-    ap = argparse.ArgumentParser(description="HyperCore daily extract for a wallet list")
+    ap = argparse.ArgumentParser(description="HyperCore scheduled extract for a wallet list")
     ap.add_argument("--wallets-file", default=config.env("HL_WALLETS_FILE") or "wallets.txt")
     ap.add_argument("--days", type=int, default=2, help="window for a wallet with no watermark yet")
-    ap.add_argument("--iceberg", action="store_true", help="lift into Iceberg (NESSIE_URI or local catalog)")
+    ap.add_argument("--iceberg", action="store_true", help="lift into Iceberg (REST / SQL / local catalog)")
     ap.add_argument("--s3-backfill", action="store_true", help="complete API-capped windows from S3 node data")
     ap.add_argument("--with-prices", action="store_true", help="also run the L3 price job inline")
     ap.add_argument("--workers", type=int, default=4, help="concurrent Info API calls per wallet")
     ap.add_argument("--retention-days", type=int, default=config.env_int("HL_RETENTION_DAYS"),
-                    help="prune staged l1/l3 CSV rows older than this after a successful lift (0 = never)")
+                    help="prune staged l1/l3/l4x CSV rows older than this after a successful lift (0 = never)")
     ap.add_argument("--out", default=str(config.out_root()))
     ap.add_argument("--no-alert", action="store_true", help="never POST the webhook")
     args = ap.parse_args(argv)
@@ -66,8 +90,15 @@ def main(argv=None) -> int:
     ns_dir = out_dir / S.NS_HYPERCORE
     options = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
 
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _raise_terminated)
+        except (ValueError, OSError):      # not the main thread / unsupported platform
+            pass
+
     started = ops.utcnow()
-    recon, error = None, None
+    recon, error, rc = None, None, 1
+    lock_held = False
     try:
         with ops.RunLock(ns_dir / ".daily.lock"):
             recon = extract.run(wallets, args.days, out_dir, with_prices=args.with_prices,
@@ -76,19 +107,33 @@ def main(argv=None) -> int:
                                 retention_days=args.retention_days)
     except ops.LockHeld as e:
         log.error("%s", e)
-        return 3
+        error, lock_held, rc = f"LockHeld: {str(e)[:300]}", True, 3
+    except Terminated as e:
+        log.error("run terminated (%s) - lock released, nothing advanced", e)
+        error = f"Terminated: {e}"
     except Exception as e:  # noqa: BLE001 — summarise and alert; never die silently
-        log.exception("daily run failed")
+        log.exception("run failed")
         error = f"{type(e).__name__}: {str(e)[:300]}"
 
     summary = ops.build_summary(recon, wallets, started, ops.utcnow(), error=error, options=options)
-    if not args.no_alert and (not summary["ok"] or config.env_bool("HL_ALERT_ON_SUCCESS")):
+    if lock_held:
+        summary["lock_held"] = True
+    previous = _read_previous_summary(ns_dir)
+    if not args.no_alert and ops.should_alert(summary, previous):
         summary["alert_sent"] = ops.send_alert(summary)
+        summary["alert_sent_at"] = ops.utcnow().isoformat()
+    elif previous and not summary["ok"] and previous.get("alert_sent"):
+        # carry the last alert time forward so the dedupe window keeps counting
+        summary["alert_sent"] = False
+        summary["alert_sent_at"] = previous.get("alert_sent_at")
+        summary["alert_suppressed"] = True
     path = ops.write_summary(ns_dir, summary)
-    log.info("daily done: ok=%s wallets ok=%d/%d problems=%s warnings=%d summary=%s",
+    log.info("run done: ok=%s wallets ok=%d/%d problems=%s warnings=%d summary=%s",
              summary["ok"], summary["wallets_ok"], summary["wallets_total"],
              summary["problems"], len(summary["warnings"]), path)
-    return 0 if summary["ok"] else 1
+    if summary["ok"]:
+        return 0
+    return rc
 
 
 if __name__ == "__main__":

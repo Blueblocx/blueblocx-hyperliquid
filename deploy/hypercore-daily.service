@@ -9,9 +9,14 @@
 #   sudo systemctl start hypercore-daily.service      # run once, now
 #   journalctl -u hypercore-daily -f                  # logs
 [Unit]
-Description=HyperCore daily extract (Hyperliquid -> lakehouse)
+Description=HyperCore scheduled extract (Hyperliquid -> lakehouse)
 After=network-online.target
 Wants=network-online.target
+# Standalone layout: the file:// warehouse lives on the NAS. Without this line a
+# Persistent= timer firing right after boot could run before the mount is up and
+# write the lake onto the root disk (HL_WAREHOUSE_MOUNT in the env file is the
+# second guard: the run refuses to start when the path is not on that mount).
+RequiresMountsFor=/mnt/blueblocx
 
 [Service]
 Type=oneshot
@@ -24,8 +29,10 @@ ExecStart=/opt/hyperliquid-poc/.venv/bin/python -m hl_poc.daily --wallets-file /
 # a 24h window of S3 hour files for market-maker wallets takes ~35 min; whales with
 # a lazy full-ledger pull add ~10 min. Anything past this is stuck, not slow.
 TimeoutStartSec=4h
-# S3 hour files are parsed one at a time (<= ~330 MB decompressed); peak RSS ~1.5 GB
-MemoryMax=3G
+# S3 hour files are parsed one at a time (<= ~330 MB decompressed, ~1.5 GB RSS); the
+# staged l1 CSV is merged in memory on every upsert (~1 KB per row: 45 days of a
+# market-maker wallet is several GB) and the lift keeps the touched partitions' keys.
+MemoryMax=8G
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
@@ -34,7 +41,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/hypercore
+# the state dir AND the warehouse directory on the NAS: ProtectSystem=strict mounts
+# everything else read-only, so a lift to /mnt/blueblocx fails without the 2nd path
+ReadWritePaths=/var/lib/hypercore /mnt/blueblocx/hypercore
 StateDirectory=hypercore
 
 [Install]

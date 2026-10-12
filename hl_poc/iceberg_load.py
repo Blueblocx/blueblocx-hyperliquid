@@ -211,13 +211,17 @@ def read_lift_state(src_dir: Path) -> dict:
         return {}
 
 
-def write_lift_state(src_dir: Path, run_iso: str, report: dict | None = None) -> None:
+def write_lift_state(src_dir: Path, run_iso: str, report: dict | None = None,
+                     extra: dict | None = None) -> None:
     """Record a SUCCESSFUL lift (lift_directory raised otherwise). The next
-    incremental lift only reads rows updated after this run started."""
-    state = {"last_success_run_iso": run_iso,
-             "written_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
-             "tables": {k: v.get("written") for k, v in (report or {}).items()
-                        if isinstance(v, dict) and "written" in v}}
+    incremental lift only reads rows updated after this run started. Keys not
+    owned here (e.g. last_prune_iso) survive unless overridden via `extra`."""
+    state = read_lift_state(src_dir)
+    state.update({"last_success_run_iso": run_iso,
+                  "written_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                  "tables": {k: v.get("written") for k, v in (report or {}).items()
+                             if isinstance(v, dict) and "written" in v}})
+    state.update(extra or {})
     atomic_write_text(Path(src_dir) / LIFT_STATE_FILE, json.dumps(state, indent=2))
 
 
@@ -336,6 +340,7 @@ def load_catalog_from_env(local_dir: Path | None = None):
         props = _sql_props(os.environ["HL_CATALOG_URI"], local_dir)
         wh_path = warehouse_local_path(props["warehouse"])
         if wh_path is not None:
+            require_warehouse_mount(wh_path)
             wh_path.mkdir(parents=True, exist_ok=True)
         log.info("iceberg catalog: SQL %s, warehouse %s", _redacted_uri(props["uri"]), props["warehouse"])
         return load_catalog("hl", **props), "sql"
@@ -383,14 +388,51 @@ def _partition_spec(schema, cols: list[str]):
     return PartitionSpec(*fields)
 
 
+# Metadata retention: without these every commit keeps the previous metadata.json
+# forever (hourly cadence = 24 new files a day per table) and the metadata log grows
+# unbounded. pyiceberg honours both properties.
+TABLE_PROPERTIES = {
+    "write.metadata.delete-after-commit.enabled": "true",
+    "write.metadata.previous-versions-max": "20",
+}
+
+
 def ensure_table(catalog, namespace: str, name: str, spec: dict, tz: bool = True):
     catalog.create_namespace_if_not_exists(namespace)
     ident = f"{namespace}.{name}"
     schema = _iceberg_schema(spec["columns"], tz)
     if spec.get("partition"):
-        return catalog.create_table_if_not_exists(
-            ident, schema=schema, partition_spec=_partition_spec(schema, spec["partition"]))
-    return catalog.create_table_if_not_exists(ident, schema=schema)
+        table = catalog.create_table_if_not_exists(
+            ident, schema=schema, partition_spec=_partition_spec(schema, spec["partition"]),
+            properties=dict(TABLE_PROPERTIES))
+    else:
+        table = catalog.create_table_if_not_exists(ident, schema=schema, properties=dict(TABLE_PROPERTIES))
+    missing = {k: v for k, v in TABLE_PROPERTIES.items() if table.properties.get(k) != v}
+    if missing:                                   # tables created before this rule: one-time commit
+        try:
+            with table.transaction() as tx:
+                tx.set_properties(**missing)
+            table.refresh()
+        except Exception as e:  # noqa: BLE001 — retention is hygiene, never worth failing a lift
+            log.warning("could not set metadata-retention properties on %s: %s", ident, e)
+    return table
+
+
+def require_warehouse_mount(wh_path: Path) -> None:
+    """Fail fast when HL_WAREHOUSE_MOUNT is set and the warehouse path is not on that
+    mount: with the NAS unmounted, mkdir would quietly create the directory on the
+    root disk and the catalog would start pointing at files that vanish when the
+    mount comes back. No-op when the mount table is unavailable (Windows)."""
+    expected = (os.environ.get("HL_WAREHOUSE_MOUNT") or "").rstrip("/")
+    if not expected:
+        return
+    from .ops import mount_fstype
+    found = mount_fstype(wh_path.as_posix())
+    if found is None:
+        return
+    if found[0].rstrip("/") != expected:
+        raise RuntimeError(f"warehouse {wh_path} is on mount {found[0]} ({found[1]}), expected "
+                           f"HL_WAREHOUSE_MOUNT={expected} - is the NAS mounted?")
 
 
 def conform(arrow: pa.Table, table) -> pa.Table:
@@ -457,10 +499,27 @@ def load_table(table, arrow: pa.Table, key_cols: list[str], mode: str, scope_col
     if mode == "replace_scope":
         from pyiceberg.expressions import EqualTo
         scope = sorted(set(zip(*[arrow.column(c).to_pylist() for c in scope_cols])))
-        for tup in scope:
-            table.delete(_and(*[EqualTo(c, v) for c, v in zip(scope_cols, tup)]))
+        # ONE delete per leading scope value (the partition, e.g. as_of_date) with an
+        # In() over the trailing column (wallets) — not one commit per tuple. Every
+        # pyiceberg delete is a copy-on-write commit that rewrites the touched data
+        # file and the whole metadata.json; at hourly cadence W wallets used to cost
+        # W commits per lift (thousands of snapshots a day).
+        deletes = 0
+        if len(scope_cols) == 2:
+            by_lead: dict = {}
+            for lead, tail in scope:
+                by_lead.setdefault(lead, []).append(tail)
+            for lead, tails in sorted(by_lead.items()):
+                for i in range(0, len(tails), 500):
+                    table.delete(_and(EqualTo(scope_cols[0], lead), _in_filter(scope_cols[1], tails[i:i + 500])))
+                    deletes += 1
+        else:
+            for tup in scope:
+                table.delete(_and(*[EqualTo(c, v) for c, v in zip(scope_cols, tup)]))
+                deletes += 1
         table.append(arrow)
-        return {"incoming": arrow.num_rows, "written": arrow.num_rows, "replaced_scopes": len(scope)}
+        return {"incoming": arrow.num_rows, "written": arrow.num_rows, "replaced_scopes": len(scope),
+                "delete_commits": deletes}
     if mode == "replace_keys":
         c = key_cols[0]  # single-column keys for dimension tables
         vals = arrow.column(c).to_pylist()
@@ -475,31 +534,52 @@ def load_table(table, arrow: pa.Table, key_cols: list[str], mode: str, scope_col
 
 # --- control.table_watermarks ------------------------------------------------------
 
+def write_watermarks(catalog, namespace: str, entries: list[tuple], run_id: str) -> dict[str, str]:
+    """Upsert the watermark rows of one lift in TWO commits (one delete + one append)
+    instead of two per table. `entries` = (table_name, watermark_col, watermark_ts,
+    row_count, snapshot_id). Monotonic per table: an older watermark never replaces
+    a newer one ("kept_newer"). Returns {table_name: written|kept_newer}."""
+    from pyiceberg.expressions import EqualTo
+    if not entries:
+        return {}
+    tbl = ensure_table(catalog, CONTROL_NS, "table_watermarks", {"columns": _WM_COLS}, tz=False)
+    names = sorted({e[0] for e in entries})
+    pred = _and(EqualTo("namespace", namespace), _in_filter("table_name", names))
+    existing = tbl.scan(row_filter=pred, selected_fields=("table_name", "watermark_ts")).to_arrow().to_pylist()
+    prev: dict[str, dt.datetime] = {}
+    for r in existing:
+        if r.get("watermark_ts") is not None:
+            prev[r["table_name"]] = max(prev.get(r["table_name"], r["watermark_ts"]), r["watermark_ts"])
+    now_naive = dt.datetime.now(tz=dt.timezone.utc).replace(tzinfo=None)
+    status: dict[str, str] = {}
+    rows: list[dict] = []
+    for table_name, watermark_col, watermark_ts, row_count, snapshot_id in entries:
+        wm_naive = (watermark_ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
+                    if watermark_ts.tzinfo else watermark_ts)
+        if table_name in prev and prev[table_name] > wm_naive:
+            status[table_name] = "kept_newer"
+            continue
+        status[table_name] = "written"
+        rows.append({
+            "namespace": namespace, "table_name": table_name, "layer": table_name.split("_")[0],
+            "producer": "hl_poc.iceberg_load", "watermark_col": watermark_col,
+            "watermark_date": wm_naive.date(), "watermark_ts": wm_naive,
+            "row_count": row_count, "snapshot_id": str(snapshot_id) if snapshot_id is not None else None,
+            "job_name": f"{namespace}_lift", "run_id": run_id, "updated_at": now_naive, "status": "completed",
+        })
+    if rows:
+        written = [r["table_name"] for r in rows]
+        tbl.delete(_and(EqualTo("namespace", namespace), _in_filter("table_name", written)))
+        tbl.append(conform(rows_to_arrow(rows, _WM_COLS, tz=False), tbl))
+    return status
+
+
 def write_watermark(catalog, namespace: str, table_name: str, watermark_col: str,
                     watermark_ts: dt.datetime, row_count: int, snapshot_id, run_id: str) -> bool:
-    """Upsert one watermark row (python-ingestion schema, naive timestamps).
-    Monotonic: an older watermark never replaces a newer one. Returns written?"""
-    from pyiceberg.expressions import And, EqualTo
-    tbl = ensure_table(catalog, CONTROL_NS, "table_watermarks", {"columns": _WM_COLS}, tz=False)
-    wm_naive = watermark_ts.astimezone(dt.timezone.utc).replace(tzinfo=None) \
-        if watermark_ts.tzinfo else watermark_ts
-    pred = And(EqualTo("namespace", namespace), EqualTo("table_name", table_name))
-    existing = tbl.scan(row_filter=pred, selected_fields=("watermark_ts",)).to_arrow().to_pylist()
-    prev = max((r["watermark_ts"] for r in existing if r.get("watermark_ts")), default=None)
-    if prev is not None and prev > wm_naive:
-        return False
-    row = {
-        "namespace": namespace, "table_name": table_name, "layer": table_name.split("_")[0],
-        "producer": "hl_poc.iceberg_load", "watermark_col": watermark_col,
-        "watermark_date": wm_naive.date(), "watermark_ts": wm_naive,
-        "row_count": row_count, "snapshot_id": str(snapshot_id) if snapshot_id is not None else None,
-        "job_name": f"{namespace}_lift", "run_id": run_id,
-        "updated_at": dt.datetime.now(tz=dt.timezone.utc).replace(tzinfo=None), "status": "completed",
-    }
-    batch = conform(rows_to_arrow([row], _WM_COLS, tz=False), tbl)
-    tbl.delete(pred)
-    tbl.append(batch)
-    return True
+    """Single-row form of write_watermarks (kept for callers/tests)."""
+    status = write_watermarks(catalog, namespace,
+                              [(table_name, watermark_col, watermark_ts, row_count, snapshot_id)], run_id)
+    return status.get(table_name) == "written"
 
 
 # --- driver ------------------------------------------------------------------------
@@ -562,14 +642,13 @@ def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
         report[name] = counts
         log.info("lift %-28s incoming=%6d written=%6d total=%7s", name, counts["incoming"],
                  counts["written"], "?" if total is None else total)
-    wm_status = {}
-    for name, wm_col, wm_ts, total, snap_id in pending_wm:
+    wm_status: dict[str, str] = {}
+    if pending_wm:
         try:
-            wm_status[name] = "written" if write_watermark(
-                catalog, namespace, name, wm_col, wm_ts, total, snap_id, run_id) else "kept_newer"
-        except Exception as e:  # noqa: BLE001 — never abort data lifts over a watermark row
-            wm_status[name] = f"failed: {type(e).__name__}: {str(e)[:120]}"
-            log.warning("watermark write failed for %s.%s: %s", namespace, name, e)
+            wm_status = write_watermarks(catalog, namespace, pending_wm, run_id)      # 2 commits for all tables
+        except Exception as e:  # noqa: BLE001 — never abort data lifts over watermark rows
+            wm_status = {name: f"failed: {type(e).__name__}: {str(e)[:120]}" for name, *_ in pending_wm}
+            log.warning("watermark write failed for %s: %s", namespace, e)
     report["_watermarks"] = wm_status
     return report
 

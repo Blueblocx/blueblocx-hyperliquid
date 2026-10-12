@@ -163,42 +163,100 @@ sudo -u hypercore mkdir -p /mnt/blueblocx/hypercore/warehouse   # the NAS: data 
 ```
 
 In the env file: `HL_CATALOG_URI=postgresql+psycopg2://hl:...@localhost:5432/hl_catalog`,
-`WAREHOUSE=file:///mnt/blueblocx/hypercore/warehouse`, `NESSIE_URI` empty.
-pyiceberg creates its two catalog tables on first use and the seven `hypercore`
-tables from the DDL on the first lift. `preflight --iceberg` checks the database,
-the warehouse directory and reports the filesystem type (NFS is fine **for the
+`WAREHOUSE=file:///mnt/blueblocx/hypercore/warehouse`, `HL_WAREHOUSE_MOUNT=/mnt/blueblocx`,
+`NESSIE_URI` empty. pyiceberg creates its two catalog tables on first use and the
+seven `hypercore` tables from the DDL on the first lift. `preflight --iceberg`
+checks the database, that the warehouse directory is writable **and on the
+expected mount**, and reports the filesystem type (NFS is fine **for the
 warehouse**; `HL_OUT_DIR` must stay on the local disk).
 
-What this gives and costs:
+Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
 
-- Writes per hourly run are tens of MB; a day of a market-maker wallet is a few
-  hundred MB of Parquet. The NAS's ~100 MB/s buffered / 18 MB/s synchronous path
-  is irrelevant at this volume (a lift is seconds).
-- Commits are atomic in PostgreSQL (optimistic update of the table pointer);
-  files are written before the pointer moves, so NFS close-to-open consistency
-  is enough. Mount `hard,vers=4.1` (DSM's maximum).
-- Readers: pyiceberg or DuckDB on this host read the tables directly; another
-  host (olympus) can mount the same export and use the same PostgreSQL catalog
-  (iceberg-rust `iceberg-catalog-sql` + `OpenDalStorageFactory::Fs`; Trino ≥ 471
-  with the JDBC catalog). Nothing on this host can be read by Nessie.
-- Backup = `pg_dump hl_catalog` + the warehouse directory (NAS snapshot).
-- SQLite as `HL_CATALOG_URI` works for a single writer but pyiceberg labels it
-  development-only; preflight warns.
+- **Volume.** Hourly lifts write a few MB of Parquet (a market-maker wallet is
+  ~30 MB/day); a lift is ~14 Iceberg commits regardless of wallet count (one
+  delete + one append per replaced table, two for all watermark rows). On a
+  synchronous NFS export that is ~5–10 s of NFS time per hour.
+- **Atomicity.** Every file pyiceberg writes gets a new unique name and is
+  closed (NFS flushes on close) before the catalog pointer is swapped with an
+  optimistic `UPDATE … WHERE metadata_location = <previous>` in PostgreSQL.
+  Nothing depends on atomic rename. A concurrent writer fails cleanly
+  (`CommitFailedException`, no retry) — hence the single-flight lock.
+- **Durability.** pyiceberg never fsyncs; with the Synology export set to
+  "Enable asynchronous" a NAS power loss can leave the pointer at a file that
+  never reached disk. Keep the export synchronous (or put the NAS on a UPS);
+  recovery is `UPDATE iceberg_tables SET metadata_location = previous_metadata_location`.
+- **Guards.** The systemd unit has `RequiresMountsFor=/mnt/blueblocx` and
+  `ReadWritePaths=… /mnt/blueblocx/hypercore` (with `ProtectSystem=strict` the
+  NAS would otherwise be read-only inside the unit); `HL_WAREHOUSE_MOUNT` makes
+  the run refuse to start when the path is not on that mount instead of
+  quietly creating the warehouse on the root disk.
+- **Readers.** pyiceberg or DuckDB ≥ 1.5 on this host (DuckDB: read
+  `metadata_location` from `iceberg_tables` and `iceberg_scan()` it — pyiceberg
+  writes no `version-hint.text`). Another host can mount the same export at the
+  **identical path** (manifests store absolute `file:///mnt/…` paths) and use
+  the same PostgreSQL catalog: iceberg-rust `iceberg-catalog-sql` with catalog
+  name `hl` + an fs storage factory (the atlas crates hard-code REST + S3 and
+  would need a second catalog in the one crate that reads hypercore), or Trino
+  ≥ 471 with `iceberg.catalog.type=jdbc`, `fs.local.enabled=true`,
+  `local.location=local:///`. Plain Parquet globs are unsafe for the replaced
+  tables (old snapshot files coexist until expired).
+- **If nothing cross-host ever reads the lake**, PostgreSQL is optional:
+  `HL_CATALOG_URI=sqlite:////var/lib/hypercore/catalog.db` is a single-writer
+  catalog on the local disk and this pipeline is exactly one writer (preflight
+  still warns, as pyiceberg labels SQLite development-only).
+- **Backup** = `pg_dump hl_catalog` **first**, then the warehouse directory
+  (NAS snapshot); the dump then only references files that already exist.
+- **Maintenance.** `python -m hl_poc.maintenance --expire-days 7` nightly
+  (`deploy/hypercore-maintenance.{service,timer}`) expires old snapshots so
+  `metadata.json` stays small; tables carry
+  `write.metadata.delete-after-commit.enabled=true`. pyiceberg deletes no data
+  files on expiry (small orphans remain; sweeper is a follow-up) and has no
+  compaction (hourly lifts leave one small Parquet per partition per hour).
 
 ### Hourly cadence
 
 `deploy/hypercore-hourly.timer` runs the same service every hour (minute 10)
-with `deploy/hourly-override.conf` capping a run at 50 min. The run is already
-incremental (per-wallet watermark, 1 h overlap, bounded lift), so nothing else
-changes. Capacity is set by the Hyperliquid per-IP weight budget: a run spends
-roughly 160–250 weight per wallet (four flat-20 state calls, four paged history
-calls, two 2-weight clearinghouse calls, plus items/20 for fills). At
-`HL_WEIGHT_BUDGET=600` (shared IP) that is ~150–200 wallets per hour; at 900,
-~250–300. Hourly windows also keep market makers (5–8k fills/hour) under the
-~10k fills API cap, so S3 backfill becomes a rare repair path rather than a daily
-cost. Beyond that capacity: a second egress IP, or fetching the slow-changing
-pulls (staking, vault equity, open orders, the portfolio oracle) once a day
-instead of hourly — a code change not made yet.
+with `deploy/hourly-override.conf` capping a run at 50 min. The run is
+incremental (per-wallet watermark, 1 h overlap, bounded lift), the staged CSVs
+are read once per run for all wallets, and retention pruning runs at most once
+a day. Verified against the code (2026-10-12):
+
+| wallet class | API weight per hourly run | wallets per 50-min run at budget 900 / 1200 |
+|---|---|---|
+| light (< 20 new fills) | ~165 (4 flat-20 account calls, 4 paged history calls, 2 state calls) | ~270 / ~360 |
+| active (~300 fills/h) | ~200 | ~225 / ~300 |
+| market maker (5–8k fills/h) | ~750–1,200 | ~40 / ~55 |
+
+The TS platform-backend runs on Cloudflare Workers, not on this host's IP, so
+`HL_WEIGHT_BUDGET=900` (default) or up to 1100 is safe unless something else here
+calls the Info API. Hourly windows keep market makers under the ~10k fills cap
+(cap coverage 60–120 min at 5–8k fills/h), so S3 backfill becomes a rare repair
+path — fetch MM-class wallets first in the list, because fills made during the
+run eat into the cap. Beyond ~270–360 wallets: a second egress IP, or fetching
+the slow-changing pulls (staking, vault equity, open orders) once a day with a
+lazy re-fetch when the net-worth oracle fails — a code change not made yet
+(+60 % capacity).
+
+Rules for hourly operation:
+
+- **Onboard new wallets by hand** (`python -m hl_poc.extract --wallet 0x… --days 2 --incremental --iceberg --s3-backfill`),
+  never by adding them to the timer's list: a wallet with no watermark gets a
+  2-day window, a market-maker-class one then needs an S3 backfill that can
+  outlast the 50-min cap, and a killed run saves nothing.
+- A killed or OOM-killed run can no longer block the next tick: the lock
+  records the PID and is discarded when that process is gone (`HL_LOCK_STALE_HOURS=2`
+  is the age fallback), SIGTERM from the timeout unwinds cleanly, and a lock
+  that is genuinely held is itself summarised and alerted (exit 3).
+- Alerts are deduplicated: an unchanged problem set re-posts only every
+  `HL_ALERT_REPEAT_HOURS` (default 6), so a persistent oracle mismatch is not
+  24 webhooks a day.
+- `l4x_perp_position_snapshot` keeps the **last snapshot per UTC day** per
+  wallet (its key is `as_of_date`); hourly runs replace the day's rows, so the
+  lake holds no intra-day position history, and the PnL oracle (needs a 20–28 h
+  old snapshot) fires in roughly 8–9 of 24 runs. Add an `as_of_hour` to the key
+  if hourly mark-to-market history is wanted.
+- `MemoryMax=8G` in the unit: the staged ledger is merged in memory on every
+  upsert (~1 KB/row); 45 days of a market-maker wallet is several GB.
 
 ### Talking to a Nessie REST catalog from another host
 

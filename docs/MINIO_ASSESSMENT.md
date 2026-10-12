@@ -480,3 +480,42 @@ during pipeline hours · iSCSI with multiple sessions or a thin LUN.
    QuickNode and api.hyperliquid.xyz? One NIC or two?
 10. Do the pending 18 B-row re-parse and the Balance/FIFO rebuild run on olympus
     before the move?
+
+## 8. Scope correction: only the Hyperliquid pipeline moves to server4090-2 (2026-10-12)
+
+The owner clarified that `server4090-2` hosts **this repository's pipeline**, not
+the atlas ethereum/arbitrum lake (which stays on olympus unless stated
+otherwise). §6–§7 analysed the wrong scope; they remain valid for the day the
+atlas lake moves, and §6.1–§6.3 are verified facts either way. For the
+Hyperliquid pipeline alone the picture is simpler, and the owner's original
+instinct — no MinIO, no SeaweedFS, read and write plain files — is **right**:
+
+- The only lake writer on the host is pyiceberg, which supports `file://`
+  natively. None of the constraints that forced an S3 gateway in the atlas lake
+  (Nessie's ObjectIO, Trino 465, iceberg-rust with S3 hard-coded) exists here.
+- Data volume is a few MB per hourly lift (a market-maker wallet ≈ 30 MB/day);
+  NFS throughput is irrelevant at that scale. A lift is ~14 commits and ~5–10 s
+  of NFS time on a synchronous export.
+- Design (implemented in commits `04be05a` and the follow-up): pyiceberg
+  `SqlCatalog` on PostgreSQL (local disk; SQLite is acceptable when nothing
+  cross-host reads the lake) + `WAREHOUSE=file:///mnt/blueblocx/hypercore/warehouse`,
+  `HL_WAREHOUSE_MOUNT=/mnt/blueblocx` guard, `HL_OUT_DIR` on the local NVMe,
+  hourly systemd timer, nightly snapshot expiry. Details and the verified
+  behaviour (commit atomicity via the PostgreSQL pointer swap, no dependence on
+  atomic rename, NFS close-to-open sufficiency, durability caveat under an async
+  export) are in `docs/DEPLOY.md`, "Standalone host" and "Hourly cadence".
+- The 29 GB free on the root NVMe is enough for this pipeline's state
+  (`HL_OUT_DIR` ≈ 2 MB per wallet-day of staging at 45-day retention, a few GB
+  for a market-maker wallet) but leaves no room to grow; reclaim or cut
+  `HL_RETENTION_DAYS` to 31 beyond ~150–200 light wallets.
+- Hourly capacity on one egress IP: ~270 light wallets per 50-minute run at
+  `HL_WEIGHT_BUDGET=900`, ~360 at 1200 (the TS platform-backend is on Cloudflare
+  Workers, not this IP); ~40–55 market-maker-class wallets. Beyond that: a second
+  IP or daily-only fetching of the slow-changing pulls (+60 %).
+- Open decisions for the owner: who consumes the hypercore numbers (the fastest
+  user-visible path is writing the per-wallet analytics the pipeline already
+  computes straight into the serving PostgreSQL; the lake stays as history), how
+  many wallets and of which class, whether atlas on olympus must read these
+  tables (then olympus mounts the same export at the identical path and uses the
+  same PostgreSQL catalog), the Synology export mode and UPS, and who rotates
+  the exposed AWS key (only needed if S3 backfill stays in use).

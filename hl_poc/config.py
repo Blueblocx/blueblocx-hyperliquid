@@ -40,10 +40,19 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                           "analytics windows remain complete"),
     "HL_WALLETS_FILE": ("", False, "default wallet list for hl_poc.daily / preflight"),
     # --- daily runner -----------------------------------------------------------------
-    "HL_LOCK_STALE_HOURS": ("12", False, "a daily-run lock file older than this is treated as abandoned"),
+    "HL_LOCK_STALE_HOURS": ("2", False,
+                            "a run lock older than this is treated as abandoned (a lock whose PID is dead is "
+                            "discarded immediately on Linux regardless of age)"),
     "HL_ALERT_WEBHOOK_URL": ("", True,
-                             "Slack/Discord-style incoming webhook; POSTed when a daily run has problems"),
+                             "Slack/Discord-style incoming webhook; POSTed when a run has problems"),
     "HL_ALERT_ON_SUCCESS": ("0", False, "1 = also POST a summary when the run is clean"),
+    "HL_ALERT_REPEAT_HOURS": ("6", False,
+                              "re-send the webhook for an UNCHANGED problem set only this often (hourly runs "
+                              "would otherwise post 24 times a day)"),
+    "HL_WAREHOUSE_MOUNT": ("", False,
+                           "standalone mode: the mount point the file:// warehouse must live on, e.g. "
+                           "/mnt/blueblocx - the lift refuses to run (and preflight fails) when the NAS is not "
+                           "mounted, instead of writing to the root disk"),
     "HL_LOG_LEVEL": ("INFO", False, "DEBUG | INFO | WARNING"),
     "HL_LOG_JSON": ("0", False, "1 = one JSON object per log line (for a log shipper)"),
     # --- S3 node data (fills beyond the API cap; Requester Pays) ---------------------

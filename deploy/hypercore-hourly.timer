@@ -13,10 +13,15 @@
 #   sudo systemctl disable --now hypercore-daily.timer 2>/dev/null
 #   sudo systemctl enable --now hypercore-hourly.timer
 #
-# Capacity: one run spends ~160-250 API weight per wallet (more for market makers);
-# at HL_WEIGHT_BUDGET=600 that is roughly 150-200 wallets per hour, at 900 about
-# 250-300. Above that, split wallets across hosts/IPs or trim the slow-changing
-# pulls (see docs/DEPLOY.md, "Hourly cadence").
+# Capacity: one run spends ~165 API weight per light wallet (+ items/20 for fills;
+# ~750-1,200 for a market maker); at HL_WEIGHT_BUDGET=900 that is ~270 light
+# wallets per 50-minute run, ~360 at 1200. Above that, trim the slow-changing
+# pulls or add an egress IP (docs/DEPLOY.md, "Hourly cadence").
+#
+# Onboard NEW wallets by hand, not through this timer: a wallet with no watermark
+# gets a --days 2 window, and a market-maker-class wallet then needs an S3 backfill
+# that can outlast the 50-minute cap (the run is killed and nothing is saved).
+#   python -m hl_poc.extract --wallet 0x... --days 2 --incremental --iceberg --s3-backfill
 [Unit]
 Description=Run hypercore-daily.service every hour
 

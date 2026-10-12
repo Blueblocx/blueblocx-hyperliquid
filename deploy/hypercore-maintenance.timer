@@ -1,0 +1,14 @@
+# /etc/systemd/system/hypercore-maintenance.timer
+#   sudo cp deploy/hypercore-maintenance.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hypercore-maintenance.timer
+[Unit]
+Description=Run hypercore-maintenance.service nightly
+
+[Timer]
+OnCalendar=*-*-* 00:40:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=hypercore-maintenance.service
+
+[Install]
+WantedBy=timers.target
