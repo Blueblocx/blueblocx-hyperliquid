@@ -59,7 +59,7 @@ Three identities, two checkouts:
 |---|---|
 | `hypercore` (system user, no shell, no keys) | runs the timers; may only **read** the code and **write** `/var/lib/hypercore` and the NAS warehouse |
 | your login user (`hatsadin`) | owns the git key and both checkouts; Claude Code works as this user |
-| `/opt/blueblocx-hyperliquid` | **production checkout**: moved only with `git pull --ff-only` to a tag; never edited in place — the hourly timer would run half-edited code |
+| `/opt/blueblocx-hyperliquid` | **production checkout**: moved only with `git fetch --tags && git checkout --detach <tag>` (§8); never edited in place — the hourly timer would run half-edited code |
 | `~/blueblocx-hyperliquid` | **working copy**: where code is edited, tested, committed and pushed (its own `.venv`) |
 
 Git access for push *and* pull from the server: a **per-repo deploy key with
@@ -68,6 +68,12 @@ Add → tick "Allow write access"), bound to a host alias because a deploy key i
 valid for exactly one repo. Alternative with no long-lived key on the box: SSH
 agent forwarding from your laptop (`ssh -A`), which only works while you are
 connected.
+
+**Shortcut:** after the key block below, `bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh`
+(run from the working-copy clone) performs the rest of this section and §3, creates
+the PostgreSQL catalog, the NAS warehouse directory and the systemd units for the
+hourly cadence, then runs a preflight — idempotently; it refuses to run while a
+timer or a run is active. The commands below are the manual equivalent.
 
 ```bash
 # as hatsadin
@@ -78,16 +84,18 @@ Host github-blueblocx-hyperliquid
   User git
   IdentityFile ~/.ssh/blueblocx_hyperliquid
   IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
 EOF
 chmod 600 ~/.ssh/config ~/.ssh/blueblocx_hyperliquid
 cat ~/.ssh/blueblocx_hyperliquid.pub        # -> GitHub deploy key, write access ON
 git config --global user.name "Leo Hatsadin" && git config --global user.email "<your github email>"
 
 # service user + production checkout (owner = you, group-readable by the service)
-sudo useradd --system --create-home --home-dir /var/lib/hypercore --shell /usr/sbin/nologin hypercore
+sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /usr/sbin/nologin hypercore
 sudo usermod -aG hypercore hatsadin
+sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.0.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.0.1 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -137,6 +145,9 @@ sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env \
 ```
 
 Expected: every line `OK` or `WARN`, exit 0. It never prints secret values.
+Standalone host without an AWS key: drop `--s3` here and `--s3-backfill` in §5
+(with the flag, a missing key is a FAIL); the units installed by
+`deploy/bootstrap.sh` already omit both.
 
 | check | FAIL means |
 |---|---|
@@ -337,15 +348,25 @@ python-ingestion's exact schema, so the atlas watermark readers see them.
 
 ## 6. Schedule
 
-**systemd (preferred)** — the service runs preflight first, then the daily run;
-timers never overlap a running service:
+**Standalone host (hourly)** — `deploy/bootstrap.sh` has already installed
+`hypercore-daily.service` with a drop-in (no S3 flags, 50-minute cap),
+`hypercore-hourly.timer` and `hypercore-maintenance.timer` (00:05 UTC, before the
+00:10 tick); after the first run by hand (§5) enable them:
+
+```bash
+sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
+systemctl list-timers 'hypercore-*'
+```
+
+**systemd, daily cadence (manual install)** — the service runs preflight first,
+then the daily run; timers never overlap a running service:
 
 ```bash
 sudo cp deploy/hypercore-daily.service deploy/hypercore-daily.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now hypercore-daily.timer
-sudo systemctl start hypercore-daily.service          # run once now
-journalctl -u hypercore-daily -f
+sudo systemctl start --no-block hypercore-daily.service   # run once now (without --no-block, start waits for the whole run)
+sudo journalctl -u hypercore-daily -f
 ```
 
 00:20 UTC is deliberate: Hyperliquid's midnight dust conversions have settled and
@@ -407,12 +428,14 @@ cd /opt/blueblocx-hyperliquid && git fetch --tags && git checkout --detach v1.0.
 .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg
-sudo systemctl start hypercore-daily.service && journalctl -u hypercore-daily -n 50   # one real run
+sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-daily -n 50   # one real run (start waits for it)
 sudo systemctl start hypercore-hourly.timer
 ```
 
-Rollback is `git checkout --detach <previous tag>` + the same pip/preflight
-steps. State files (`_watermarks.json`, `_lift_state.json`, staged CSVs) are
+`RELEASE_TAG=v1.0.2 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does step 2
+for you (checkout, pip, tests, units, preflight) and refuses to run while a timer
+or a run is active; re-enable the timers afterwards. Rollback is
+`git checkout --detach <previous tag>` + the same pip/preflight steps. State files (`_watermarks.json`, `_lift_state.json`, staged CSVs) are
 forward- and backward-compatible across versions of this repo so far; a release
 note will say if that changes. Never run `git pull` or an editor inside `/opt`:
 the hourly timer executes whatever is on disk at minute 10.

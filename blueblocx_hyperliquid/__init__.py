@@ -1,3 +1,3 @@
 """Hyperliquid → BlueBlocx lakehouse pipeline (HyperCore via Info API + S3 node data)."""
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
