@@ -142,6 +142,125 @@ class RestPropsTests(unittest.TestCase):
                          ("dev", "s3://lake", "eu-west-1", "pyiceberg.io.fsspec.FsspecFileIO", "t0k"))
 
 
+class CatalogModeTests(unittest.TestCase):
+    def _env(self, **kw):
+        base = {"NESSIE_URI": "", "HL_CATALOG_URI": "", "WAREHOUSE": "", "S3_ENDPOINT": "", "S3_ACCESS_KEY": "",
+                "S3_SECRET_KEY": "", "S3_REGION": "", "AWS_REGION": "", "HL_PY_IO_IMPL": ""}
+        base.update(kw)
+        return mock.patch.dict(os.environ, base, clear=False)
+
+    def test_catalog_mode_precedence(self):
+        with self._env():
+            self.assertEqual(il.catalog_mode(), "local")
+        with self._env(HL_CATALOG_URI="sqlite:///x.db"):
+            self.assertEqual(il.catalog_mode(), "sql")
+        with self._env(HL_CATALOG_URI="sqlite:///x.db", NESSIE_URI="http://n:19120/iceberg"):
+            self.assertEqual(il.catalog_mode(), "rest")
+
+    def test_warehouse_local_path(self):
+        self.assertEqual(il.warehouse_local_path("file:///mnt/blueblocx/hypercore/warehouse"),
+                         Path("/mnt/blueblocx/hypercore/warehouse"))
+        self.assertEqual(il.warehouse_local_path("file://localhost/mnt/x"), Path("/mnt/x"))
+        self.assertEqual(il.warehouse_local_path("file://D:/BlueBlocx/out/iceberg/warehouse"),
+                         Path("D:/BlueBlocx/out/iceberg/warehouse"))
+        self.assertEqual(il.warehouse_local_path("file:///D:/x/wh"), Path("D:/x/wh"))
+        self.assertIsNone(il.warehouse_local_path("file://nas/share/wh"))
+        self.assertIsNone(il.warehouse_local_path("s3://warehouse"))
+
+    def test_sql_props(self):
+        with self._env(HL_CATALOG_URI="postgresql+psycopg2://hl:pw@localhost:5432/hl_catalog",
+                       WAREHOUSE="file:///mnt/blueblocx/hypercore/warehouse"):
+            p = il._sql_props(os.environ["HL_CATALOG_URI"])
+        self.assertEqual((p["type"], p["warehouse"], p["py-io-impl"]),
+                         ("sql", "file:///mnt/blueblocx/hypercore/warehouse", il.DEFAULT_PY_IO_IMPL))
+        self.assertNotIn("s3.region", p)                        # no S3 props for a file:// warehouse
+        with self._env(HL_CATALOG_URI="sqlite:///c.db", WAREHOUSE="s3://hl-lake", S3_ENDPOINT="http://10.0.0.9:9000",
+                       S3_ACCESS_KEY="k", S3_SECRET_KEY="s"):
+            p = il._sql_props(os.environ["HL_CATALOG_URI"])
+        self.assertEqual((p["s3.endpoint"], p["s3.region"], p["s3.access-key-id"]), ("http://10.0.0.9:9000", "us-east-1", "k"))
+        with tempfile.TemporaryDirectory() as d, self._env(HL_CATALOG_URI="sqlite:///c.db"):
+            p = il._sql_props(os.environ["HL_CATALOG_URI"], local_dir=Path(d))
+        self.assertTrue(p["warehouse"].startswith("file://") and p["warehouse"].endswith("/warehouse"))
+
+    def test_redacted_uri_hides_password(self):
+        out = il._redacted_uri("postgresql+psycopg2://hl:s3cr3t@db.local:5432/hl_catalog")
+        self.assertNotIn("s3cr3t", out)
+        self.assertIn("db.local", out)
+
+    def test_sql_mode_lift_writes_data_to_warehouse_dir(self):
+        """SQL catalog (SQLite stands in for PostgreSQL) + a file:// warehouse that is NOT
+        under HL_OUT_DIR: the data files must land in the warehouse directory."""
+        from hl_poc import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            wh = root / "nas" / "warehouse"
+            cat = root / "cat"
+            cat.mkdir()
+            src = root / "staging"
+            src.mkdir()
+            now = dt.datetime(2026, 10, 12, 1, 0, tzinfo=dt.timezone.utc).isoformat()
+            with (src / "token_whitelist.csv").open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=S.TOKEN_WHITELIST_COLUMNS)
+                w.writeheader()
+                w.writerow({"token_address": "hlcore:token:1", "token_group": 7, "is_active": True,
+                            "whitelist_reason": "hypercore_token", "created_at": now, "updated_at": now})
+            env = {"HL_CATALOG_URI": f"sqlite:///{(cat / 'catalog.db').as_posix()}",
+                   "WAREHOUSE": f"file://{wh.as_posix()}", "HL_OUT_DIR": str(root / "out")}
+            with self._env(**env):
+                self.assertEqual(il.catalog_mode(), "sql")
+                catalog, mode = il.load_catalog_from_env()
+                self.assertEqual(mode, "sql")
+                try:
+                    rep = il.lift_directory(src, catalog=catalog)
+                finally:
+                    catalog.engine.dispose()          # SQLite keeps the file open on Windows
+            self.assertEqual(rep["token_whitelist"]["written"], 1)
+            parquet = list(wh.rglob("*.parquet"))
+            self.assertTrue(parquet, "data files must be under the WAREHOUSE directory")
+            self.assertFalse(list((root / "out").rglob("*.parquet")) if (root / "out").exists() else [])
+
+    def test_local_mode_warehouse_override_and_s3_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with self._env(WAREHOUSE=f"file://{(root / 'wh2').as_posix()}"):
+                catalog, mode = il.load_catalog_from_env(local_dir=root / "cat")
+            catalog.engine.dispose()
+            self.assertEqual(mode, "local")
+            self.assertTrue(catalog.properties["warehouse"].endswith("/wh2"))
+            self.assertTrue((root / "wh2").is_dir())
+            with self._env(WAREHOUSE="s3://warehouse"):
+                catalog, mode = il.load_catalog_from_env(local_dir=root / "cat2")
+            catalog.engine.dispose()
+            self.assertEqual(mode, "local")
+            self.assertIn("/cat2/warehouse", catalog.properties["warehouse"])
+
+
+class PreflightSqlCatalogTests(unittest.TestCase):
+    def test_sql_catalog_requires_warehouse(self):
+        with mock.patch.dict(os.environ, {"NESSIE_URI": "", "HL_CATALOG_URI": "sqlite:///x.db", "WAREHOUSE": ""}):
+            c = preflight.check_iceberg(required=True)
+        self.assertEqual(c.status, "FAIL")
+        self.assertIn("WAREHOUSE", c.detail)
+
+    def test_sql_catalog_sqlite_warns_but_works(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
+                   "WAREHOUSE": f"file://{(root / 'wh').as_posix()}"}
+            with mock.patch.dict(os.environ, env):
+                c = preflight.check_iceberg(required=True)
+            self.assertEqual(c.status, "WARN")
+            self.assertIn("single-writer", c.detail)
+            self.assertIn("hypercore tables 0/", c.detail)
+            self.assertTrue((root / "wh").is_dir())
+
+    def test_sql_catalog_bad_warehouse_scheme(self):
+        with mock.patch.dict(os.environ, {"NESSIE_URI": "", "HL_CATALOG_URI": "sqlite:///x.db", "WAREHOUSE": "nfs://nas/x"}):
+            c = preflight.check_iceberg(required=True)
+        self.assertEqual(c.status, "FAIL")
+        self.assertIn("neither file:// nor s3://", c.detail)
+
+
 class PreflightIcebergTests(unittest.TestCase):
     def test_tcp_reachable(self):
         srv = socket.socket()

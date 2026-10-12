@@ -1,0 +1,30 @@
+# /etc/systemd/system/hypercore-hourly.timer
+#
+# Hourly cadence: the same hypercore-daily.service, fired at minute 10 of every
+# hour (Hyperliquid's hourly funding settles on the hour; the 1h watermark
+# overlap re-pulls the boundary). Use INSTEAD of hypercore-daily.timer, and
+# shorten the service timeout so an overrun can never collide with the next
+# tick:
+#
+#   sudo cp deploy/hypercore-hourly.timer /etc/systemd/system/
+#   sudo mkdir -p /etc/systemd/system/hypercore-daily.service.d
+#   sudo cp deploy/hourly-override.conf /etc/systemd/system/hypercore-daily.service.d/hourly.conf
+#   sudo systemctl daemon-reload
+#   sudo systemctl disable --now hypercore-daily.timer 2>/dev/null
+#   sudo systemctl enable --now hypercore-hourly.timer
+#
+# Capacity: one run spends ~160-250 API weight per wallet (more for market makers);
+# at HL_WEIGHT_BUDGET=600 that is roughly 150-200 wallets per hour, at 900 about
+# 250-300. Above that, split wallets across hosts/IPs or trim the slow-changing
+# pulls (see docs/DEPLOY.md, "Hourly cadence").
+[Unit]
+Description=Run hypercore-daily.service every hour
+
+[Timer]
+OnCalendar=*-*-* *:10:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=hypercore-daily.service
+
+[Install]
+WantedBy=timers.target

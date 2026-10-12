@@ -52,17 +52,25 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                           "every download is billed to THIS account"),
     "AWS_SECRET_ACCESS_KEY": ("", True, ""),
     "AWS_REGION": ("us-east-1", False, "region for the S3 client (bucket redirects are followed)"),
-    # --- Iceberg REST (Nessie) — same names the atlas Rust services / python-ingestion read
+    # --- Iceberg catalog: REST (shared atlas lake) or SQL (standalone host) ------------
     "NESSIE_URI": ("", False,
-                   "Iceberg REST endpoint, e.g. http://nessie:19120/iceberg. Unset = local SQLite "
-                   "catalog under HL_OUT_DIR/iceberg (development only)"),
+                   "Iceberg REST endpoint, e.g. http://nessie:19120/iceberg (the shared atlas lake). "
+                   "Unset and HL_CATALOG_URI unset = local SQLite catalog under HL_OUT_DIR/iceberg "
+                   "(development only)"),
     "NESSIE_BRANCH": ("main", False, "Nessie branch (pyiceberg REST `prefix`)"),
     "NESSIE_TOKEN": ("", True, "bearer token when the REST catalog is authenticated"),
+    "HL_CATALOG_URI": ("", True,
+                       "standalone mode: SQLAlchemy URL of the pyiceberg SQL catalog, e.g. "
+                       "postgresql+psycopg2://hl:pw@localhost:5432/hl_catalog (SQLite is single-writer, "
+                       "development only). No object store or Nessie needed; data goes to WAREHOUSE"),
     "HL_PY_IO_IMPL": ("pyiceberg.io.pyarrow.PyArrowFileIO", False,
-                      "pyiceberg FileIO class for the REST catalog. Nessie advertises FsspecFileIO, "
-                      "which needs the s3fs package this project does not install"),
-    "WAREHOUSE": ("", False, "warehouse location, e.g. s3://warehouse"),
-    "S3_ENDPOINT": ("", False, "object-store endpoint for the warehouse (MinIO or S3); unset = AWS"),
+                      "pyiceberg FileIO class. Nessie advertises FsspecFileIO, which needs the s3fs "
+                      "package this project does not install"),
+    "WAREHOUSE": ("", False,
+                  "where table data lives: REST mode s3://warehouse (bucket); SQL/local mode a plain "
+                  "directory such as file:///mnt/blueblocx/hypercore/warehouse (NFS is fine for the "
+                  "warehouse; HL_OUT_DIR must stay local) or an s3:// bucket with the S3_* variables"),
+    "S3_ENDPOINT": ("", False, "object-store endpoint for an s3:// warehouse (MinIO/SeaweedFS/S3); unset = AWS"),
     "S3_ACCESS_KEY": ("", True, "warehouse object-store key"),
     "S3_SECRET_KEY": ("", True, ""),
     "S3_REGION": ("", False, "warehouse object-store region"),

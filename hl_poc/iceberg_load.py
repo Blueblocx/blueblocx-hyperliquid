@@ -6,11 +6,15 @@ blocks) so the loader cannot drift from the DDL; the target namespace is a
 parameter (hypercore by default, hyperevm shares the same shapes). Two catalog
 modes:
 
-  * REST (production): NESSIE_URI (+ NESSIE_BRANCH -> pyiceberg `prefix`,
+  * REST (shared atlas lake): NESSIE_URI (+ NESSIE_BRANCH -> pyiceberg `prefix`,
     WAREHOUSE, S3_ENDPOINT / S3_ACCESS_KEY / S3_SECRET_KEY / S3_REGION) — the
     same variable names the Rust services and python-ingestion read.
-  * LOCAL (default when NESSIE_URI is unset): a pyiceberg SQLite catalog with a
-    file warehouse under out/iceberg/, so the whole lift is testable end to end.
+  * SQL (standalone host, no object store): HL_CATALOG_URI = a SQLAlchemy URL
+    (PostgreSQL in production; SQLite is single-writer) holding the catalog rows,
+    WAREHOUSE = where the data lives — file:///mnt/nas/hypercore/warehouse on an
+    NFS mount, or an s3:// bucket with the S3_* variables.
+  * LOCAL (default when neither is set): a pyiceberg SQLite catalog with a file
+    warehouse under HL_OUT_DIR/iceberg/, so the whole lift is testable end to end.
 
 Type policy (matches production): data-table TIMESTAMP columns are Iceberg
 `timestamptz` (Spark TIMESTAMP is TIMESTAMP_LTZ; python-ingestion writes
@@ -242,6 +246,14 @@ def _rest_props(uri: str) -> dict:
     token = os.environ.get("NESSIE_TOKEN") or os.environ.get("ICEBERG_REST_TOKEN")
     if token:
         props["token"] = token
+    props.update(_s3_props())
+    return props
+
+
+def _s3_props() -> dict:
+    """s3.* FileIO properties from the environment (shared by the REST and SQL modes
+    whenever the warehouse is an s3:// location)."""
+    props: dict = {}
     ep = os.environ.get("S3_ENDPOINT") or os.environ.get("MINIO_ENDPOINT") or os.environ.get("AWS_ENDPOINT_URL")
     if ep:
         props["s3.endpoint"] = ep
@@ -254,20 +266,96 @@ def _rest_props(uri: str) -> dict:
     return props
 
 
+def _redacted_uri(uri: str) -> str:
+    """Catalog URI safe for logs (password hidden)."""
+    try:
+        from sqlalchemy.engine import make_url
+        return make_url(uri).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001
+        return uri.split("@")[-1] if "@" in uri else uri
+
+
+def catalog_mode() -> str:
+    """Which catalog the environment selects: 'rest' (NESSIE_URI), 'sql'
+    (HL_CATALOG_URI: PostgreSQL or SQLite via SQLAlchemy) or 'local' (the dev
+    SQLite catalog under HL_OUT_DIR/iceberg)."""
+    if os.environ.get("NESSIE_URI"):
+        return "rest"
+    if os.environ.get("HL_CATALOG_URI"):
+        return "sql"
+    return "local"
+
+
+def _sql_props(sql_uri: str, local_dir: Path | None = None) -> dict:
+    """pyiceberg SQL-catalog properties: the catalog rows live in the database
+    named by HL_CATALOG_URI (PostgreSQL in production — SQLite is single-writer,
+    development only); the DATA lives wherever WAREHOUSE points. A file://
+    warehouse (e.g. an NFS mount) needs no object store at all; an s3://
+    warehouse takes the usual S3_* variables."""
+    warehouse = os.environ.get("WAREHOUSE") or ""
+    if not warehouse:
+        local = Path(local_dir or (config.out_root() / "iceberg")).resolve()
+        local.mkdir(parents=True, exist_ok=True)
+        warehouse = f"file://{local.as_posix()}/warehouse"
+    props = {"type": "sql", "uri": sql_uri, "warehouse": warehouse,
+             "py-io-impl": os.environ.get("HL_PY_IO_IMPL") or DEFAULT_PY_IO_IMPL}
+    if warehouse.startswith(("s3://", "s3a://", "s3n://")):
+        props.update(_s3_props())
+    return props
+
+
+def warehouse_local_path(warehouse: str) -> Path | None:
+    """Filesystem path of a file:// warehouse, else None. Accepts file:///abs/path,
+    file://localhost/abs/path and the Windows forms file://D:/x and file:///D:/x
+    (the dev catalog has always written file://{drive}:/...)."""
+    if not warehouse.startswith("file://"):
+        return None
+    from urllib.parse import unquote
+    rest = unquote(warehouse[len("file://"):])
+    if rest.startswith("localhost/"):
+        rest = rest[len("localhost"):]
+    if len(rest) >= 3 and rest[0] == "/" and rest[2] == ":":
+        rest = rest[1:]                                # file:///D:/x -> D:/x
+    is_posix_abs = rest.startswith("/")
+    is_windows_abs = len(rest) >= 2 and rest[1] == ":" and rest[0].isalpha()
+    if not (is_posix_abs or is_windows_abs):
+        return None                                    # file://host/share is not local
+    return Path(rest)
+
+
 def load_catalog_from_env(local_dir: Path | None = None):
     from pyiceberg.catalog import load_catalog
-    uri = os.environ.get("NESSIE_URI")
-    if uri:
+    mode = catalog_mode()
+    if mode == "rest":
+        uri = os.environ["NESSIE_URI"]
         props = _rest_props(uri)
         log.info("iceberg catalog: REST %s (prefix/branch %s, io %s)", uri, props["prefix"],
                  props["py-io-impl"].rsplit(".", 1)[-1])
         return load_catalog("nessie", **props), "rest"
+    if mode == "sql":
+        props = _sql_props(os.environ["HL_CATALOG_URI"], local_dir)
+        wh_path = warehouse_local_path(props["warehouse"])
+        if wh_path is not None:
+            wh_path.mkdir(parents=True, exist_ok=True)
+        log.info("iceberg catalog: SQL %s, warehouse %s", _redacted_uri(props["uri"]), props["warehouse"])
+        return load_catalog("hl", **props), "sql"
     local = Path(local_dir or (config.out_root() / "iceberg")).resolve()
     local.mkdir(parents=True, exist_ok=True)
     wh = local.as_posix()
-    log.info("iceberg catalog: LOCAL sqlite at %s", wh)
+    warehouse = os.environ.get("WAREHOUSE") or ""
+    if not warehouse.startswith("file://"):
+        if warehouse:
+            log.warning("WAREHOUSE=%s ignored: without NESSIE_URI or HL_CATALOG_URI the dev catalog "
+                        "only writes a file:// warehouse", warehouse)
+        warehouse = f"file://{wh}/warehouse"
+    else:
+        p = warehouse_local_path(warehouse)
+        if p is not None:
+            p.mkdir(parents=True, exist_ok=True)
+    log.info("iceberg catalog: LOCAL sqlite at %s, warehouse %s", wh, warehouse)
     return load_catalog("local", **{"type": "sql", "uri": f"sqlite:///{wh}/catalog.db",
-                                   "warehouse": f"file://{wh}/warehouse"}), "local"
+                                   "warehouse": warehouse,
+                                   "py-io-impl": os.environ.get("HL_PY_IO_IMPL") or DEFAULT_PY_IO_IMPL}), "local"
 
 
 def _iceberg_schema(cols: list[tuple], tz: bool = True):

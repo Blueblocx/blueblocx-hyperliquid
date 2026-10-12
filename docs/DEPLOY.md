@@ -85,7 +85,8 @@ Every variable is documented in `hl_poc/config.py` (`ENV_VARS`); the important o
 | `HL_WEIGHT_BUDGET` | `600` if anything else on this IP polls Hyperliquid, else up to `900` |
 | `HL_RETENTION_DAYS` | `45` (≥ 31; the 30-day analytics windows read the staged CSV) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | the new scoped key from §0 |
-| `NESSIE_URI`, `NESSIE_BRANCH`, `WAREHOUSE`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | the same values the atlas Rust services use (`services/rust/*/.env.example`). Leave `NESSIE_URI` empty **only** for a dry run: it switches to a local SQLite catalog under `HL_OUT_DIR/iceberg` that nothing else can read |
+| `HL_CATALOG_URI` + `WAREHOUSE` | **standalone host**: PostgreSQL catalog URL + `file:///mnt/<nas>/hypercore/warehouse` (see "Standalone host" below). No Nessie, no object store |
+| `NESSIE_URI`, `NESSIE_BRANCH`, `WAREHOUSE`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | **shared atlas lake** instead: the same values the atlas Rust services use (`services/rust/*/.env.example`). With neither set the pipeline falls back to a local SQLite catalog under `HL_OUT_DIR/iceberg` that is for dry runs only |
 | `HL_ALERT_WEBHOOK_URL` | a Slack or Discord incoming webhook. Problems are POSTed after every failing run |
 | `HL_LOG_JSON` | `1` when journald/a log shipper collects stderr |
 
@@ -146,6 +147,58 @@ Verify from the lake side too (Trino / Spark SQL):
 SELECT count(*), min(block_date), max(block_date) FROM nessie.hypercore.l1_wallet_ledger;
 SELECT * FROM nessie.control.table_watermarks WHERE namespace = 'hypercore';
 ```
+
+### Standalone host: PostgreSQL catalog + plain files on the NAS (no Nessie, no MinIO)
+
+When this pipeline is the only lake writer on the host (the case for
+`server4090-2`), it needs **no object store and no Nessie**: pyiceberg writes
+Parquet and Iceberg metadata as plain files, and a small PostgreSQL holds the
+catalog rows. The engines that forced Nessie + S3 in the atlas lake (Trino 465,
+iceberg-rust with S3 hard-coded, Nessie's own ObjectIO) are not on this host.
+
+```bash
+sudo apt install postgresql                               # local disk, a few hundred MB
+sudo -u postgres psql -c "CREATE ROLE hl LOGIN PASSWORD '...';" -c "CREATE DATABASE hl_catalog OWNER hl;"
+sudo -u hypercore mkdir -p /mnt/blueblocx/hypercore/warehouse   # the NAS: data + metadata files
+```
+
+In the env file: `HL_CATALOG_URI=postgresql+psycopg2://hl:...@localhost:5432/hl_catalog`,
+`WAREHOUSE=file:///mnt/blueblocx/hypercore/warehouse`, `NESSIE_URI` empty.
+pyiceberg creates its two catalog tables on first use and the seven `hypercore`
+tables from the DDL on the first lift. `preflight --iceberg` checks the database,
+the warehouse directory and reports the filesystem type (NFS is fine **for the
+warehouse**; `HL_OUT_DIR` must stay on the local disk).
+
+What this gives and costs:
+
+- Writes per hourly run are tens of MB; a day of a market-maker wallet is a few
+  hundred MB of Parquet. The NAS's ~100 MB/s buffered / 18 MB/s synchronous path
+  is irrelevant at this volume (a lift is seconds).
+- Commits are atomic in PostgreSQL (optimistic update of the table pointer);
+  files are written before the pointer moves, so NFS close-to-open consistency
+  is enough. Mount `hard,vers=4.1` (DSM's maximum).
+- Readers: pyiceberg or DuckDB on this host read the tables directly; another
+  host (olympus) can mount the same export and use the same PostgreSQL catalog
+  (iceberg-rust `iceberg-catalog-sql` + `OpenDalStorageFactory::Fs`; Trino ≥ 471
+  with the JDBC catalog). Nothing on this host can be read by Nessie.
+- Backup = `pg_dump hl_catalog` + the warehouse directory (NAS snapshot).
+- SQLite as `HL_CATALOG_URI` works for a single writer but pyiceberg labels it
+  development-only; preflight warns.
+
+### Hourly cadence
+
+`deploy/hypercore-hourly.timer` runs the same service every hour (minute 10)
+with `deploy/hourly-override.conf` capping a run at 50 min. The run is already
+incremental (per-wallet watermark, 1 h overlap, bounded lift), so nothing else
+changes. Capacity is set by the Hyperliquid per-IP weight budget: a run spends
+roughly 160–250 weight per wallet (four flat-20 state calls, four paged history
+calls, two 2-weight clearinghouse calls, plus items/20 for fills). At
+`HL_WEIGHT_BUDGET=600` (shared IP) that is ~150–200 wallets per hour; at 900,
+~250–300. Hourly windows also keep market makers (5–8k fills/hour) under the
+~10k fills API cap, so S3 backfill becomes a rare repair path rather than a daily
+cost. Beyond that capacity: a second egress IP, or fetching the slow-changing
+pulls (staking, vault equity, open orders, the portfolio oracle) once a day
+instead of hourly — a code change not made yet.
 
 ### Talking to a Nessie REST catalog from another host
 

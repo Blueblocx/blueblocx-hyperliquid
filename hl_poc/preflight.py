@@ -296,10 +296,69 @@ def _tcp_reachable(url: str, timeout: float = 3.0) -> bool:
         return False
 
 
+def _check_sql_catalog(required: bool) -> Check:
+    """Standalone mode: HL_CATALOG_URI (PostgreSQL/SQLite) + WAREHOUSE (file:// or s3://)."""
+    from .iceberg_load import TABLE_PLAN, _redacted_uri, load_catalog_from_env, warehouse_local_path
+    uri = os.environ.get("HL_CATALOG_URI", "")
+    warehouse = os.environ.get("WAREHOUSE", "")
+    notes, fails = [], []
+    if uri.startswith("sqlite"):
+        notes.append("SQLite catalog is single-writer (pyiceberg: development only) - use PostgreSQL for production")
+    if not warehouse:
+        fails.append("WAREHOUSE unset - set it to the data directory, e.g. file:///mnt/nas/hypercore/warehouse")
+    wh_path = warehouse_local_path(warehouse) if warehouse else None
+    if warehouse and wh_path is None and not warehouse.startswith(("s3://", "s3a://", "s3n://")):
+        fails.append(f"WAREHOUSE {warehouse} is neither file:// nor s3://")
+    if wh_path is not None:
+        try:
+            wh_path.mkdir(parents=True, exist_ok=True)
+            probe = wh_path / ".preflight_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            try:
+                free_gb = shutil.disk_usage(wh_path).free / 1e9
+            except Exception:  # noqa: BLE001
+                free_gb = None
+            mount = mount_fstype(wh_path.resolve().as_posix())
+            notes.append(f"warehouse {wh_path} writable" + (f", {free_gb:.0f} GB free" if free_gb is not None else "")
+                         + (f", {mount[1]}" if mount else ""))
+        except Exception as e:  # noqa: BLE001
+            fails.append(f"warehouse {warehouse} not writable: {type(e).__name__}: {str(e)[:100]}")
+    if fails:
+        return _fail("iceberg", f"SQL catalog {_redacted_uri(uri)}: " + "; ".join(fails))
+    catalog = None
+    try:
+        catalog, _ = load_catalog_from_env()
+        namespaces = {".".join(n) if isinstance(n, tuple) else str(n) for n in catalog.list_namespaces()}
+        have: set[str] = set()
+        if "hypercore" in namespaces:
+            have = {t[-1] if isinstance(t, tuple) else str(t) for t in catalog.list_tables("hypercore")}
+    except Exception as e:  # noqa: BLE001
+        return _fail("iceberg", f"SQL catalog {_redacted_uri(uri)}: {type(e).__name__}: {str(e)[:140]}"
+                                f" - is PostgreSQL running and the driver (psycopg2-binary) installed?")
+    finally:
+        engine = getattr(catalog, "engine", None)
+        if engine is not None:
+            engine.dispose()                     # release the connection (SQLite keeps the file open)
+    missing = [t for t in TABLE_PLAN if t not in have]
+    detail = (f"SQL catalog {_redacted_uri(uri)}: {len(namespaces)} namespace(s), hypercore tables "
+              f"{len(have)}/{len(TABLE_PLAN)}, warehouse {warehouse}")
+    if missing:
+        notes.append(f"missing {missing} - created from the DDL on the first lift")
+    if notes:
+        return _warn("iceberg", detail + "; " + "; ".join(notes))
+    return _ok("iceberg", detail)
+
+
 def check_iceberg(required: bool) -> Check:
+    from .iceberg_load import catalog_mode
+    mode = catalog_mode()
+    if mode == "sql":
+        return _check_sql_catalog(required)
     uri = os.environ.get("NESSIE_URI")
     if not uri:
-        msg = "NESSIE_URI unset - local SQLite catalog under HL_OUT_DIR/iceberg (development only)"
+        msg = ("neither NESSIE_URI nor HL_CATALOG_URI set - local SQLite catalog under HL_OUT_DIR/iceberg "
+               "(development only)")
         return _fail("iceberg", msg) if required else _warn("iceberg", msg)
     notes = []
     if not os.environ.get("WAREHOUSE"):

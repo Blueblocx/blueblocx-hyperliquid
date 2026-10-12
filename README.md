@@ -58,7 +58,8 @@ monitoring, upgrade, what still lives in atlas). The pieces:
 | configuration | environment variables only, documented in `hl_poc/config.py` (`ENV_VARS`); `deploy/.env.example` mirrors it; `.env` is loaded without overriding the process env |
 | health check | `python -m hl_poc.preflight [--offline] [--iceberg --s3]` — deps, tzdata, DDL, paths, env sanity, HL API + clock skew, S3 requester-pays, Nessie REST; never prints secrets |
 | scheduler entry point | `python -m hl_poc.daily` — lock, incremental run, run summary (`_run_summary.json`, `_run_history.jsonl`), webhook alert; exit 0/1/2/3 |
-| scheduling | `deploy/hypercore-daily.{service,timer}` (systemd), `deploy/run_daily.sh` + `deploy/crontab.example` (cron), `Dockerfile` (batch image), `deploy/dagster_hypercore_assets.py` (template) |
+| scheduling | `deploy/hypercore-daily.{service,timer}` (systemd, daily) or `deploy/hypercore-hourly.timer` + `deploy/hourly-override.conf` (hourly), `deploy/run_daily.sh` + `deploy/crontab.example` (cron), `Dockerfile` (batch image), `deploy/dagster_hypercore_assets.py` (template) |
+| catalog | three modes in `hl_poc/iceberg_load.py`: **standalone** `HL_CATALOG_URI` (PostgreSQL) + `WAREHOUSE=file:///…` on a NAS mount — no Nessie, no object store; **shared atlas lake** `NESSIE_URI` + S3 store; **dev** SQLite under `HL_OUT_DIR/iceberg` |
 | state hygiene | atomic writes for every state file; staged CSVs pruned to `HL_RETENTION_DAYS` after a successful Iceberg lift |
 | CI | `.github/workflows/ci.yml` — tests on Python 3.12/3.13, offline preflight, Docker image build + in-container smoke |
 
