@@ -10,7 +10,7 @@ credentials*
 __pycache__/
 *.pyc
 
-# POC output / scratch
+# pipeline output / scratch
 out/
 *.lz4
 *.log

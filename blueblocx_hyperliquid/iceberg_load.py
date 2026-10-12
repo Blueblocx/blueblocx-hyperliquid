@@ -36,9 +36,9 @@ does not):
   * watermarks are written in a FINAL step, monotonic, and never abort data lifts.
 
 Usage:
-    python -m hl_poc.iceberg_load --from out/hypercore
-    python -m hl_poc.iceberg_load --from out/hyperevm --namespace hyperevm
-    NESSIE_URI=http://nessie:19120/iceberg python -m hl_poc.iceberg_load --from out/hypercore
+    python -m blueblocx_hyperliquid.iceberg_load --from out/hypercore
+    python -m blueblocx_hyperliquid.iceberg_load --from out/hyperevm --namespace hyperevm
+    NESSIE_URI=http://nessie:19120/iceberg python -m blueblocx_hyperliquid.iceberg_load --from out/hypercore
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ import pyarrow as pa
 from . import config
 from .ops import atomic_write_text
 
-log = logging.getLogger("hl_poc.iceberg_load")
+log = logging.getLogger("blueblocx_hyperliquid.iceberg_load")
 
 ROOT = Path(__file__).resolve().parent.parent
 DDL_PATH = ROOT / "docs" / "PROPOSED_SCHEMA.sql"      # overridable with HL_DDL_PATH
@@ -241,7 +241,7 @@ def _rest_props(uri: str) -> dict:
 
     Nessie's OVERRIDES — notably s3.endpoint = its configured external-endpoint —
     beat anything set here, so the endpoint the catalog advertises must be
-    reachable from THIS host; `hl_poc.preflight --iceberg` checks exactly that.
+    reachable from THIS host; `blueblocx_hyperliquid.preflight --iceberg` checks exactly that.
     """
     branch = os.environ.get("NESSIE_BRANCH") or "main"
     props = {"type": "rest", "uri": uri.rstrip("/"), "prefix": branch,
@@ -562,7 +562,7 @@ def write_watermarks(catalog, namespace: str, entries: list[tuple], run_id: str)
         status[table_name] = "written"
         rows.append({
             "namespace": namespace, "table_name": table_name, "layer": table_name.split("_")[0],
-            "producer": "hl_poc.iceberg_load", "watermark_col": watermark_col,
+            "producer": "blueblocx_hyperliquid.iceberg_load", "watermark_col": watermark_col,
             "watermark_date": wm_naive.date(), "watermark_ts": wm_naive,
             "row_count": row_count, "snapshot_id": str(snapshot_id) if snapshot_id is not None else None,
             "job_name": f"{namespace}_lift", "run_id": run_id, "updated_at": now_naive, "status": "completed",

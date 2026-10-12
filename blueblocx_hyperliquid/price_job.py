@@ -16,8 +16,8 @@ ASOF (backward) joins tolerate that; bucket_minute is the candle open.
 Stablecoins are pinned to $1 on the same interval grid across the range.
 
 Usage:
-    python -m hl_poc.price_job --spot HYPE,UBTC --perp BTC,ETH --days 30
-    python -m hl_poc.price_job --spot HYPE --days 3        # 1m granularity
+    python -m blueblocx_hyperliquid.price_job --spot HYPE,UBTC --perp BTC,ETH --days 30
+    python -m blueblocx_hyperliquid.price_job --spot HYPE --days 3        # 1m granularity
 Output (upsert by (token_address, bucket_minute)):
     out/hypercore/l3_token_price_usd_1m.csv
 """
@@ -35,7 +35,7 @@ from . import prices
 from .info_client import InfoClient, interval_for_range
 from .spot_meta import SpotMetaResolver
 
-log = logging.getLogger("hl_poc.price_job")
+log = logging.getLogger("blueblocx_hyperliquid.price_job")
 
 OUT_ROOT = Path(__file__).resolve().parent.parent / "out"
 

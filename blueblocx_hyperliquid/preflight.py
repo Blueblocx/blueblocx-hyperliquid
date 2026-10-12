@@ -2,10 +2,10 @@
 Pre-deployment / pre-run health check. One line per check, exit 1 if anything
 FAILS. Secret values are never printed (presence only).
 
-    python -m hl_poc.preflight                       # everything the current env allows
-    python -m hl_poc.preflight --offline             # CI: deps, DDL, env sanity, paths - no network
-    python -m hl_poc.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
-    python -m hl_poc.preflight --json                # machine-readable
+    python -m blueblocx_hyperliquid.preflight                       # everything the current env allows
+    python -m blueblocx_hyperliquid.preflight --offline             # CI: deps, DDL, env sanity, paths - no network
+    python -m blueblocx_hyperliquid.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
+    python -m blueblocx_hyperliquid.preflight --json                # machine-readable
 
 Statuses: OK · WARN (runs, but read it) · FAIL (do not schedule) · SKIP (not applicable).
 """
@@ -442,7 +442,7 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps({"version": __version__, "ok": not failed, "checks": [asdict(c) for c in checks]}, indent=2))
     else:
-        print(f"hl_poc {__version__} preflight")
+        print(f"blueblocx_hyperliquid {__version__} preflight")
         for c in checks:
             print(f"  {c.status:<4} {c.name:<14} {c.detail}")
         print(f"  => {'FAIL' if failed else 'OK'} ({len(failed)} failing, "

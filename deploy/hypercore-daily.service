@@ -22,10 +22,10 @@ RequiresMountsFor=/mnt/blueblocx
 Type=oneshot
 User=hypercore
 Group=hypercore
-WorkingDirectory=/opt/hyperliquid-poc
+WorkingDirectory=/opt/blueblocx-hyperliquid
 EnvironmentFile=/etc/hypercore/hypercore.env
-ExecStartPre=/opt/hyperliquid-poc/.venv/bin/python -m hl_poc.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
-ExecStart=/opt/hyperliquid-poc/.venv/bin/python -m hl_poc.daily --wallets-file /etc/hypercore/wallets.txt --iceberg --s3-backfill
+ExecStartPre=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.daily --wallets-file /etc/hypercore/wallets.txt --iceberg --s3-backfill
 # a 24h window of S3 hour files for market-maker wallets takes ~35 min; whales with
 # a lazy full-ledger pull add ~10 min. Anything past this is stuck, not slow.
 TimeoutStartSec=4h

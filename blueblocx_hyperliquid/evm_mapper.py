@@ -10,7 +10,7 @@ l1_wallet_ledger:
   - amount_raw = uint256(data); amount = amount_raw / 10^decimals (decimals from
     a token-metadata lookup; None until resolved -> amount left null)
 
-For the POC we only keep the row whose wallet_address == the wallet we queried
+Here we only keep the row whose wallet_address == the wallet we queried
 (the getLogs filter already guarantees the wallet is on one side), so we emit a
 single directional row per log rather than both sides — the counterparty is the
 other address. This keeps the per-wallet dump focused; the full both-rows form is

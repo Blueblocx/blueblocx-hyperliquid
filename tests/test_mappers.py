@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import unittest
 
-from hl_poc import mappers, schema as S
-from hl_poc.spot_meta import SpotMetaResolver
+from blueblocx_hyperliquid import mappers, schema as S
+from blueblocx_hyperliquid.spot_meta import SpotMetaResolver
 
 WALLET_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 WALLET_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -229,7 +229,7 @@ class SpotPriceCtxTests(unittest.TestCase):
     pair's price -> net worth off by $11.5M)."""
 
     def test_prices_keyed_by_ctx_coin_not_index(self):
-        from hl_poc import prices
+        from blueblocx_hyperliquid import prices
         resolver = SpotMetaResolver(SPOT_META)
         # ctxs deliberately shuffled + padded with extra markets not in universe
         ctxs = [
@@ -244,7 +244,7 @@ class SpotPriceCtxTests(unittest.TestCase):
         self.assertNotIn("BAR", px)  # no USDC pair for BAR
 
     def test_midpx_fallback_when_no_mark(self):
-        from hl_poc import prices
+        from blueblocx_hyperliquid import prices
         resolver = SpotMetaResolver(SPOT_META)
         px = prices.spot_symbol_prices(resolver, SPOT_META,
                                        [{"coin": "HYPE/USDC", "markPx": None, "midPx": "88"}],
@@ -257,7 +257,7 @@ class NetWorthCompositionTests(unittest.TestCase):
     Verified live: unified wallet gap -0.001%, plain perp wallet gap 0.0."""
 
     def _analytics(self, spot_hold=None, vaults=None, staked="0", account_value="500"):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         usdc = {"coin": "USDC", "token": 0, "total": "2000", "hold": "0"}
         if spot_hold is not None:
             usdc["spotHold"] = spot_hold
@@ -283,7 +283,7 @@ class NetWorthCompositionTests(unittest.TestCase):
         self.assertAlmostEqual(a["net_worth"], 2000 + 200)
 
     def test_l4x_snapshot_carries_dex(self):
-        from hl_poc import prices
+        from blueblocx_hyperliquid import prices
         chs = {"marginSummary": {"accountValue": "10"}, "assetPositions": [
             {"position": {"coin": "xyz:SP500", "szi": "1", "entryPx": "1", "positionValue": "1",
                           "unrealizedPnl": "0", "returnOnEquity": "0", "marginUsed": "1",
@@ -299,7 +299,7 @@ class NetWorthCompositionTests(unittest.TestCase):
         self.assertAlmostEqual(a["net_worth"], 500 + 2000 + 200 + 300 + 1000.5)
 
     def test_non_usdc_fee_leg_is_valued_not_summed_raw(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         t = 1_700_000_000_000
         rows, _ = map_all(WALLET_A, fills=[spot_fill(5, t)])  # fee leg in HYPE
         chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
@@ -311,7 +311,7 @@ class NetWorthCompositionTests(unittest.TestCase):
         self.assertEqual(a["unvalued_ledger_rows"], 0)
 
     def test_unpriced_token_rows_are_counted_not_silently_summed(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         t = 1_700_000_000_000
         rows, _ = map_all(WALLET_A, fills=[spot_fill(5, t)])
         chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
@@ -405,7 +405,7 @@ class WeightBudgetTests(unittest.TestCase):
     """settle() must correct the CALLER's slot, not whichever slot is last."""
 
     def test_settle_by_handle_under_interleaving(self):
-        from hl_poc.info_client import _WeightBudget
+        from blueblocx_hyperliquid.info_client import _WeightBudget
         b = _WeightBudget(300)
         s1 = b.acquire(20)      # T1 small call
         s2 = b.acquire(270)     # T2 big candle call
@@ -418,7 +418,7 @@ class WeightBudgetTests(unittest.TestCase):
 
 class AnalyticsCoverageTests(unittest.TestCase):
     def test_windows_beyond_coverage_are_none_with_flag(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         now = 1_700_000_000_000
         chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
         a = analytics.compute_analytics([], [], chs, {"balances": []}, now, NOW,
@@ -430,7 +430,7 @@ class AnalyticsCoverageTests(unittest.TestCase):
         self.assertAlmostEqual(a["coverage_days"], 2.0)
 
     def test_truncated_fills_invalidate_all_windows(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         now = 1_700_000_000_000
         chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
         a = analytics.compute_analytics([], [], chs, {"balances": []}, now, NOW,

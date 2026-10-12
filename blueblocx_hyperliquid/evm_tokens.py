@@ -2,7 +2,7 @@
 Resolve HyperEVM ERC-20 token metadata (decimals, symbol) via eth_call.
 
 This is the L1 metadata step for the EVM source — equivalent to atlas's
-l1_token_metadata (which comes from Moralis there). For the POC we read it
+l1_token_metadata (which comes from Moralis there). Here we read it
 straight off-chain with standard ERC-20 view calls, which work on the default
 non-archive RPC because they only need latest state.
 

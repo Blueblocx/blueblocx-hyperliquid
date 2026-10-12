@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from . import schema as S
 from .spot_meta import SpotMetaResolver, TokenInfo
 
-log = logging.getLogger("hl_poc.mappers")
+log = logging.getLogger("blueblocx_hyperliquid.mappers")
 
 
 def _iso(ms: int) -> str:

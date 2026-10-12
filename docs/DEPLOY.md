@@ -1,6 +1,6 @@
 # Deploying the HyperCore pipeline
 
-Runbook for putting `hyperliquid-poc` on a Linux server as a scheduled batch job.
+Runbook for putting `blueblocx-hyperliquid` on a Linux server as a scheduled batch job.
 It is a **batch job, not a service**: once a day it pulls each watched wallet's
 Hyperliquid history, validates it against Hyperliquid's own portfolio numbers,
 and lifts the rows into Iceberg (`nessie.hypercore.*`). Serving those rows to the
@@ -55,10 +55,10 @@ one light wallet per 30–60 s; a 100-wallet list finishes in ~1 h.
 
 ```bash
 sudo useradd --system --create-home --home-dir /var/lib/hypercore --shell /usr/sbin/nologin hypercore
-sudo git clone <your-remote> /opt/hyperliquid-poc
-sudo chown -R hypercore:hypercore /opt/hyperliquid-poc
+sudo git clone <your-remote> /opt/blueblocx-hyperliquid
+sudo chown -R hypercore:hypercore /opt/blueblocx-hyperliquid
 sudo -u hypercore bash -c '
-  cd /opt/hyperliquid-poc &&
+  cd /opt/blueblocx-hyperliquid &&
   python3 -m venv .venv &&
   .venv/bin/pip install -r requirements.txt -c constraints.txt &&
   .venv/bin/python -m unittest discover -s tests -t .'
@@ -71,13 +71,13 @@ with; `requirements.txt` alone would float the indirect packages.
 
 ```bash
 sudo mkdir -p /etc/hypercore
-sudo cp /opt/hyperliquid-poc/deploy/.env.example /etc/hypercore/hypercore.env
+sudo cp /opt/blueblocx-hyperliquid/deploy/.env.example /etc/hypercore/hypercore.env
 sudo chown root:hypercore /etc/hypercore/hypercore.env && sudo chmod 640 /etc/hypercore/hypercore.env
 sudoedit /etc/hypercore/hypercore.env            # fill in the values
 printf '%s\n' 0x... 0x... | sudo tee /etc/hypercore/wallets.txt     # one address per line, # comments ok
 ```
 
-Every variable is documented in `hl_poc/config.py` (`ENV_VARS`); the important ones:
+Every variable is documented in `blueblocx_hyperliquid/config.py` (`ENV_VARS`); the important ones:
 
 | variable | set it to |
 |---|---|
@@ -97,7 +97,7 @@ so `EnvironmentFile=` (systemd) or `--env-file` (Docker) work unchanged.
 
 ```bash
 sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env \
-  /opt/hyperliquid-poc/.venv/bin/python -m hl_poc.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
+  /opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg --s3 --wallets-file /etc/hypercore/wallets.txt
 ```
 
 Expected: every line `OK` or `WARN`, exit 0. It never prints secret values.
@@ -119,8 +119,8 @@ Run two or three wallets for a two-day window and read the evidence before
 scheduling anything:
 
 ```bash
-cd /opt/hyperliquid-poc
-sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m hl_poc.extract \
+cd /opt/blueblocx-hyperliquid
+sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.extract \
   --wallet 0xA,0xB --days 2 --incremental --iceberg --s3-backfill
 ```
 
@@ -136,7 +136,7 @@ Then look at `$HL_OUT_DIR/hypercore/_reconciliation.json`:
 Then the whole list once, by hand, exactly as the scheduler will run it:
 
 ```bash
-sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m hl_poc.daily \
+sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.daily \
   --wallets-file /etc/hypercore/wallets.txt --iceberg --s3-backfill
 echo $?            # 0 clean · 1 problems (see _run_summary.json) · 2 config · 3 lock held
 ```
@@ -206,7 +206,7 @@ Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
   still warns, as pyiceberg labels SQLite development-only).
 - **Backup** = `pg_dump hl_catalog` **first**, then the warehouse directory
   (NAS snapshot); the dump then only references files that already exist.
-- **Maintenance.** `python -m hl_poc.maintenance --expire-days 7` nightly
+- **Maintenance.** `python -m blueblocx_hyperliquid.maintenance --expire-days 7` nightly
   (`deploy/hypercore-maintenance.{service,timer}`) expires old snapshots so
   `metadata.json` stays small; tables carry
   `write.metadata.delete-after-commit.enabled=true`. pyiceberg deletes no data
@@ -239,7 +239,7 @@ lazy re-fetch when the net-worth oracle fails — a code change not made yet
 
 Rules for hourly operation:
 
-- **Onboard new wallets by hand** (`python -m hl_poc.extract --wallet 0x… --days 2 --incremental --iceberg --s3-backfill`),
+- **Onboard new wallets by hand** (`python -m blueblocx_hyperliquid.extract --wallet 0x… --days 2 --incremental --iceberg --s3-backfill`),
   never by adding them to the timer's list: a wallet with no watermark gets a
   2-day window, a market-maker-class one then needs an S3 backfill that can
   outlast the 50-min cap, and a killed run saves nothing.
@@ -282,7 +282,7 @@ Three things the first real lift against Nessie will hit unless prepared:
 - **Lifts are bounded.** `_lift_state.json` in the staging dir records the last
   successful lift; the next run reads only rows updated after it (1h margin) and
   checks only those against the lake. Row counts come from table metadata, never
-  a scan. To re-lift everything (new lake, lost state): `python -m hl_poc.iceberg_load --from $HL_OUT_DIR/hypercore --full`.
+  a scan. To re-lift everything (new lake, lost state): `python -m blueblocx_hyperliquid.iceberg_load --from $HL_OUT_DIR/hypercore --full`.
   To retry only the lift after a failed run: the same command without `--full`.
 
 ### Iceberg tables: who creates them
@@ -317,10 +317,10 @@ the 23:00 S3 hour file (published ~00:02) exists, so the previous day is complet
 
 **cron** — `deploy/run_daily.sh` + `deploy/crontab.example` (uses `flock`).
 
-**Docker** — `docker build -t hl-poc .`; state in a volume mounted at `/data`
+**Docker** — `docker build -t blueblocx-hyperliquid .`; state in a volume mounted at `/data`
 (`wallets.txt` at `/data/wallets.txt`); schedule the `docker run` from host cron
 or an orchestrator. `ENTRYPOINT` is `python -m`, so
-`docker run --rm --env-file /etc/hypercore/hypercore.env -v hypercore-data:/data hl-poc hl_poc.preflight`
+`docker run --rm --env-file /etc/hypercore/hypercore.env -v hypercore-data:/data blueblocx-hyperliquid blueblocx_hyperliquid.preflight`
 works too.
 
 **Dagster** — `deploy/dagster_hypercore_assets.py` is a template asset that runs
@@ -355,10 +355,10 @@ per line.
 ## 8. Upgrade
 
 ```bash
-cd /opt/hyperliquid-poc && sudo -u hypercore git pull --ff-only
+cd /opt/blueblocx-hyperliquid && sudo -u hypercore git pull --ff-only
 sudo -u hypercore .venv/bin/pip install -r requirements.txt -c constraints.txt
 sudo -u hypercore .venv/bin/python -m unittest discover -s tests -t .
-sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m hl_poc.preflight --iceberg --s3
+sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg --s3
 sudo systemctl start hypercore-daily.service && journalctl -u hypercore-daily -n 50
 ```
 

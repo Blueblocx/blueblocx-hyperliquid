@@ -14,8 +14,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from hl_poc import config, daily, extract, ops, preflight
-from hl_poc.info_client import InfoClient
+from blueblocx_hyperliquid import config, daily, extract, ops, preflight
+from blueblocx_hyperliquid.info_client import InfoClient
 
 
 def _clean_recon(wallets, **overrides):
@@ -90,9 +90,9 @@ class ConfigTests(unittest.TestCase):
         buf = io.StringIO()
         config.setup_logging(level="INFO", json_lines=True, stream=buf)
         import logging
-        logging.getLogger("hl_poc.test").info("hello %s", "world")
+        logging.getLogger("blueblocx_hyperliquid.test").info("hello %s", "world")
         rec = json.loads(buf.getvalue().strip().splitlines()[-1])
-        self.assertEqual((rec["level"], rec["logger"], rec["msg"]), ("INFO", "hl_poc.test", "hello world"))
+        self.assertEqual((rec["level"], rec["logger"], rec["msg"]), ("INFO", "blueblocx_hyperliquid.test", "hello world"))
         config.setup_logging(level="WARNING", json_lines=False, stream=io.StringIO())
 
 
@@ -278,7 +278,7 @@ class RetentionTests(unittest.TestCase):
 
 class StagingLoaderTests(unittest.TestCase):
     def test_grouped_loaders_match_per_wallet_loaders(self):
-        from hl_poc import schema as S
+        from blueblocx_hyperliquid import schema as S
         a, b, c = "0x" + "a" * 40, "0x" + "b" * 40, "0x" + "c" * 40
         now_ms = int(dt.datetime(2026, 10, 12, 12, tzinfo=dt.timezone.utc).timestamp() * 1000)
         with tempfile.TemporaryDirectory() as d:

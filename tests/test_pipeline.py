@@ -13,7 +13,7 @@ import unittest
 
 import pyarrow as pa
 
-from hl_poc import evm_mapper, extract, iceberg_load, s3_backfill, schema as S
+from blueblocx_hyperliquid import evm_mapper, extract, iceberg_load, s3_backfill, schema as S
 
 W = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 OTHER = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -143,7 +143,7 @@ class IncrementalWindowTests(unittest.TestCase):
 
 class TruncationFlagTests(unittest.TestCase):
     def _c(self):
-        from hl_poc.info_client import InfoClient
+        from blueblocx_hyperliquid.info_client import InfoClient
         return InfoClient()
 
     def test_cap_sized_but_window_covered_is_not_truncated(self):
@@ -165,8 +165,8 @@ class TruncationFlagTests(unittest.TestCase):
 
 class TwapSliceFillTests(unittest.TestCase):
     def test_twap_slice_normalised_and_merged_by_tid(self):
-        from hl_poc import mappers
-        from hl_poc.spot_meta import SpotMetaResolver
+        from blueblocx_hyperliquid import mappers
+        from blueblocx_hyperliquid.spot_meta import SpotMetaResolver
         # live shape from userTwapSliceFillsByTime (twapId null INSIDE, set outside)
         slice_ = {"fill": {"coin": "HYPE/USDC", "px": "0.30087", "sz": "38.74", "side": "B",
                            "time": 1_700_000_000_000, "startPosition": "1", "dir": "Buy",
@@ -191,14 +191,14 @@ class SharedS3WindowTests(unittest.TestCase):
 
 class LendingCacheTests(unittest.TestCase):
     def test_merge_lending_adds_deltas_and_drops_zero(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         self.assertEqual(analytics.merge_lending({"USDC": 100.0}, {"USDC": -100.0, "USDT0": 5.0}),
                          {"USDT0": 5.0})
 
 
 class OracleToleranceTests(unittest.TestCase):
     def test_absolute_floor_for_tiny_accounts(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         pf = [["perpAllTime", {"accountValueHistory": [[1, "13.712637"]]}],
               ["allTime", {"accountValueHistory": [[1, "19.340574"]]}]]
         a = {"account_value_usd": 0.0, "account_value_other_dex_usd": 13.734737, "net_worth": 19.43}
@@ -211,12 +211,12 @@ class OracleToleranceTests(unittest.TestCase):
 
 class PnlOracleTests(unittest.TestCase):
     def test_pending_without_prior_snapshot(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         r = analytics.pnl_oracle({"perpDay": {"pnlHistory": [[0, "10"], [1, "25"]]}}, 10.0, 5.0, None, None)
         self.assertFalse(r["checked"])
 
     def test_matches_when_realized_plus_unrealized_delta_equals_history(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         pf = {"perpDay": {"pnlHistory": [[0, "100.0"], [1, "160.0"]]}}      # +60 in 24h
         r = analytics.pnl_oracle(pf, realized_perp_24h=45.0, unrealized_now=30.0,
                                  prior_unrealized=15.0, prior_age_h=24.0)        # 45 + 15 = 60
@@ -227,7 +227,7 @@ class PnlOracleTests(unittest.TestCase):
 
 class WeightModelTests(unittest.TestCase):
     def test_documented_weights(self):
-        from hl_poc.info_client import InfoClient
+        from blueblocx_hyperliquid.info_client import InfoClient
         self.assertEqual(InfoClient._weight_of({"type": "clearinghouseState"}, {}), 2)
         self.assertEqual(InfoClient._weight_of({"type": "portfolio"}, [["day", {}]]), 20)
         self.assertEqual(InfoClient._weight_of({"type": "userFillsByTime"}, [{}] * 2000), 120)
@@ -235,7 +235,7 @@ class WeightModelTests(unittest.TestCase):
 
 class ClosedCandleTests(unittest.TestCase):
     def test_in_progress_candle_is_not_emitted(self):
-        from hl_poc import prices
+        from blueblocx_hyperliquid import prices
         now = 1_700_000_000_000
         candles = [{"t": now - 120_000, "T": now - 60_001, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1},
                    {"t": now - 60_000, "T": now + 59_999, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1}]
@@ -273,14 +273,14 @@ class LendingPositionTests(unittest.TestCase):
                           "amount": amount, "interestAmount": interest}}
 
     def test_supply_minus_withdraw_plus_interest_matches_live_shape(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         # live wallet 0x4fb2…: supplies 32,567.98, withdraws 26,968.58, interest 6.6044 -> 5,606.00 (== oracle gap)
         led = [self._bl("supply", "32567.98"), self._bl("withdraw", "26968.58", "6.6044")]
         pos = analytics.lending_position(led)
         self.assertAlmostEqual(pos["USDC"], 5606.0044, places=3)
 
     def test_non_pm_account_adds_lending_to_net_worth(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "0.47", "hold": "0"}]}  # no `supplied` key
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
@@ -289,7 +289,7 @@ class LendingPositionTests(unittest.TestCase):
         self.assertAlmostEqual(a["net_worth"], 5606.47)
 
     def test_pm_account_with_supplied_in_total_does_not_double_count(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
         spot = {"portfolioMarginEnabled": True,
                 "balances": [{"coin": "USDC", "token": 0, "total": "2603", "hold": "218", "spotHold": "358", "supplied": "2245"}]}
@@ -301,8 +301,8 @@ class LendingPositionTests(unittest.TestCase):
 
 class CollateralTokenTests(unittest.TestCase):
     def test_hip3_coin_uses_dex_collateral(self):
-        from hl_poc import mappers
-        from hl_poc.spot_meta import TokenInfo
+        from blueblocx_hyperliquid import mappers
+        from blueblocx_hyperliquid.spot_meta import TokenInfo
         usdh = TokenInfo(index=360, symbol="USDH", decimals=8, token_address="hlcore:token:360",
                          is_stablecoin=True)
         t = mappers.perp_cash_token("flx:TSLA", {"flx:": usdh})
@@ -313,7 +313,7 @@ class CollateralTokenTests(unittest.TestCase):
 
 class EvmDecimalsTests(unittest.TestCase):
     def test_unresolved_decimals_stay_null_in_metadata(self):
-        from hl_poc import prices
+        from blueblocx_hyperliquid import prices
         rows = prices.token_metadata_rows({"0xabc": {"symbol": "X", "decimals": None, "is_stablecoin": False}}, NOW)
         self.assertIsNone(rows[0]["decimals"])
 
@@ -341,7 +341,7 @@ class MergeRowsTests(unittest.TestCase):
 
 class Hip3NetWorthTests(unittest.TestCase):
     def test_overlap_applies_to_total_perp_equity_with_spot_hold(self):
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "500", "totalMarginUsed": "50"}, "assetPositions": []}
         # unified account: collateral for main+xyz (800) is inside spot USDC total
         spot = {"portfolioMarginEnabled": True,
@@ -355,7 +355,7 @@ class Hip3NetWorthTests(unittest.TestCase):
     def test_hip3_trader_unified_via_hold_margin(self):
         # live shape (HIP-3 trader): no spotHold; hold ≈ perp margin reserved from
         # spot; oracle allTime == spot + staked (perp not additive)
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "276477", "totalMarginUsed": "400000"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "603330", "hold": "421308"}]}
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW,
@@ -367,7 +367,7 @@ class Hip3NetWorthTests(unittest.TestCase):
     def test_flat_unified_account_hold_equals_perp_equity(self):
         # live shape (0xfe35…): no open positions (margin used 0) but hold == perp
         # accountValue; oracle allTime == spot USDC total (46,392)
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "34618.945332", "totalMarginUsed": "0.0"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "46392.2910905", "hold": "34618.945332"}]}
         a = analytics.compute_analytics([], [], chs, spot, 1_700_000_000_000, NOW)
@@ -376,7 +376,7 @@ class Hip3NetWorthTests(unittest.TestCase):
 
     def test_whale_unified_hold_minus_spot_bids_matches_margin(self):
         # live shape (48M whale): hold 4.63M, spot bids lock 0.06M, margin used 4.44M
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "7407327", "totalMarginUsed": "4435961"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "24531182", "hold": "4633671"}]}
         orders = [{"coin": "@292", "side": "B", "sz": "47784.01", "limitPx": "0.0402"}] * 30
@@ -390,7 +390,7 @@ class Hip3NetWorthTests(unittest.TestCase):
     def test_separate_accounts_hold_zero_no_overlap(self):
         # live shape (0x16c9…): perp 257k funded in the perp book, spot USDC 58k with
         # hold 0 -> oracle == perp + spot; nothing overlaps
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "257454", "totalMarginUsed": "48392"}, "assetPositions": []}
         spot = {"balances": [{"coin": "USDC", "token": 0, "total": "58260", "hold": "0"},
                              {"coin": "HYPE", "token": 150, "total": "3710"}]}
@@ -402,7 +402,7 @@ class Hip3NetWorthTests(unittest.TestCase):
 
     def test_no_spot_usdc_row_means_no_overlap(self):
         # live shape (market maker): equity only in the perp book
-        from hl_poc import analytics
+        from blueblocx_hyperliquid import analytics
         chs = {"marginSummary": {"accountValue": "3182671"}, "assetPositions": []}
         a = analytics.compute_analytics([], [], chs, {"balances": []}, 1_700_000_000_000, NOW)
         self.assertEqual(a["perp_spot_overlap_rule"], "none")

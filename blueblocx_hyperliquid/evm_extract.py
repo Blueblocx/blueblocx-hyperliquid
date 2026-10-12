@@ -4,7 +4,7 @@ HyperEVM (chain 999) per-wallet extract -> nessie.hyperevm.* CSVs.
 HyperEVM is a SEPARATE namespace from HyperCore (see README / spec §0). In
 production it should flow through the atlas EVM path (python-ingestion raw_logs
 -> Rust parse-raw) exactly like ethereum/arbitrum; this module is the per-wallet
-POC equivalent so the namespace is populated with rows that obey the same
+Standalone equivalent so the namespace is populated with rows that obey the same
 invariants as HyperCore:
 
   * standard = "ERC20" (gate), symbol/decimals in l1_token_metadata
@@ -15,7 +15,7 @@ Scope: ERC-20 Transfer logs where the wallet is sender or receiver, over the
 last --blocks blocks (public RPC caps eth_getLogs at 50 blocks per call).
 
 Usage:
-    python -m hl_poc.evm_extract --wallet 0xA --blocks 3000
+    python -m blueblocx_hyperliquid.evm_extract --wallet 0xA --blocks 3000
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from . import evm_mapper, evm_tokens
 from .extract import upsert_csv
 from .prices import token_metadata_rows
 
-log = logging.getLogger("hl_poc.evm_extract")
+log = logging.getLogger("blueblocx_hyperliquid.evm_extract")
 
 OUT_ROOT = Path(__file__).resolve().parent.parent / "out"
 

@@ -38,7 +38,7 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                           "after a successful Iceberg lift, drop staged l1/l3 CSV rows older than "
                           "this many days (0 = keep everything). Must stay >= 31 so the 30d "
                           "analytics windows remain complete"),
-    "HL_WALLETS_FILE": ("", False, "default wallet list for hl_poc.daily / preflight"),
+    "HL_WALLETS_FILE": ("", False, "default wallet list for blueblocx_hyperliquid.daily / preflight"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock older than this is treated as abandoned (a lock whose PID is dead is "

@@ -21,7 +21,7 @@
 # Onboard NEW wallets by hand, not through this timer: a wallet with no watermark
 # gets a --days 2 window, and a market-maker-class wallet then needs an S3 backfill
 # that can outlast the 50-minute cap (the run is killed and nothing is saved).
-#   python -m hl_poc.extract --wallet 0x... --days 2 --incremental --iceberg --s3-backfill
+#   python -m blueblocx_hyperliquid.extract --wallet 0x... --days 2 --incremental --iceberg --s3-backfill
 [Unit]
 Description=Run hypercore-daily.service every hour
 

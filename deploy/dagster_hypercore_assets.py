@@ -17,7 +17,7 @@ import sys
 from dagster import AssetExecutionContext, asset  # type: ignore
 
 PY = os.environ.get("HYPERCORE_PYTHON", sys.executable)
-REPO = os.environ.get("HYPERCORE_REPO", "/opt/hyperliquid-poc")
+REPO = os.environ.get("HYPERCORE_REPO", "/opt/blueblocx-hyperliquid")
 WALLETS = os.environ.get("HYPERCORE_WALLETS_FILE", f"{REPO}/wallets.txt")
 
 
@@ -39,8 +39,8 @@ def hypercore_l1_daily(context: AssetExecutionContext) -> None:
     into nessie.hypercore.* (NESSIE_URI from the environment). Preflight first so a
     bad key / unreachable catalog fails before any API weight is spent; the daily
     runner writes _run_summary.json and POSTs HL_ALERT_WEBHOOK_URL on problems."""
-    _run(context, ["hl_poc.preflight", "--iceberg", "--s3", "--wallets-file", WALLETS])
-    _run(context, ["hl_poc.daily", "--wallets-file", WALLETS, "--iceberg", "--s3-backfill"])
+    _run(context, ["blueblocx_hyperliquid.preflight", "--iceberg", "--s3", "--wallets-file", WALLETS])
+    _run(context, ["blueblocx_hyperliquid.daily", "--wallets-file", WALLETS, "--iceberg", "--s3-backfill"])
 
 
 @asset(group_name="hypercore", compute_kind="python", deps=[hypercore_l1_daily])
@@ -48,4 +48,4 @@ def hypercore_l3_prices(context: AssetExecutionContext) -> None:
     """Shared per-token l3_token_price_usd_1m for the held tokens (price_job)."""
     spot = os.environ.get("HYPERCORE_PRICE_SPOT", "HYPE,UBTC,UETH")
     perp = os.environ.get("HYPERCORE_PRICE_PERP", "BTC,ETH,HYPE")
-    _run(context, ["hl_poc.price_job", "--spot", spot, "--perp", perp, "--days", "3"])
+    _run(context, ["blueblocx_hyperliquid.price_job", "--spot", spot, "--perp", perp, "--days", "3"])

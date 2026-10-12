@@ -1,11 +1,11 @@
 """
-POC extractor: pull HyperCore data for one or more wallets via the Info API into
+Extractor: pull HyperCore data for one or more wallets via the Info API into
 CSVs whose columns match the BlueBlocx Iceberg schema (nessie.hypercore.*).
 
 Usage:
-    python -m hl_poc.extract --wallet 0xA --days 7
-    python -m hl_poc.extract --wallet 0xA,0xB --days 7            # multi-wallet
-    python -m hl_poc.extract --wallet 0xA --days 7 --with-prices  # also build L3
+    python -m blueblocx_hyperliquid.extract --wallet 0xA --days 7
+    python -m blueblocx_hyperliquid.extract --wallet 0xA,0xB --days 7            # multi-wallet
+    python -m blueblocx_hyperliquid.extract --wallet 0xA --days 7 --with-prices  # also build L3
 
 Design notes (see docs/HYPERCORE_LEDGER_SPEC.md):
   - The per-wallet path is NETWORK-bound. Independent calls run in a thread pool
@@ -50,7 +50,7 @@ from .info_client import InfoClient
 from .ops import atomic_write_text
 from .spot_meta import SpotMetaResolver, empty as empty_resolver
 
-log = logging.getLogger("hl_poc.extract")
+log = logging.getLogger("blueblocx_hyperliquid.extract")
 
 OUT_ROOT = Path(__file__).resolve().parent.parent / "out"     # repo default; HL_OUT_DIR overrides (config.out_root)
 
@@ -890,7 +890,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 def main() -> None:
     config.load_env()
     config.setup_logging()
-    ap = argparse.ArgumentParser(description="Hyperliquid HyperCore -> CSV POC")
+    ap = argparse.ArgumentParser(description="Hyperliquid HyperCore -> staged CSVs -> Iceberg")
     ap.add_argument("--wallet", required=True, help="one address or comma-separated list")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--with-prices", action="store_true",

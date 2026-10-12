@@ -15,8 +15,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from hl_poc import iceberg_load as il
-from hl_poc import preflight
+from blueblocx_hyperliquid import iceberg_load as il
+from blueblocx_hyperliquid import preflight
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
@@ -190,7 +190,7 @@ class CatalogModeTests(unittest.TestCase):
     def test_sql_mode_lift_writes_data_to_warehouse_dir(self):
         """SQL catalog (SQLite stands in for PostgreSQL) + a file:// warehouse that is NOT
         under HL_OUT_DIR: the data files must land in the warehouse directory."""
-        from hl_poc import schema as S
+        from blueblocx_hyperliquid import schema as S
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             wh = root / "nas" / "warehouse"
@@ -239,7 +239,7 @@ class CommitFanOutTests(unittest.TestCase):
     """Hourly cadence lives or dies by the number of Iceberg commits per lift."""
 
     def _l4x_rows(self, wallets, as_of_date, as_of_ts):
-        from hl_poc import schema as S
+        from blueblocx_hyperliquid import schema as S
         rows = []
         for w in wallets:
             for coin in ("BTC", "ETH"):
@@ -250,7 +250,7 @@ class CommitFanOutTests(unittest.TestCase):
         return rows
 
     def test_replace_scope_is_one_delete_per_day_and_watermarks_two_commits(self):
-        from hl_poc import schema as S
+        from blueblocx_hyperliquid import schema as S
         wallets = [f"0x{i:040x}" for i in range(1, 8)]          # 7 wallets, same day
         day = "2026-10-12"
         with tempfile.TemporaryDirectory() as d:
@@ -318,7 +318,7 @@ class CommitFanOutTests(unittest.TestCase):
 
 class WarehouseMountTests(unittest.TestCase):
     def test_require_warehouse_mount(self):
-        from hl_poc import ops
+        from blueblocx_hyperliquid import ops
         with mock.patch.dict(os.environ, {"HL_WAREHOUSE_MOUNT": "/mnt/blueblocx"}):
             with mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
                 with self.assertRaises(RuntimeError) as cm:
@@ -333,7 +333,7 @@ class WarehouseMountTests(unittest.TestCase):
                 il.require_warehouse_mount(Path("/anything"))                               # unset: no-op
 
     def test_preflight_fails_when_nas_not_mounted(self):
-        from hl_poc import ops
+        from blueblocx_hyperliquid import ops
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
@@ -348,8 +348,8 @@ class WarehouseMountTests(unittest.TestCase):
 
 class MaintenanceTests(unittest.TestCase):
     def test_expire_snapshots_keeps_current(self):
-        from hl_poc import maintenance
-        from hl_poc import schema as S
+        from blueblocx_hyperliquid import maintenance
+        from blueblocx_hyperliquid import schema as S
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             src = root / "staging"

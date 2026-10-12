@@ -3,8 +3,8 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hl-poc"
-version = "0.1.0"
+name = "blueblocx-hyperliquid"
+version = "1.0.0"
 description = "Hyperliquid HyperCore -> BlueBlocx lakehouse pipeline (Info API + S3 node data -> Iceberg)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,8 +18,8 @@ dependencies = [
   "tzdata==2026.5",
 ]
 
-# Run as modules from a checkout (`python -m hl_poc.daily`): the Iceberg loader
+# Run as modules from a checkout (`python -m blueblocx_hyperliquid.daily`): the Iceberg loader
 # reads docs/PROPOSED_SCHEMA.sql relative to the repository (or $HL_DDL_PATH), so
 # an editable install (`pip install -e .`) is the supported packaged form.
 [tool.setuptools]
-packages = ["hl_poc"]
+packages = ["blueblocx_hyperliquid"]

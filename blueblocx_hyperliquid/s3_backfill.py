@@ -26,7 +26,7 @@ Usage (module):
     res = fetch_fills_s3({"0xabc..."}, start_ms, end_ms)
     res.fills["0xabc..."], res.keys_missing, res.keys_failed, res.complete
 CLI (validation / ad-hoc pull):
-    python -m hl_poc.s3_backfill --wallet 0xA,0xB --hours 3
+    python -m blueblocx_hyperliquid.s3_backfill --wallet 0xA,0xB --hours 3
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
-log = logging.getLogger("hl_poc.s3_backfill")
+log = logging.getLogger("blueblocx_hyperliquid.s3_backfill")
 
 BUCKET = "hl-mainnet-node-data"
 PREFIX = "node_fills_by_block/hourly"

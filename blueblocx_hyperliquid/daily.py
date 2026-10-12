@@ -2,7 +2,7 @@
 Scheduled runner: the one command a timer (systemd / cron / dagster) calls, daily
 or hourly.
 
-    python -m hl_poc.daily --wallets-file /etc/hypercore/wallets.txt --iceberg [--s3-backfill]
+    python -m blueblocx_hyperliquid.daily --wallets-file /etc/hypercore/wallets.txt --iceberg [--s3-backfill]
 
 Order of operations:
   1. load .env + logging; install a SIGTERM handler (a systemd timeout must still
@@ -31,7 +31,7 @@ from pathlib import Path
 from . import config, extract, ops
 from . import schema as S
 
-log = logging.getLogger("hl_poc.daily")
+log = logging.getLogger("blueblocx_hyperliquid.daily")
 
 
 class Terminated(Exception):

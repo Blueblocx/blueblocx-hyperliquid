@@ -1,7 +1,7 @@
 """
 Minimal HyperEVM JSON-RPC client (chain id 999).
 
-POC ingestion strategy = PER-WALLET, not whole-chain. atlas production scans
+Ingestion strategy here = PER-WALLET, not whole-chain. atlas production scans
 every block into raw_logs; here we only need one wallet's portfolio, so we filter
 eth_getLogs by the wallet address in the Transfer topics. This is far cheaper
 (no 40M-block scan) and matches the "dump this wallet" use case.

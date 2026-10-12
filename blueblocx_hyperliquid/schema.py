@@ -33,7 +33,7 @@ import xxhash
 # L4 balance/FIFO/networth layer runs unchanged on top.
 NS_HYPERCORE = "hypercore"
 NS_HYPEREVM = "hyperevm"
-# Back-compat alias: earlier POC output landed under out/hyperliquid/. Kept so a
+# Back-compat alias: earlier output landed under out/hyperliquid/. Kept so a
 # consumer of the old path doesn't break; new writes go to NS_HYPERCORE.
 NS_HYPERLIQUID = "hyperliquid"
 

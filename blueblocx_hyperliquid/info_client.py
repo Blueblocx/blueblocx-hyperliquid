@@ -160,7 +160,7 @@ class InfoClient:
                 data = r.json()
                 self._budget.settle(slot, self._weight_of(body, data))
                 return data
-            except Exception as e:  # noqa: BLE001 — POC: retry everything transient
+            except Exception as e:  # noqa: BLE001 — retry everything transient
                 last_err = e
                 if attempt == _MAX_RETRIES:
                     break

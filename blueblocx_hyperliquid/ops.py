@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import __version__, config
 
-log = logging.getLogger("hl_poc.ops")
+log = logging.getLogger("blueblocx_hyperliquid.ops")
 
 SUMMARY_FILE = "_run_summary.json"      # latest run, full detail
 HISTORY_FILE = "_run_history.jsonl"     # one compact line per run, append-only

@@ -2,7 +2,7 @@
 Table maintenance for the lake this pipeline writes (run nightly, under the same
 lock as the scheduled run):
 
-    python -m hl_poc.maintenance --expire-days 7 [--namespace hypercore]
+    python -m blueblocx_hyperliquid.maintenance --expire-days 7 [--namespace hypercore]
 
 What it does per table (the 7 hypercore tables + control.table_watermarks):
   * expire_snapshots older than --expire-days: pyiceberg 0.12 removes the
@@ -29,7 +29,7 @@ from pathlib import Path
 from . import config, ops
 from . import schema as S
 
-log = logging.getLogger("hl_poc.maintenance")
+log = logging.getLogger("blueblocx_hyperliquid.maintenance")
 
 
 def expire_snapshots(table, older_than: dt.datetime) -> dict:
