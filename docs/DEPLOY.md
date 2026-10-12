@@ -53,19 +53,55 @@ one light wallet per 30–60 s; a 100-wallet list finishes in ~1 h.
 
 ## 2. Install
 
+Three identities, two checkouts:
+
+| who / what | role |
+|---|---|
+| `hypercore` (system user, no shell, no keys) | runs the timers; may only **read** the code and **write** `/var/lib/hypercore` and the NAS warehouse |
+| your login user (`hatsadin`) | owns the git key and both checkouts; Claude Code works as this user |
+| `/opt/blueblocx-hyperliquid` | **production checkout**: moved only with `git pull --ff-only` to a tag; never edited in place — the hourly timer would run half-edited code |
+| `~/blueblocx-hyperliquid` | **working copy**: where code is edited, tested, committed and pushed (its own `.venv`) |
+
+Git access for push *and* pull from the server: a **per-repo deploy key with
+write access** held by your login user (GitHub → repo → Settings → Deploy keys →
+Add → tick "Allow write access"), bound to a host alias because a deploy key is
+valid for exactly one repo. Alternative with no long-lived key on the box: SSH
+agent forwarding from your laptop (`ssh -A`), which only works while you are
+connected.
+
 ```bash
+# as hatsadin
+ssh-keygen -t ed25519 -N "" -C "hatsadin@server4090-2 blueblocx-hyperliquid" -f ~/.ssh/blueblocx_hyperliquid
+cat >> ~/.ssh/config <<'EOF'
+Host github-blueblocx-hyperliquid
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/blueblocx_hyperliquid
+  IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config ~/.ssh/blueblocx_hyperliquid
+cat ~/.ssh/blueblocx_hyperliquid.pub        # -> GitHub deploy key, write access ON
+git config --global user.name "Leo Hatsadin" && git config --global user.email "<your github email>"
+
+# service user + production checkout (owner = you, group-readable by the service)
 sudo useradd --system --create-home --home-dir /var/lib/hypercore --shell /usr/sbin/nologin hypercore
-sudo git clone <your-remote> /opt/blueblocx-hyperliquid
-sudo chown -R hypercore:hypercore /opt/blueblocx-hyperliquid
-sudo -u hypercore bash -c '
-  cd /opt/blueblocx-hyperliquid &&
-  python3 -m venv .venv &&
-  .venv/bin/pip install -r requirements.txt -c constraints.txt &&
-  .venv/bin/python -m unittest discover -s tests -t .'
+sudo usermod -aG hypercore hatsadin
+sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
+git clone --branch v1.0.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
+.venv/bin/python -m unittest discover -s tests -t .
+chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
+
+# working copy for development (Claude Code lives here, never in /opt)
+git clone git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git ~/blueblocx-hyperliquid
+cd ~/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 ```
 
 `constraints.txt` pins the full transitive closure the pipeline was validated
-with; `requirements.txt` alone would float the indirect packages.
+with; `requirements.txt` alone would float the indirect packages. Point the
+working copy at a scratch state dir (`HL_OUT_DIR=~/hc-dev`, local SQLite
+catalog) so development runs never touch `/var/lib/hypercore` or the production
+catalog.
 
 ## 3. Configure
 
@@ -352,19 +388,34 @@ stable for a few weeks on your wallet set.
 Logs go to stderr (journald under systemd); `HL_LOG_JSON=1` for one JSON object
 per line.
 
-## 8. Upgrade
+## 8. Upgrade (release flow when code is written on the server)
+
+Develop and verify in the working copy, release with a tag, then move the
+production checkout to that tag between timer ticks:
 
 ```bash
-cd /opt/blueblocx-hyperliquid && sudo -u hypercore git pull --ff-only
-sudo -u hypercore .venv/bin/pip install -r requirements.txt -c constraints.txt
-sudo -u hypercore .venv/bin/python -m unittest discover -s tests -t .
-sudo -u hypercore HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg --s3
-sudo systemctl start hypercore-daily.service && journalctl -u hypercore-daily -n 50
+# 1) in the working copy (as hatsadin): edit, test, commit, push, tag
+cd ~/blueblocx-hyperliquid
+.venv/bin/python -m unittest discover -s tests -t . && .venv/bin/python -m blueblocx_hyperliquid.preflight --offline
+git add -A && git commit -m "..." && git push
+git tag -a v1.0.1 -m "..." && git push --tags            # CI runs on GitHub (tests + image)
+
+# 2) move production to the tag while no run is active
+sudo systemctl stop hypercore-hourly.timer hypercore-daily.timer 2>/dev/null
+while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done
+cd /opt/blueblocx-hyperliquid && git fetch --tags && git checkout --detach v1.0.1
+.venv/bin/pip install -r requirements.txt -c constraints.txt
+.venv/bin/python -m unittest discover -s tests -t .
+HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg
+sudo systemctl start hypercore-daily.service && journalctl -u hypercore-daily -n 50   # one real run
+sudo systemctl start hypercore-hourly.timer
 ```
 
-Rollback is `git checkout <previous tag>` + the same pip/preflight steps. State
-files (`_watermarks.json`, staged CSVs) are forward- and backward-compatible
-across versions of this repo so far; a release note will say if that changes.
+Rollback is `git checkout --detach <previous tag>` + the same pip/preflight
+steps. State files (`_watermarks.json`, `_lift_state.json`, staged CSVs) are
+forward- and backward-compatible across versions of this repo so far; a release
+note will say if that changes. Never run `git pull` or an editor inside `/opt`:
+the hourly timer executes whatever is on disk at minute 10.
 
 ## 9. Backup / recovery
 
