@@ -1,0 +1,35 @@
+# /etc/systemd/system/hypercore-web.service
+#
+# The web monitor: one read-only page (http://<host>:8787/) answering "running, stuck,
+# or was the last run fine?", plus /api/status, /api/summary, /api/progress,
+# /api/history and /healthz. Standard library only, ~30 MB, no authentication: keep
+# the port on the LAN / VPN (HL_WEB_BIND and HL_WEB_PORT in the env file).
+#
+#   sudo cp deploy/hypercore-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hypercore-web.service
+#   (after an upgrade: sudo systemctl restart hypercore-web.service)
+[Unit]
+Description=HyperCore web monitor (read-only status page)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hypercore
+Group=hypercore
+WorkingDirectory=/opt/blueblocx-hyperliquid
+EnvironmentFile=/etc/hypercore/hypercore.env
+Environment=HL_ENV_FILE=/etc/hypercore/hypercore.env
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.web
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+Nice=10
+# read-only: it only reads the state dir and asks systemd for unit states
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

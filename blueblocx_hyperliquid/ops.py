@@ -1,7 +1,7 @@
 """
 Operational plumbing around the scheduled run: atomic state writes, a
-single-flight lock, the run summary (hard problems vs warnings) and the alert
-webhook. No business logic lives here — daily.py wraps extract.run with these.
+single-flight lock, the run summary (hard problems vs warnings) and the live
+progress file. No business logic lives here — daily.py wraps extract.run with these.
 """
 from __future__ import annotations
 
@@ -206,7 +206,7 @@ class RunLock:
 
 # --- run summary --------------------------------------------------------------------
 
-# HARD problems fail the run (exit 1 + alert):
+# HARD problems fail the run (exit 1; shown by the monitor):
 #   natural_key        chain-wide (tx_hash, event_index, direction) collision — nothing written
 #   skipped / missing  a wallet's core pulls failed, or it never produced a result
 #   fidelity           mapped rows != raw API input (dropped / duplicated / sign-flipped rows)
@@ -219,7 +219,7 @@ class RunLock:
 #   tracked_unavailable  the leaderboard tracked set could not be refreshed and no cache
 #                      was fresh enough: the run covered the pins only (added by daily.py)
 #   error              the run raised
-# WARNINGS are reported and alerted with the summary but do not fail the run:
+# WARNINGS are reported in the summary but do not fail the run:
 #   pnl_oracle         HL perpDay.pnlHistory Δ24h != realized + Δunrealized (still being
 #                      calibrated on live data; promote to hard once it is stable)
 #   unmapped_ledger_types   a ledger delta.type the mapper does not know (rows skipped)
@@ -402,100 +402,3 @@ class Progress:
 
 def read_progress(ns_dir: Path) -> dict | None:
     return read_json(Path(ns_dir) / PROGRESS_FILE)
-
-
-# --- heartbeat (dead man's switch) ------------------------------------------------------
-
-def heartbeat(url: str | None, ok: bool, timeout: float = 10.0, get=None) -> bool:
-    """Ping a healthchecks.io-style URL after a run: the URL itself on a clean run,
-    URL/fail otherwise. The monitor alerts when no ping arrives within its period,
-    which covers the cases no in-process alert can: timer disabled, preflight FAIL,
-    host down. Never raises."""
-    if not url:
-        return False
-    target = url if ok else url.rstrip("/") + "/fail"
-    try:
-        if get is None:
-            import requests
-            get = requests.get
-        resp = get(target, timeout=timeout)
-        good = 200 <= int(getattr(resp, "status_code", 0)) < 300
-        if not good:
-            log.warning("heartbeat returned HTTP %s", getattr(resp, "status_code", "?"))
-        return good
-    except Exception as e:  # noqa: BLE001
-        log.warning("heartbeat failed: %s", type(e).__name__)
-        return False
-
-
-# --- alerting ------------------------------------------------------------------------
-
-def should_alert(summary: dict, previous: dict | None, repeat_hours: float | None = None,
-                 now: dt.datetime | None = None) -> bool:
-    """Alert on a problem run, but not 24 times a day for the SAME problem: repeat
-    only when the problem set changed or the last alert for it is older than
-    HL_ALERT_REPEAT_HOURS. A clean run alerts only with HL_ALERT_ON_SUCCESS=1."""
-    if summary.get("ok"):
-        return config.env_bool("HL_ALERT_ON_SUCCESS")
-    hours = float(config.env("HL_ALERT_REPEAT_HOURS")) if repeat_hours is None else repeat_hours
-    if not previous or previous.get("ok") or not previous.get("alert_sent"):
-        return True
-    if sorted(previous.get("problems") or []) != sorted(summary.get("problems") or []):
-        return True
-    last = previous.get("alert_sent_at") or previous.get("finished_at")
-    try:
-        last_dt = dt.datetime.fromisoformat(last)
-    except (TypeError, ValueError):
-        return True
-    now = now or utcnow()
-    return (now - last_dt).total_seconds() >= hours * 3600.0
-
-
-def format_alert_text(summary: dict) -> str:
-    state = "OK" if summary.get("ok") else "PROBLEMS"
-    lines = [f"[hypercore daily] {state} — {summary.get('wallets_ok', 0)}/{summary.get('wallets_total', 0)} "
-             f"wallets clean in {summary.get('duration_s', 0)}s on {summary.get('host', '?')} "
-             f"(run {summary.get('run_at', '?')})"]
-    probs = summary.get("problems") or []
-    warns = summary.get("warnings") or []
-    if probs:
-        lines.append("problems: " + ", ".join(probs[:20]) + (f" … +{len(probs) - 20}" if len(probs) > 20 else ""))
-    if warns:
-        lines.append("warnings: " + ", ".join(warns[:20]) + (f" … +{len(warns) - 20}" if len(warns) > 20 else ""))
-    return "\n".join(lines)
-
-
-def post_text(text: str, url: str | None = None, extra: dict | None = None, timeout: float = 10.0,
-              post=None) -> bool:
-    """POST a message to a Slack/Discord-style incoming webhook (HL_ALERT_WEBHOOK_URL by
-    default). Returns True when the hook accepted it. Never logs the URL (a secret),
-    never raises."""
-    url = url or config.env("HL_ALERT_WEBHOOK_URL")
-    if not url:
-        return False
-    payload = {
-        "text": text,                 # Slack
-        "content": text[:1900],       # Discord (2000-char cap)
-    }
-    payload.update(extra or {})
-    try:
-        if post is None:
-            import requests
-            post = requests.post
-        resp = post(url, json=payload, timeout=timeout)
-        ok = 200 <= int(getattr(resp, "status_code", 0)) < 300
-        if not ok:
-            log.warning("alert webhook returned HTTP %s", getattr(resp, "status_code", "?"))
-        return ok
-    except Exception as e:  # noqa: BLE001 — an alert failure must not fail the run
-        log.warning("alert webhook failed: %s", type(e).__name__)
-        return False
-
-
-def send_alert(summary: dict, url: str | None = None, timeout: float = 10.0, post=None) -> bool:
-    """POST the run summary to the webhook (see post_text)."""
-    return post_text(format_alert_text(summary), url=url, timeout=timeout, post=post, extra={
-        "hypercore": {"ok": summary.get("ok"), "run_at": summary.get("run_at"),
-                      "problems": (summary.get("problems") or [])[:50],
-                      "warnings": (summary.get("warnings") or [])[:50]},
-    })

@@ -475,7 +475,7 @@ class DailyWithTrackedSourceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, environ, clear=False), \
                 mock.patch.object(daily.extract, "run", side_effect=fake_run), \
                 mock.patch.object(daily.tracked, "refresh_tracked", return_value=(sets, dict(meta))) as refresh:
-            code = daily.main(["--wallets-file", str(wf), "--out", str(out), "--no-alert", *extra])
+            code = daily.main(["--wallets-file", str(wf), "--out", str(out), *extra])
         summary_path = out / "hypercore" / ops.SUMMARY_FILE
         summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else None
         return code, summary, captured, out, refresh
@@ -562,7 +562,7 @@ class DailyWithTrackedSourceTests(unittest.TestCase):
 
     def test_unknown_source_is_a_config_error(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HL_TRACKED_SOURCE": "csv"}):
-            self.assertEqual(daily.main(["--wallets-file", str(Path(d) / "w.txt"), "--out", d, "--no-alert"]), 2)
+            self.assertEqual(daily.main(["--wallets-file", str(Path(d) / "w.txt"), "--out", d]), 2)
 
 
 class PreflightTrackedTests(unittest.TestCase):

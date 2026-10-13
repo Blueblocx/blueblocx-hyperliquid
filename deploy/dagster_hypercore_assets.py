@@ -38,7 +38,7 @@ def hypercore_l1_daily(context: AssetExecutionContext) -> None:
     list — incremental, HIP-3 aware, S3 backfill for 10k-capped wallets, lifted
     into nessie.hypercore.* (NESSIE_URI from the environment). Preflight first so a
     bad key / unreachable catalog fails before any API weight is spent; the daily
-    runner writes _run_summary.json and POSTs HL_ALERT_WEBHOOK_URL on problems."""
+    runner writes _run_summary.json (exit 1 on problems)."""
     _run(context, ["blueblocx_hyperliquid.preflight", "--iceberg", "--s3", "--wallets-file", WALLETS])
     _run(context, ["blueblocx_hyperliquid.daily", "--wallets-file", WALLETS, "--iceberg", "--s3-backfill"])
 

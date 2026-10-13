@@ -249,7 +249,7 @@ def _gather(tasks: dict, max_workers: int) -> dict:
     `with ThreadPoolExecutor` would call shutdown(wait=True) and block until every
     queued call had finished - past systemd's stop timeout on a slow API, which
     would SIGKILL the runner before it writes its summary. The interpreter joins
-    the leftover workers at exit, after the summary, lock release and heartbeat."""
+    the leftover workers at exit, after the summary and the lock release."""
     pool = ThreadPoolExecutor(max_workers=max_workers)
     try:
         futs = {k: pool.submit(fn) for k, fn in tasks.items()}

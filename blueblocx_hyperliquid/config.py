@@ -69,21 +69,15 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock older than this is treated as abandoned (a lock whose PID is dead is "
                             "discarded immediately on Linux regardless of age)"),
-    "HL_ALERT_WEBHOOK_URL": ("", True,
-                             "Slack/Discord-style incoming webhook; POSTed when a run has problems"),
-    "HL_ALERT_ON_SUCCESS": ("0", False, "1 = also POST a summary when the run is clean"),
-    "HL_ALERT_REPEAT_HOURS": ("6", False,
-                              "re-send the webhook for an UNCHANGED problem set only this often (hourly runs "
-                              "would otherwise post 24 times a day)"),
-    "HL_HEARTBEAT_URL": ("", True,
-                         "healthchecks.io-style ping URL: GET after every run (URL/fail when the run had "
-                         "problems). The monitor alerts when no ping arrives in its period, which covers "
-                         "what no in-process alert can: timer disabled, preflight FAIL, host down"),
+    "HL_WEB_BIND": ("0.0.0.0", False,
+                    "address the web monitor (blueblocx_hyperliquid.web, hypercore-web.service) listens on; "
+                    "it has no authentication - a LAN/VPN address or a firewalled port"),
+    "HL_WEB_PORT": ("8787", False, "port of the web monitor"),
     "HL_STUCK_MINUTES": ("15", False,
                          "`status` reports a running run as STUCK when _run_progress.json has not been "
-                         "updated for this long. The clock also spans one first-time full-ledger lookup "
-                         "(~9 min measured on an old whale), one S3 hour file (~90 s) and the lift, so 10 "
-                         "is the floor, not a value to lower"),
+                         "updated for this long (web monitor too). The clock also spans one first-time "
+                         "full-ledger lookup (~9 min measured on an old whale), one S3 hour file (~90 s) and "
+                         "the lift, so 10 is the floor, not a value to lower"),
     "HL_STATUS_MAX_AGE_HOURS": ("", False,
                                 "`status` reports the last run as STALE after this many hours. Empty = 2 with "
                                 "the hourly timer, 26 when only hypercore-daily.timer is active; set it for a "

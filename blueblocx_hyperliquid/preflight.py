@@ -231,7 +231,7 @@ def check_tracked(*, offline: bool, out_dir: Path, get=None) -> Check:
     Only misconfiguration FAILS. An unreachable or odd-looking stats host is a WARN:
     this check runs as ExecStartPre, and the runner itself degrades (cached set within
     HL_TRACKED_MAX_AGE_HOURS -> tracked_stale; else pins only + tracked_unavailable,
-    exit 1 + webhook) - a FAIL here would block exactly that path."""
+    exit 1) - a FAIL here would block exactly that path."""
     src = config.env("HL_TRACKED_SOURCE").strip().lower()
     if not src:
         return _skip("tracked", "HL_TRACKED_SOURCE unset: the wallets file is the whole list")

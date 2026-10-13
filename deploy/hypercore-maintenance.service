@@ -1,8 +1,8 @@
 # /etc/systemd/system/hypercore-maintenance.service
 # Nightly: expire Iceberg snapshots older than 7 days on the pipeline's tables and
 # make sure the metadata-retention properties are set. Shares the run lock with the
-# scheduled extract and is skipped by a running lift (exit 3 = SuccessExitStatus, so
-# no OnFailure alert); genuine expire/property errors exit 1 and do alert.
+# scheduled extract and is skipped by a running lift (exit 3 = SuccessExitStatus, not
+# a failure); genuine expire/property errors exit 1 and show as a failed unit.
 [Unit]
 Description=HyperCore lake maintenance (expire snapshots)
 After=network-online.target
@@ -10,7 +10,6 @@ RequiresMountsFor=/mnt/blueblocx
 # a boot catch-up (both Persistent= timers fire together) or a hand start must not
 # collide with the data run on the lock: order after hypercore-daily.service
 After=hypercore-daily.service
-OnFailure=hypercore-failure@%n.service
 
 [Service]
 Type=oneshot

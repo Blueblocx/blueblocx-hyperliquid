@@ -19,16 +19,15 @@ Order of operations:
      with HL_RUN_SOFT_DEADLINE_MIN the tail of the list is deferred to the next run
      instead of the service timeout killing everything
   4. build the run summary (hard problems vs warnings - see ops.build_summary),
-     POST the alert webhook (deduplicated: an unchanged problem set repeats only
-     every HL_ALERT_REPEAT_HOURS), write _run_summary.json, append _run_history.jsonl,
-     ping HL_HEARTBEAT_URL (or its /fail variant)
-  Throughout, _run_progress.json records the phase and the wallet being pulled;
-  `python -m blueblocx_hyperliquid.status` reads it to answer "running, stuck, or fine?".
+     write _run_summary.json, append _run_history.jsonl
+  Throughout, _run_progress.json records the phase and the wallet being pulled; the
+  web monitor (blueblocx_hyperliquid.web) and `python -m blueblocx_hyperliquid.status`
+  read it to answer "running, stuck, or fine?".
 
 Exit codes: 0 clean · 1 problems or error (details in _run_summary.json; includes a
 tracked set that could not be refreshed) · 2 bad configuration (wallet list
 missing/empty with no tracked source, unknown HL_TRACKED_SOURCE) · 3 another run
-holds the lock (also summarised and alerted, so a stuck lock is never silent).
+holds the lock (also summarised, so a stuck lock is never silent).
 The dagster asset template in deploy/dagster_hypercore_assets.py wraps this.
 """
 from __future__ import annotations
@@ -65,17 +64,6 @@ def read_wallets(path: Path) -> list[str]:
     return out
 
 
-def _read_previous_summary(ns_dir: Path) -> dict | None:
-    p = ns_dir / ops.SUMMARY_FILE
-    if not p.exists():
-        return None
-    try:
-        import json
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def main(argv=None) -> int:
     config.load_env()
     config.setup_logging()
@@ -92,7 +80,6 @@ def main(argv=None) -> int:
     ap.add_argument("--deadline-min", type=float, default=config.env_float("HL_RUN_SOFT_DEADLINE_MIN"),
                     help="start no new wallet after this many minutes; the rest are deferred to the next run (0 = off)")
     ap.add_argument("--out", default=str(config.out_root()))
-    ap.add_argument("--no-alert", action="store_true", help="never POST the webhook")
     args = ap.parse_args(argv)
 
     source = config.env("HL_TRACKED_SOURCE").strip().lower()
@@ -158,7 +145,7 @@ def main(argv=None) -> int:
     except Terminated as e:
         log.error("run terminated (%s) - lock released, nothing advanced", e)
         error = f"Terminated: {e}"
-    except Exception as e:  # noqa: BLE001 — summarise and alert; never die silently
+    except Exception as e:  # noqa: BLE001 — summarise; never die silently
         log.exception("run failed")
         error = f"{type(e).__name__}: {str(e)[:300]}"
 
@@ -174,21 +161,9 @@ def main(argv=None) -> int:
             summary["ok"] = False
     if lock_held:
         summary["lock_held"] = True
-    previous = _read_previous_summary(ns_dir)
-    if not args.no_alert and ops.should_alert(summary, previous):
-        summary["alert_sent"] = ops.send_alert(summary)
-        summary["alert_sent_at"] = ops.utcnow().isoformat()
-    elif previous and not summary["ok"] and previous.get("alert_sent"):
-        # carry the last alert time forward so the dedupe window keeps counting
-        summary["alert_sent"] = False
-        summary["alert_sent_at"] = previous.get("alert_sent_at")
-        summary["alert_suppressed"] = True
     path = ops.write_summary(ns_dir, summary)
     if progress is not None:
         progress.finish(ok=summary["ok"], problems=len(summary["problems"]), error=error)
-    hb_url = config.env("HL_HEARTBEAT_URL")
-    if hb_url:
-        log.info("heartbeat %s: %s", "ok" if summary["ok"] else "fail", ops.heartbeat(hb_url, summary["ok"]))
     log.info("run done: ok=%s wallets ok=%d/%d deferred=%d problems=%s warnings=%d summary=%s",
              summary["ok"], summary["wallets_ok"], summary["wallets_total"], summary["wallets_deferred"],
              summary["problems"], len(summary["warnings"]), path)

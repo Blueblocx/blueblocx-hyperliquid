@@ -19,14 +19,15 @@
 #      /etc/hypercore/wallets.txt placeholder for the pins
 #   7. NAS warehouse directory, written as the service user (catches uid squash)
 #   8. systemd units: service + hourly timer + nightly maintenance, with a drop-in
-#      that removes the S3 flags (no AWS key in this layout) and caps a run at 50 min
+#      that removes the S3 flags (no AWS key in this layout) and caps a run at 50 min;
+#      the web monitor (hypercore-web.service, port 8787) is enabled and started
 #   9. preflight as the service user
 # It does NOT start the timers or run the pipeline (next steps are printed at the end).
 # Overrides: export RELEASE_TAG / GIT_ALIAS / NAS_MOUNT / WEIGHT_BUDGET before running.
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.2.1}"
+RELEASE_TAG="${RELEASE_TAG:-v1.3.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -160,12 +161,9 @@ HL_RUN_SOFT_DEADLINE_MIN=35
 HL_LOG_LEVEL=INFO
 HL_LOG_JSON=1
 HL_LOCK_STALE_HOURS=2
-HL_ALERT_WEBHOOK_URL=
-HL_ALERT_ON_SUCCESS=0
-HL_ALERT_REPEAT_HOURS=6
-# dead man's switch: healthchecks.io ping URL, GET after every run (URL/fail on problems);
-# it alerts when no ping arrives in its period - timer disabled, preflight failing, host down
-HL_HEARTBEAT_URL=
+# web monitor (hypercore-web.service): http://<this host>:8787/ - no authentication, LAN only
+HL_WEB_BIND=0.0.0.0
+HL_WEB_PORT=8787
 
 # Iceberg: pyiceberg SQL catalog in PostgreSQL, data as plain files on the NAS
 HL_CATALOG_URI=postgresql+psycopg2://${PG_ROLE}:${PG_PASS}@localhost:5432/${PG_DB}
@@ -195,7 +193,14 @@ ensure_env HL_TRACKED_SOURCE leaderboard "v1.1: automatic wallet list (top whale
 ensure_env HL_WHALE_TOP_N 100 "v1.1: tracked whales, top N by account value"
 ensure_env HL_SMART_TOP_N 50 "v1.1: tracked smart money, top N by 30d pnl"
 ensure_env HL_RUN_SOFT_DEADLINE_MIN 35 "v1.1: hourly cadence - start no new wallet after 35 min (service timeout 50), defer the rest"
-ensure_env HL_HEARTBEAT_URL "" "v1.2: healthchecks.io ping URL (dead man's switch: alerts when a run did not happen) - empty = off"
+ensure_env HL_WEB_BIND 0.0.0.0 "v1.3: web monitor address (no authentication: LAN/VPN only)"
+ensure_env HL_WEB_PORT 8787 "v1.3: web monitor port"
+# keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
+# does not warn about variables nothing reads
+if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then
+  sudo sed -i -E '/^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=/d' "$ENV_FILE"
+  echo "removed the HL_ALERT_* / HL_HEARTBEAT_URL keys (alerts were removed in v1.3)"
+fi
 if ! sudo test -f "$WALLETS_FILE"; then
   sudo install -m 640 -o "$ME" -g "$SERVICE_USER" /dev/null "$WALLETS_FILE"
   sudo tee "$WALLETS_FILE" >/dev/null <<'EOF'
@@ -221,11 +226,13 @@ fi
 
 # ----------------------------------------------------------------------------- 8. systemd
 say "systemd units"
-for unit in hypercore-daily.service hypercore-hourly.timer hypercore-maintenance.service hypercore-maintenance.timer hypercore-failure@.service; do
+for unit in hypercore-daily.service hypercore-hourly.timer hypercore-maintenance.service hypercore-maintenance.timer hypercore-web.service; do
   # the shipped units hard-code /mnt/blueblocx (RequiresMountsFor, ReadWritePaths): follow $NAS_MOUNT
   sed "s#/mnt/blueblocx#${NAS_MOUNT}#g" "$PROD_DIR/deploy/$unit" | sudo tee "/etc/systemd/system/$unit" >/dev/null
   sudo chmod 644 "/etc/systemd/system/$unit"
 done
+# removed in v1.3 (the OnFailure notifier): make sure no stale copy is left behind
+sudo rm -f /etc/systemd/system/hypercore-failure@.service
 # `hypercore-status` for everyone in the hypercore group: running / stuck / last verdict
 sudo install -m 0755 "$PROD_DIR/deploy/hypercore-status" /usr/local/bin/hypercore-status
 sudo mkdir -p /etc/systemd/system/hypercore-daily.service.d
@@ -241,6 +248,9 @@ ExecStart=${PROD_DIR}/.venv/bin/python -m blueblocx_hyperliquid.daily --wallets-
 TimeoutStartSec=50min
 EOF
 sudo systemctl daemon-reload
+# the web monitor is read-only and safe to (re)start now; a restart picks up the new code
+sudo systemctl enable --now hypercore-web.service >/dev/null
+sudo systemctl restart hypercore-web.service
 
 # ----------------------------------------------------------------------------- 9. preflight
 say "preflight (as ${SERVICE_USER})"
@@ -257,19 +267,19 @@ TRACKED_SRC="$(env_val HL_TRACKED_SOURCE)"
 WHALE_N="$(env_val HL_WHALE_TOP_N)"
 SMART_N="$(env_val HL_SMART_TOP_N)"
 STUCK_MIN="$(env_val HL_STUCK_MINUTES)"
+WEB_PORT="$(env_val HL_WEB_PORT)"
+HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 say "done: ${PROD_DIR} @ $(git -C "$PROD_DIR" describe --tags --always). next steps"
 cat <<EOF
 Wallet list (HL_TRACKED_SOURCE=${TRACKED_SRC:-unset}): top ${WHALE_N:-?} whales + up to ${SMART_N:-?} smart-money
 wallets from the Hyperliquid leaderboard (same rule as the live platform-backend), refreshed every run.
+Web monitor:               http://${HOST_IP:-<this-host>}:${WEB_PORT:-8787}/    (running / stuck / last run; LAN only, no login)
 1. Optional pins:          nano ${WALLETS_FILE}        (customer / watchlist wallets, one 0x... per line)
-2. Alerts (recommended):   sudoedit ${ENV_FILE}
-                             HL_ALERT_WEBHOOK_URL=<Discord/Slack incoming webhook>   problems + unit failures
-                             HL_HEARTBEAT_URL=<healthchecks.io ping URL>             "nothing ran" (period 1 h, grace 1 h)
-3. First run by hand:      sudo systemctl start --no-block hypercore-daily.service
-   watch it:               hypercore-status            (phase, wallet i/N, STUCK after ${STUCK_MIN:-15} quiet minutes)
+2. First run by hand:      sudo systemctl start --no-block hypercore-daily.service
+   watch it:               the web monitor, or hypercore-status   (STUCK after ${STUCK_MIN:-15} quiet minutes)
    then:                   sudo jq '{ok,wallets_ok,wallets_deferred,tracked,problems,warnings}' ${STATE_DIR}/hypercore/_run_summary.json
-4. Enable the schedule:    sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
-5. Any time:               hypercore-status            (exit 0 = healthy; add --json for scripts)
+3. Enable the schedule:    sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
+4. Any time:               the web monitor, or hypercore-status (exit 0 = healthy; --json for scripts)
 Note: your group membership (${SERVICE_USER}) applies after you log in again (hypercore-status needs it).
 EOF

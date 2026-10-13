@@ -95,7 +95,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.2.1 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.3.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -145,7 +145,7 @@ Every variable is documented in `blueblocx_hyperliquid/config.py` (`ENV_VARS`); 
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | the new scoped key from §0 |
 | `HL_CATALOG_URI` + `WAREHOUSE` | **standalone host**: PostgreSQL catalog URL + `file:///mnt/<nas>/hypercore/warehouse` (see "Standalone host" below). No Nessie, no object store |
 | `NESSIE_URI`, `NESSIE_BRANCH`, `WAREHOUSE`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | **shared atlas lake** instead: the same values the atlas Rust services use (`services/rust/*/.env.example`). With neither set the pipeline falls back to a local SQLite catalog under `HL_OUT_DIR/iceberg` that is for dry runs only |
-| `HL_ALERT_WEBHOOK_URL` | a Slack or Discord incoming webhook. Problems are POSTed after every failing run |
+| `HL_WEB_BIND` / `HL_WEB_PORT` | where the web monitor listens (`0.0.0.0` / `8787`). No authentication: keep it on the LAN or a VPN |
 | `HL_LOG_JSON` | `1` when journald/a log shipper collects stderr |
 
 The `.env` loader never overrides variables already in the process environment,
@@ -334,10 +334,7 @@ Rules for hourly operation:
 - A killed or OOM-killed run can no longer block the next tick: the lock
   records the PID and is discarded when that process is gone (`HL_LOCK_STALE_HOURS=2`
   is the age fallback), SIGTERM from the timeout unwinds cleanly, and a lock
-  that is genuinely held is itself summarised and alerted (exit 3).
-- Alerts are deduplicated: an unchanged problem set re-posts only every
-  `HL_ALERT_REPEAT_HOURS` (default 6), so a persistent oracle mismatch is not
-  24 webhooks a day.
+  that is genuinely held is itself summarised (exit 3).
 - `l4x_perp_position_snapshot` keeps the **last snapshot per UTC day** per
   wallet (its key is `as_of_date`); hourly runs replace the day's rows, so the
   lake holds no intra-day position history, and the PnL oracle (needs a 20–28 h
@@ -392,8 +389,8 @@ python-ingestion's exact schema, so the atlas watermark readers see them.
 **Standalone host (hourly)** — `deploy/bootstrap.sh` has already installed
 `hypercore-daily.service` with a drop-in (no S3 flags, 50-minute cap),
 `hypercore-hourly.timer`, `hypercore-maintenance.timer` (00:05 UTC, before the
-00:10 tick), the `hypercore-failure@.service` notifier template and
-`/usr/local/bin/hypercore-status`; after the first run by hand (§5) enable the timers:
+00:10 tick), the web monitor `hypercore-web.service` (already running on port 8787)
+and `/usr/local/bin/hypercore-status`; after the first run by hand (§5) enable the timers:
 
 ```bash
 sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
@@ -404,10 +401,10 @@ systemctl list-timers 'hypercore-*'
 then the daily run; timers never overlap a running service:
 
 ```bash
-sudo cp deploy/hypercore-daily.service deploy/hypercore-daily.timer deploy/hypercore-failure@.service /etc/systemd/system/
-sudo install -m 0755 deploy/hypercore-status /usr/local/bin/   # OnFailure= needs the failure@ template; §7's status command
+sudo cp deploy/hypercore-daily.service deploy/hypercore-daily.timer deploy/hypercore-web.service /etc/systemd/system/
+sudo install -m 0755 deploy/hypercore-status /usr/local/bin/   # §7's status command
 sudo systemctl daemon-reload
-sudo systemctl enable --now hypercore-daily.timer
+sudo systemctl enable --now hypercore-web.service hypercore-daily.timer
 sudo systemctl start --no-block hypercore-daily.service   # run once now (without --no-block, start waits for the whole run)
 sudo journalctl -u hypercore-daily -f
 ```
@@ -431,16 +428,16 @@ Add the shared L3 price job after the daily run if the product needs
 
 ## 7. Monitor
 
-Four signals and no extra daemon — systemd is the controller, this layer is only
-the eyes (a Dagster UI adds a webserver, a daemon and a database to this host for
-nothing these four do not already answer; the atlas Dagster on olympus can still
-trigger the same command over SSH later, see `deploy/dagster_hypercore_assets.py`):
+systemd is the controller; the monitoring is a read-only view of what the run
+leaves behind — one small stdlib web server, no Dagster daemon/webserver/database
+on this host (the atlas Dagster on olympus can still trigger the same command over
+SSH later, see `deploy/dagster_hypercore_assets.py`). There is no push alerting:
+you look at the page, or point any uptime checker you already have at `/healthz`.
 
 | signal | answers | where |
 |---|---|---|
+| **web monitor** `hypercore-web.service` → `http://<host>:8787/` | the whole picture, refreshed every 30 s: **running?** phase, wallet i/N, progress bar, the wallet in flight, minutes since the last progress — `STUCK?` after `HL_STUCK_MINUTES` quiet minutes while the process is alive, "died without a summary" when the pid is gone; **last run** verdict, problems, warnings; **recent runs** table; **per-wallet** table (problems first); **timers**. `/api/status` (JSON verdict), `/api/summary`, `/api/progress`, `/api/history`, `/healthz` (200 / 503) | `python -m blueblocx_hyperliquid.web`, bound to `HL_WEB_BIND:HL_WEB_PORT`; read-only, no authentication — LAN/VPN only |
 | `hypercore-status` (`python -m blueblocx_hyperliquid.status`, `--json` for scripts) | **running?** phase, wallet i/N, minutes since the last progress — `STUCK?` after `HL_STUCK_MINUTES` (15) quiet minutes while the process is alive (the clock also spans one first-time full-ledger lookup, ~9 min on an old whale); a progress file whose pid is gone = "died without a summary"; **last run** ok? how long ago — `STALE` after 2 h on the hourly timer, 26 h when only `hypercore-daily.timer` is active, or `HL_STATUS_MAX_AGE_HOURS` (set it for cron/Docker schedules); **timers** active? exit 0 healthy / 1 attention | reads `_run_progress.json`, `_run_summary.json`, `_run_history.jsonl` + `systemctl show` |
-| webhook `HL_ALERT_WEBHOOK_URL` | a run finished with problems (deduplicated: an unchanged set repeats every `HL_ALERT_REPEAT_HOURS`); a unit failed before the run could report — preflight FAIL, crash, kill — via `OnFailure=hypercore-failure@%n.service`, which stays quiet when the data run wrote its summary in the last 5 min (never two messages for one run); a maintenance failure always posts (it writes no summary; its lock yield, exit 3, is `SuccessExitStatus` and never alerts) | Discord / Slack incoming webhook |
-| heartbeat `HL_HEARTBEAT_URL` | **nothing ran at all**: timer disabled, preflight failing every tick, host down — the one thing no in-process alert can see. The data run GETs the URL after every run (URL/fail on problems); the monitor alerts when a period passes without a ping. Hourly cadence: period 1 h, grace 1 h; daily cadence: period 1 day, grace 2 h | healthchecks.io (free tier) or a self-hosted equivalent |
 | journald | the detail: one line per wallet while pulling (`[12/149] 0xeadc152a pulled in 61.3s: 6159 fills …`), per-table lift lines, tracebacks | `journalctl -u hypercore-daily -f` |
 
 Every run writes `$HL_OUT_DIR/hypercore/_run_summary.json` (full detail) and
@@ -458,7 +455,7 @@ appends one line to `_run_history.jsonl`. Exit code and summary agree:
 | `tracked_unavailable` | the leaderboard could not be fetched and no cached set was within `HL_TRACKED_MAX_AGE_HOURS`; the run covered the pins only | check that `stats-data.hyperliquid.xyz` is reachable; the next run retries |
 | `error:…` | the run raised | `journalctl -u hypercore-daily` has the traceback |
 
-`warnings` do not fail the run but are in the alert text: `pnl_oracle`,
+`warnings` do not fail the run but are shown in the monitor: `pnl_oracle`,
 `unmapped_ledger_types`, `unpriced`; `<w>:networth_pending` (net worth differs
 from HL but the full-ledger lending lookup that could explain it was skipped by the
 soft deadline — the next run pulls it, and the wallet is then either clean or a
@@ -494,17 +491,18 @@ cd /opt/blueblocx-hyperliquid && git fetch --tags && git checkout --detach v1.0.
 .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg
-# only when the release changed deploy/ (v1.2.0: OnFailure= in both services, hypercore-failure@.service,
-# hypercore-status): refresh the installed copies; the drop-in hypercore-daily.service.d/local.conf is kept
-sudo cp deploy/hypercore-daily.service deploy/hypercore-maintenance.service deploy/hypercore-failure@.service /etc/systemd/system/ \
-  && sudo install -m 0755 deploy/hypercore-status /usr/local/bin/ && sudo systemctl daemon-reload
+# only when the release changed deploy/ (units, the web monitor, hypercore-status): refresh the
+# installed copies; the drop-in hypercore-daily.service.d/local.conf is kept
+sudo cp deploy/hypercore-daily.service deploy/hypercore-maintenance.service deploy/hypercore-web.service /etc/systemd/system/ \
+  && sudo install -m 0755 deploy/hypercore-status /usr/local/bin/ && sudo systemctl daemon-reload \
+  && sudo systemctl restart hypercore-web.service
 sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-daily -n 50   # one real run (start waits for it)
 sudo systemctl start hypercore-hourly.timer
 ```
 
-`RELEASE_TAG=v1.2.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
-step 2 for you (checkout, pip, tests, units + wrapper + daemon-reload, env keys new
-in the release, preflight), refuses to run while a timer or a run is active, and is
+`RELEASE_TAG=v1.3.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
+step 2 for you (checkout, pip, tests, units + web monitor restart + wrapper +
+daemon-reload, env keys new in the release, preflight), refuses to run while a timer or a run is active, and is
 the simpler choice whenever a release touches `deploy/` or the NAS is not at
 `/mnt/blueblocx` (the shipped units hard-code that path; bootstrap rewrites it);
 re-enable the timers afterwards. Rollback is

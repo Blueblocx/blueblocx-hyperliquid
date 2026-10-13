@@ -1,19 +1,21 @@
-"""Observability layer: live progress file, status verdict, heartbeat, webhook text,
-the OnFailure notifier. No network, no systemd - everything external is faked."""
+"""Observability layer: live progress file, status verdict, the web monitor. No
+network beyond 127.0.0.1, no systemd - everything external is faked."""
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from blueblocx_hyperliquid import extract, notify, ops, s3_backfill, status
+from blueblocx_hyperliquid import extract, ops, s3_backfill, status, web
 from blueblocx_hyperliquid import schema as S
 from tests.test_tracked import W1, W2, _ClientDown, _FakeClient, _FakeTime
 
@@ -22,11 +24,6 @@ NOW = dt.datetime(2026, 10, 13, 8, 0, tzinfo=dt.timezone.utc)
 
 def _iso(minutes_ago: float) -> str:
     return (NOW - dt.timedelta(minutes=minutes_ago)).isoformat()
-
-
-class _Resp:
-    def __init__(self, code=200):
-        self.status_code = code
 
 
 class ProgressTests(unittest.TestCase):
@@ -86,103 +83,10 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(len(res.keys_missing), 3)
 
 
-class HeartbeatAndWebhookTests(unittest.TestCase):
-    def test_heartbeat_targets_and_outcomes(self):
-        seen = []
-
-        def get(url, timeout):
-            seen.append(url)
-            return _Resp(200)
-        self.assertTrue(ops.heartbeat("https://hc.example/ping/abc", True, get=get))
-        self.assertTrue(ops.heartbeat("https://hc.example/ping/abc/", False, get=get))
-        self.assertEqual(seen, ["https://hc.example/ping/abc", "https://hc.example/ping/abc/fail"])
-        self.assertFalse(ops.heartbeat("", True, get=get))                         # off: no call
-        self.assertEqual(len(seen), 2)
-        self.assertFalse(ops.heartbeat("https://hc.example/p", True, get=lambda url, timeout: _Resp(503)))
-
-        def boom(url, timeout):
-            raise ConnectionError("down")
-        self.assertFalse(ops.heartbeat("https://hc.example/p", True, get=boom))
-
-    def test_post_text_and_send_alert_payloads(self):
-        posts = []
-
-        def post(url, json, timeout):
-            posts.append((url, json))
-            return _Resp(204)
-        self.assertTrue(ops.post_text("hello", url="https://hook", post=post, extra={"k": 1}))
-        self.assertEqual(posts[-1][1], {"text": "hello", "content": "hello", "k": 1})
-        summary = {"ok": False, "wallets_ok": 1, "wallets_total": 2, "duration_s": 5, "host": "h",
-                   "run_at": "2026-10-13T00:00:00+00:00", "problems": ["0xaaaa:fidelity"], "warnings": ["deferred=1"]}
-        self.assertTrue(ops.send_alert(summary, url="https://hook", post=post))
-        payload = posts[-1][1]
-        self.assertIn("PROBLEMS", payload["text"])
-        self.assertIn("0xaaaa:fidelity", payload["text"])
-        self.assertEqual(payload["hypercore"]["problems"], ["0xaaaa:fidelity"])
-        with mock.patch.dict(os.environ, {"HL_ALERT_WEBHOOK_URL": ""}):
-            self.assertFalse(ops.post_text("x", post=post))                        # unset: no call
-        self.assertEqual(len(posts), 2)
-
-
-class NotifyTests(unittest.TestCase):
-    def _run(self, d, summary, env=None, unit="hypercore-daily.service", extra=()):
-        ns = Path(d) / S.NS_HYPERCORE
-        ns.mkdir(parents=True, exist_ok=True)
-        if summary is not None:
-            (ns / ops.SUMMARY_FILE).write_text(json.dumps(summary), encoding="utf-8")
-        posts, gets = [], []
-
-        def post(url, json, timeout):
-            posts.append(json)
-            return _Resp(200)
-
-        def get(url, timeout):
-            gets.append(url)
-            return _Resp(200)
-        environ = {"HL_ALERT_WEBHOOK_URL": "https://hook", "HL_HEARTBEAT_URL": "https://hc/ping/x"}
-        environ.update(env or {})
-        with mock.patch.dict(os.environ, environ):
-            rc = notify.main(["--failed-unit", unit, "--out", d, *extra], now=NOW, post=post, get=get)
-        return rc, posts, gets
-
-    def test_quiet_when_the_data_run_reported_itself(self):
-        with tempfile.TemporaryDirectory() as d:
-            rc, posts, gets = self._run(d, {"ok": False, "finished_at": _iso(2)})
-            self.assertEqual((rc, posts, gets), (0, [], []))
-
-    def test_alerts_when_no_fresh_summary(self):
-        with tempfile.TemporaryDirectory() as d:
-            rc, posts, gets = self._run(d, None)
-            self.assertEqual(rc, 0)
-            self.assertIn("hypercore-daily.service FAILED", posts[0]["text"])
-            self.assertIn("no run summary exists yet", posts[0]["text"])
-            self.assertEqual(gets, ["https://hc/ping/x/fail"])
-        with tempfile.TemporaryDirectory() as d:
-            rc, posts, _ = self._run(d, {"ok": True, "finished_at": _iso(90)})
-            self.assertIn("last summary 90 min ago (ok=True)", posts[0]["text"])
-        with tempfile.TemporaryDirectory() as d:          # --grace-minutes 0 defeats the quiet window (test command)
-            rc, posts, _ = self._run(d, {"ok": True, "finished_at": _iso(1)}, extra=["--grace-minutes", "0"])
-            self.assertEqual(len(posts), 1)
-
-    def test_maintenance_failure_posts_despite_a_fresh_daily_summary_and_skips_the_heartbeat(self):
-        with tempfile.TemporaryDirectory() as d:
-            rc, posts, gets = self._run(d, {"ok": True, "finished_at": _iso(3)}, unit="hypercore-maintenance.service")
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(posts), 1)
-            self.assertIn("hypercore-maintenance.service FAILED", posts[0]["text"])
-            self.assertIn("writes no run summary", posts[0]["text"])
-            self.assertEqual(gets, [])                        # the heartbeat answers "did the data run happen"
-
-    def test_no_urls_configured_is_still_exit_zero(self):
-        with tempfile.TemporaryDirectory() as d:
-            rc, posts, gets = self._run(d, None, env={"HL_ALERT_WEBHOOK_URL": "", "HL_HEARTBEAT_URL": ""})
-            self.assertEqual((rc, posts, gets), (0, [], []))
-
-
 class StatusTests(unittest.TestCase):
     OK_SUMMARY = {"ok": True, "run_at": _iso(15), "finished_at": _iso(10), "duration_s": 300.0,
                   "wallets_total": 149, "wallets_ok": 147, "wallets_deferred": 2, "problems": [],
-                  "warnings": ["deferred=2"], "version": "1.2.0", "tracked": {"source": "fresh"}}
+                  "warnings": ["deferred=2"], "version": "1.3.0", "tracked": {"source": "fresh"}}
     RUNNING = {"state": "running", "pid": 123, "host": "h", "phase": "pull", "wallets_done": 40, "wallets_total": 149,
                "wallets_deferred": 0, "current": W1, "started_at": _iso(12), "updated_at": _iso(1)}
     # what `systemctl show` reports for a LIVE Type=oneshot run: activating/start, never active
@@ -309,6 +213,82 @@ class StatusTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"HL_STATUS_MAX_AGE_HOURS": "0.1"}):     # 6 min: env override -> STALE
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(status.main(["--out", d, "--no-systemd"]), 1)
+
+
+class WebTests(unittest.TestCase):
+    def test_render_html_shows_the_verdict_tables_and_escapes(self):
+        history = [{"ok": True, "run_at": "2026-10-13T06:10:00+00:00", "duration_s": 420.0, "wallets_ok": 149,
+                    "wallets_total": 149, "wallets_deferred": 0, "problems": [], "warnings": []},
+                   {"ok": False, "run_at": "2026-10-13T07:10:00+00:00", "duration_s": 2100.0, "wallets_ok": 70,
+                    "wallets_total": 149, "wallets_deferred": 78, "problems": ["a", "b", "c", "d"], "warnings": ["w"]}]
+        report = status.assess(StatusTests.RUNNING, StatusTests.OK_SUMMARY, history, NOW, units=StatusTests.LIVE,
+                               alive=True)
+        summary = dict(StatusTests.OK_SUMMARY, per_wallet={
+            W1: {"status": "ok", "fidelity_ok": True, "perp_oracle": True, "networth_oracle": True,
+                 "fills_truncated": False, "l1_rows": 12, "raw_fills": 5, "open_positions": 1},
+            W2: {"status": "problem", "fidelity_ok": False}})
+        page = web.render_html(report, summary, history)
+        self.assertIn("hypercore HEALTHY", page)
+        self.assertIn("wallet 40/149", page)
+        self.assertIn("Recent runs", page)
+        self.assertIn("a, b, c …", page)
+        self.assertIn("hypercore-hourly.timer", page)
+        table_at = page.index("Wallets in the last run")        # (W1 also appears earlier as the wallet in flight)
+        self.assertLess(page.index(W2, table_at), page.index(W1, table_at))   # problem wallets are listed first
+        bad = status.assess(None, dict(StatusTests.OK_SUMMARY, ok=False, problems=["<script>x</script>"]), [], NOW,
+                            units=StatusTests.IDLE)
+        page = web.render_html(bad, None, [])
+        self.assertIn("hypercore ATTENTION", page)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", page)
+        self.assertNotIn("<script>x", page)
+        empty = status.assess(None, None, [], NOW, units=StatusTests.IDLE)
+        self.assertIn("no run has completed yet", web.render_html(empty, None, []))
+
+    def test_server_routes(self):
+        with tempfile.TemporaryDirectory() as d:
+            ns = Path(d) / S.NS_HYPERCORE
+            ns.mkdir(parents=True)
+            srv = web.serve("127.0.0.1", 0, web.Monitor(ns, use_systemd=False))
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+            def get(path):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", path)
+                r = c.getresponse()
+                body = r.read().decode("utf-8")
+                ctype = r.getheader("Content-Type") or ""
+                c.close()
+                return r.status, body, ctype
+            try:
+                st, body, _ = get("/healthz")
+                self.assertEqual((st, body), (503, "no run summary yet - nothing has completed\n"))
+                st, body, ctype = get("/api/status")
+                self.assertEqual(st, 200)
+                self.assertIn("json", ctype)
+                self.assertFalse(json.loads(body)["healthy"])
+                st, body, ctype = get("/")
+                self.assertEqual(st, 200)
+                self.assertIn("text/html", ctype)
+                self.assertIn("hypercore ATTENTION", body)
+                fresh = dict(StatusTests.OK_SUMMARY, finished_at=ops.utcnow().isoformat(), run_at=ops.utcnow().isoformat())
+                (ns / ops.SUMMARY_FILE).write_text(json.dumps(fresh), encoding="utf-8")
+                (ns / ops.HISTORY_FILE).write_text(json.dumps({"ok": True, "run_at": "r"}) + "\n", encoding="utf-8")
+                st, body, _ = get("/healthz")
+                self.assertEqual((st, body), (200, "ok\n"))
+                st, body, _ = get("/api/summary")
+                self.assertTrue(json.loads(body)["ok"])
+                st, body, _ = get("/api/progress")
+                self.assertEqual(json.loads(body), {})
+                st, body, _ = get("/api/history")
+                self.assertEqual(json.loads(body), [{"ok": True, "run_at": "r"}])
+                st, body, _ = get("/?refresh=1")
+                self.assertIn("hypercore HEALTHY", body)
+                st, _, _ = get("/nope")
+                self.assertEqual(st, 404)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
 
 if __name__ == "__main__":

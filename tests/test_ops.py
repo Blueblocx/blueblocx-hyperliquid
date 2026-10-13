@@ -1,4 +1,4 @@
-"""Production plumbing: env/config, lock, run summary, alerting, retention, daily
+"""Production plumbing: env/config, lock, run summary, retention, daily
 exit codes, preflight. No network — everything external is faked."""
 from __future__ import annotations
 
@@ -66,8 +66,8 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HL_RETENTION_DAYS", None)
             self.assertEqual(config.env_int("HL_RETENTION_DAYS"), 45)        # documented default
-            os.environ["HL_ALERT_ON_SUCCESS"] = "yes"
-            self.assertTrue(config.env_bool("HL_ALERT_ON_SUCCESS"))
+            os.environ["HL_LOG_JSON"] = "yes"
+            self.assertTrue(config.env_bool("HL_LOG_JSON"))
 
     def test_describe_env_never_exposes_secret_values(self):
         with mock.patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "s3cr3t", "HL_INFO_URL": "http://x"}, clear=False):
@@ -140,24 +140,6 @@ class OpsTests(unittest.TestCase):
                     with ops.RunLock(p, stale_hours=12):
                         pass
 
-    def test_should_alert_dedupes_unchanged_problems(self):
-        now = dt.datetime(2026, 10, 12, 10, tzinfo=dt.timezone.utc)
-        cur = {"ok": False, "problems": ["0xaaaa0000:fidelity"], "finished_at": now.isoformat()}
-        with mock.patch.dict(os.environ, {"HL_ALERT_ON_SUCCESS": "0", "HL_ALERT_REPEAT_HOURS": "6"}):
-            self.assertTrue(ops.should_alert(cur, None, now=now))                           # first time
-            prev = {"ok": False, "problems": ["0xaaaa0000:fidelity"], "alert_sent": True,
-                    "alert_sent_at": (now - dt.timedelta(hours=2)).isoformat()}
-            self.assertFalse(ops.should_alert(cur, prev, now=now))                          # same, 2h ago
-            prev_old = dict(prev, alert_sent_at=(now - dt.timedelta(hours=7)).isoformat())
-            self.assertTrue(ops.should_alert(cur, prev_old, now=now))                       # same, 7h ago
-            changed = dict(cur, problems=["0xaaaa0000:fidelity", "0xbbbb0000:perp_oracle"])
-            self.assertTrue(ops.should_alert(changed, prev, now=now))                       # new problem
-            prev_unsent = dict(prev, alert_sent=False)
-            self.assertTrue(ops.should_alert(cur, prev_unsent, now=now))                    # never actually sent
-            self.assertFalse(ops.should_alert({"ok": True, "problems": []}, None, now=now))
-        with mock.patch.dict(os.environ, {"HL_ALERT_ON_SUCCESS": "1"}):
-            self.assertTrue(ops.should_alert({"ok": True, "problems": []}, None, now=now))
-
     def test_build_summary_classifies_hard_problems_and_warnings(self):
         wallets = ["0xaaaa0000000000000000000000000000000000aa",
                    "0xbbbb0000000000000000000000000000000000bb",
@@ -215,36 +197,6 @@ class OpsTests(unittest.TestCase):
             compact = json.loads(lines[0])
             self.assertNotIn("per_wallet", compact)
             self.assertEqual(compact["per_wallet_status"], {w[0]: "ok"})
-
-    def test_send_alert(self):
-        w = ["0xaaaa0000000000000000000000000000000000aa"]
-        s = ops.build_summary(_clean_recon(w), w, ops.utcnow(), ops.utcnow())
-        s["problems"] = ["0xaaaa0000:fidelity"]
-        s["ok"] = False
-        calls = []
-
-        class Resp:
-            status_code = 200
-
-        def fake_post(url, json=None, timeout=None):
-            calls.append((url, json, timeout))
-            return Resp()
-
-        with mock.patch.dict(os.environ, {"HL_ALERT_WEBHOOK_URL": ""}, clear=False):
-            self.assertFalse(ops.send_alert(s, post=fake_post))
-            self.assertEqual(calls, [])
-        self.assertTrue(ops.send_alert(s, url="https://hooks.example/abc", post=fake_post))
-        url, payload, timeout = calls[0]
-        self.assertEqual(url, "https://hooks.example/abc")
-        self.assertIn("PROBLEMS", payload["text"])
-        self.assertIn("0xaaaa0000:fidelity", payload["text"])
-        self.assertLessEqual(len(payload["content"]), 1900)
-        self.assertEqual(payload["hypercore"]["problems"], ["0xaaaa0000:fidelity"])
-
-        def boom(*a, **k):
-            raise ConnectionError("down")
-        self.assertFalse(ops.send_alert(s, url="https://hooks.example/abc", post=boom))
-
 
 class RetentionTests(unittest.TestCase):
     def _write(self, path, rows):
@@ -341,7 +293,7 @@ class DailyMainTests(unittest.TestCase):
             return recon
 
         with mock.patch.object(daily.extract, "run", side_effect=fake_run):
-            code = daily.main(["--wallets-file", str(wf), "--out", str(out), "--no-alert",
+            code = daily.main(["--wallets-file", str(wf), "--out", str(out),
                                "--iceberg", "--retention-days", "60", *extra])
         summary_path = out / "hypercore" / ops.SUMMARY_FILE
         summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else None
@@ -375,7 +327,7 @@ class DailyMainTests(unittest.TestCase):
 
     def test_bad_config_exit_two(self):
         with tempfile.TemporaryDirectory() as d:
-            code = daily.main(["--wallets-file", str(Path(d) / "nope.txt"), "--out", d, "--no-alert"])
+            code = daily.main(["--wallets-file", str(Path(d) / "nope.txt"), "--out", d])
             self.assertEqual(code, 2)
             code, _, _, _ = self._run(d, recon=_clean_recon([]), wallets=[])
             self.assertEqual(code, 2)
