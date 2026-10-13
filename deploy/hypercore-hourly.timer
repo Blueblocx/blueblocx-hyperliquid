@@ -18,9 +18,12 @@
 # wallets per 50-minute run, ~360 at 1200. Above that, trim the slow-changing
 # pulls or add an egress IP (docs/DEPLOY.md, "Hourly cadence").
 #
-# Onboard NEW wallets by hand, not through this timer: a wallet with no watermark
-# gets a --days 2 window, and a market-maker-class wallet then needs an S3 backfill
-# that can outlast the 50-minute cap (the run is killed and nothing is saved).
+# The list itself: pinned wallets + the leaderboard tracked set (HL_TRACKED_SOURCE,
+# tracked.py). Set HL_RUN_SOFT_DEADLINE_MIN=35 so a list that outgrows the slot defers
+# its tail to the next tick (rotating order) instead of being killed at 50 min with
+# nothing saved. Auto-tracked wallets onboard themselves with a --days 2 window; a
+# PINNED market-maker-class wallet (10k-fill cap) still needs an S3 backfill by hand,
+# because one wallet's backfill cannot be interrupted by the soft deadline:
 #   python -m blueblocx_hyperliquid.extract --wallet 0x... --days 2 --incremental --iceberg --s3-backfill
 [Unit]
 Description=Run hypercore-daily.service every hour

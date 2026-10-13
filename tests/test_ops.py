@@ -317,6 +317,17 @@ class StagingLoaderTests(unittest.TestCase):
 class DailyMainTests(unittest.TestCase):
     W = ["0xaaaa0000000000000000000000000000000000aa", "0xbbbb0000000000000000000000000000000000bb"]
 
+    def setUp(self):
+        # a developer's <repo>/.env (deploy/.env.example ships HL_TRACKED_SOURCE=leaderboard)
+        # must not turn these into leaderboard runs / network fetches; '' blocks load_env's setdefault
+        p = mock.patch.dict(os.environ, {"HL_TRACKED_SOURCE": "", "HL_RUN_SOFT_DEADLINE_MIN": "0"})
+        p.start()
+        self.addCleanup(p.stop)
+        r = mock.patch.object(daily.tracked, "refresh_tracked",
+                              side_effect=AssertionError("refresh_tracked must not run without a tracked source"))
+        r.start()
+        self.addCleanup(r.stop)
+
     def _run(self, d, recon=None, raise_exc=None, wallets=None, extra=()):
         out = Path(d) / "out"
         wf = Path(d) / "wallets.txt"
@@ -386,6 +397,12 @@ class DailyMainTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
+    def setUp(self):
+        # independent of the developer's <repo>/.env (see DailyMainTests.setUp)
+        p = mock.patch.dict(os.environ, {"HL_TRACKED_SOURCE": "", "HL_RUN_SOFT_DEADLINE_MIN": "0"})
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_offline_checks_have_no_failures_here(self):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.dict(os.environ, {"HL_WEIGHT_BUDGET": "600", "HL_RETENTION_DAYS": "45"}, clear=False):

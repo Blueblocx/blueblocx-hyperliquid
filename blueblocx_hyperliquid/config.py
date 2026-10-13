@@ -38,7 +38,33 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                           "after a successful Iceberg lift, drop staged l1/l3 CSV rows older than "
                           "this many days (0 = keep everything). Must stay >= 31 so the 30d "
                           "analytics windows remain complete"),
-    "HL_WALLETS_FILE": ("", False, "default wallet list for blueblocx_hyperliquid.daily / preflight"),
+    # --- which wallets (tracked.py) ---------------------------------------------------
+    "HL_WALLETS_FILE": ("", False,
+                        "pinned wallets, one address per line: always pulled, first. Optional once "
+                        "HL_TRACKED_SOURCE is set"),
+    "HL_TRACKED_SOURCE": ("", False,
+                          "'leaderboard' = also pull the tracked set the TS platform-backend sweeps live "
+                          "(top whales by account value + smart money from the Hyperliquid leaderboard), "
+                          "refreshed every run and cached. Empty = the wallets file only"),
+    "HL_LEADERBOARD_URL": ("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard", False,
+                           "leaderboard payload (~39 MB; a separate stats host, no Info API weight)"),
+    "HL_WHALE_TOP_N": ("100", False, "tracked whales: top N leaderboard rows by accountValue (TS WHALE_TOP_N)"),
+    "HL_SMART_TOP_N": ("50", False,
+                       "tracked smart money: top N by 30d pnl among rows passing the three floors below "
+                       "(TS SMART_TOP_N)"),
+    "HL_SMART_MIN_ACCOUNT_VALUE": ("100000", False,
+                                   "smart-money floor: account value, USD (a value below 100000 also "
+                                   "lowers the leaderboard scan floor so it takes effect)"),
+    "HL_SMART_MIN_MONTH_ROI": ("0.2", False, "smart-money floor: 30d roi as a fraction (0.2 = 20%)"),
+    "HL_SMART_MIN_MONTH_VLM": ("5000000", False, "smart-money floor: 30d volume, USD"),
+    "HL_TRACKED_MAX_AGE_HOURS": ("48", False,
+                                 "stats host down: reuse the cached tracked set up to this age, then run "
+                                 "the pins only and report tracked_unavailable"),
+    "HL_RUN_SOFT_DEADLINE_MIN": ("0", False,
+                                 "minutes into a run after which no further wallet is started; the rest "
+                                 "are deferred to the next run (rotating order) instead of the service "
+                                 "timeout killing the whole run. Hourly cadence: 35 (TimeoutStartSec=50min). "
+                                 "0 = off"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock older than this is treated as abandoned (a lock whose PID is dead is "
@@ -147,6 +173,14 @@ def env_int(name: str, default: int | None = None) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+
+
+def env_float(name: str, default: float | None = None) -> float:
+    raw = env(name, None if default is None else str(default))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
 
 
 def env_bool(name: str, default: bool = False) -> bool:

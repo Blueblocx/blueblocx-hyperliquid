@@ -17,8 +17,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HL_WALLETS_FILE=/data/wallets.txt \
     HL_LOG_JSON=1
 
+# an empty pins file so preflight runs (WARN, not FAIL) before a volume provides one
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
- && mkdir -p /data/out && chown -R app:app /data
+ && mkdir -p /data/out && touch /data/wallets.txt && chown -R app:app /data
 
 WORKDIR /app
 COPY requirements.txt constraints.txt ./

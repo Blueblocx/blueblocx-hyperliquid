@@ -14,17 +14,19 @@
 #   4. working-copy venv in the clone you ran this from
 #   5. PostgreSQL role + database for the pyiceberg catalog (password generated once)
 #   6. /etc/hypercore/hypercore.env (standalone: PostgreSQL catalog + NAS warehouse,
-#      S3 backfill OFF), /etc/hypercore/wallets.txt placeholder
+#      S3 backfill OFF, wallet list = leaderboard tracked set + optional pins; an
+#      existing file keeps its values and only gains the keys new in this release),
+#      /etc/hypercore/wallets.txt placeholder for the pins
 #   7. NAS warehouse directory, written as the service user (catches uid squash)
 #   8. systemd units: service + hourly timer + nightly maintenance, with a drop-in
 #      that removes the S3 flags (no AWS key in this layout) and caps a run at 50 min
 #   9. preflight as the service user
-# It does NOT start the timers or run the pipeline: add wallets first (printed at the end).
+# It does NOT start the timers or run the pipeline (next steps are printed at the end).
 # Overrides: export RELEASE_TAG / GIT_ALIAS / NAS_MOUNT / WEIGHT_BUDGET before running.
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.0.1}"
+RELEASE_TAG="${RELEASE_TAG:-v1.1.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -143,8 +145,18 @@ HL_WEIGHT_BUDGET=${WEIGHT_BUDGET}
 HL_HTTP_TIMEOUT=30
 
 HL_OUT_DIR=${STATE_DIR}
-HL_WALLETS_FILE=${WALLETS_FILE}
 HL_RETENTION_DAYS=45
+
+# Which wallets: the Info API is per address, so a run needs a list. Pinned wallets in
+# HL_WALLETS_FILE (optional, always first) + the tracked set the TS platform-backend
+# sweeps live: top HL_WHALE_TOP_N leaderboard rows by account value and up to
+# HL_SMART_TOP_N smart-money rows, refreshed every run (stats host, no Info API weight)
+HL_WALLETS_FILE=${WALLETS_FILE}
+HL_TRACKED_SOURCE=leaderboard
+HL_WHALE_TOP_N=100
+HL_SMART_TOP_N=50
+# hourly cadence: start no new wallet after 35 min (service timeout 50), defer the rest
+HL_RUN_SOFT_DEADLINE_MIN=35
 HL_LOG_LEVEL=INFO
 HL_LOG_JSON=1
 HL_LOCK_STALE_HOURS=2
@@ -164,14 +176,29 @@ AWS_SECRET_ACCESS_KEY=
 AWS_REGION=us-east-1
 EOF
 else
-  warn "$ENV_FILE exists - left untouched"
+  warn "$ENV_FILE exists - values left untouched (keys new in this release are appended below)"
 fi
 sudo chown root:"$SERVICE_USER" "$ENV_FILE"
 sudo chmod 640 "$ENV_FILE"
+# upgrade path: a key this release reads but an older env file lacks is appended with its
+# default; a key that is present (even empty) is never changed
+ensure_env() {  # ensure_env KEY VALUE COMMENT
+  if ! sudo grep -q "^$1=" "$ENV_FILE"; then
+    printf '\n# %s\n%s=%s\n' "$3" "$1" "$2" | sudo tee -a "$ENV_FILE" >/dev/null
+    echo "added $1=$2"
+  fi
+}
+ensure_env HL_TRACKED_SOURCE leaderboard "v1.1: automatic wallet list (top whales + smart money from the leaderboard) in addition to the pins"
+ensure_env HL_WHALE_TOP_N 100 "v1.1: tracked whales, top N by account value"
+ensure_env HL_SMART_TOP_N 50 "v1.1: tracked smart money, top N by 30d pnl"
+ensure_env HL_RUN_SOFT_DEADLINE_MIN 35 "v1.1: hourly cadence - start no new wallet after 35 min (service timeout 50), defer the rest"
 if ! sudo test -f "$WALLETS_FILE"; then
   sudo install -m 640 -o "$ME" -g "$SERVICE_USER" /dev/null "$WALLETS_FILE"
   sudo tee "$WALLETS_FILE" >/dev/null <<'EOF'
-# one Hyperliquid wallet address per line (0x + 40 hex); # comments allowed
+# PINNED wallets: one Hyperliquid address per line (0x + 40 hex), # comments allowed.
+# Optional: the run also pulls the leaderboard tracked set (HL_TRACKED_SOURCE in
+# hypercore.env). Pins are always pulled first and their API-capped windows are hard
+# problems; put customer / watchlist wallets here.
 EOF
 fi
 # the wallet list is yours to edit without sudo; the service only reads it
@@ -213,21 +240,26 @@ sudo systemctl daemon-reload
 say "preflight (as ${SERVICE_USER})"
 # from $PROD_DIR: the package is imported from the checkout, not installed into the venv
 if ( cd "$PROD_DIR" && sudo -u "$SERVICE_USER" env HL_ENV_FILE="$ENV_FILE" "$PROD_DIR/.venv/bin/python" -m blueblocx_hyperliquid.preflight --iceberg --wallets-file "$WALLETS_FILE" ); then
-  echo "preflight OK ('WARN wallets ... empty' is expected until you add wallets)"
+  echo "preflight OK"
 else
   warn "preflight reported FAIL rows - fix them before enabling the timers"
 fi
 
+# what the service will actually use (an existing env file keeps its own values)
+env_val() { sudo sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
+TRACKED_SRC="$(env_val HL_TRACKED_SOURCE)"
+WHALE_N="$(env_val HL_WHALE_TOP_N)"
+SMART_N="$(env_val HL_SMART_TOP_N)"
+
 say "done: ${PROD_DIR} @ $(git -C "$PROD_DIR" describe --tags --always). next steps"
 cat <<EOF
-1. Add wallets:            nano ${WALLETS_FILE}        (one 0x... per line; the file is yours)
+Wallet list (HL_TRACKED_SOURCE=${TRACKED_SRC:-unset}): top ${WHALE_N:-?} whales + up to ${SMART_N:-?} smart-money
+wallets from the Hyperliquid leaderboard (same rule as the live platform-backend), refreshed every run.
+1. Optional pins:          nano ${WALLETS_FILE}        (customer / watchlist wallets, one 0x... per line)
 2. Optional webhook:       sudoedit ${ENV_FILE}   -> HL_ALERT_WEBHOOK_URL=
-3. Small first run (2-3 wallets, docs/DEPLOY.md section 5):
-     cd ${PROD_DIR} && sudo -u ${SERVICE_USER} env HL_ENV_FILE=${ENV_FILE} .venv/bin/python -m blueblocx_hyperliquid.extract --wallet 0xA,0xB --days 2 --incremental --iceberg
-   then read ${STATE_DIR}/hypercore/_reconciliation.json (natural_key_ok, fidelity_ok, oracle.*)
-4. Full run once by hand:  sudo systemctl start --no-block hypercore-daily.service && sudo journalctl -u hypercore-daily -f
-   then:                   sudo jq '{ok,wallets_ok,problems,warnings}' ${STATE_DIR}/hypercore/_run_summary.json
-5. Enable the schedule:    sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
-6. Check:                  systemctl list-timers 'hypercore-*'
+3. First run by hand:      sudo systemctl start --no-block hypercore-daily.service && sudo journalctl -u hypercore-daily -f
+   then:                   sudo jq '{ok,wallets_ok,wallets_deferred,tracked,problems,warnings}' ${STATE_DIR}/hypercore/_run_summary.json
+4. Enable the schedule:    sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
+5. Check:                  systemctl list-timers 'hypercore-*'
 Note: your group membership (${SERVICE_USER}) applies after you log in again.
 EOF

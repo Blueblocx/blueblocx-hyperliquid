@@ -152,21 +152,35 @@ class RunLock:
 #   fidelity           mapped rows != raw API input (dropped / duplicated / sign-flipped rows)
 #   perp_oracle        perp equity != HL portfolio.perpAllTime (or the oracle could not be read)
 #   networth_oracle    computed net worth != HL portfolio.allTime
-#   fills_truncated    the window is incomplete (API cap without a complete S3 backfill)
+#   fills_truncated    the window is incomplete (API cap without a complete S3 backfill);
+#                      for auto-tracked (leaderboard) wallets this is a WARNING instead -
+#                      pinned wallets are what the product must have complete
 #   fetch_errors       a non-core pull failed (staking / vaults / open orders / a HIP-3 dex)
+#   tracked_unavailable  the leaderboard tracked set could not be refreshed and no cache
+#                      was fresh enough: the run covered the pins only (added by daily.py)
 #   error              the run raised
 # WARNINGS are reported and alerted with the summary but do not fail the run:
 #   pnl_oracle         HL perpDay.pnlHistory Δ24h != realized + Δunrealized (still being
 #                      calibrated on live data; promote to hard once it is stable)
 #   unmapped_ledger_types   a ledger delta.type the mapper does not know (rows skipped)
 #   unpriced           a held non-stable symbol with no spot price (net worth understated)
+#   deferred=N         the soft deadline left N wallets for the next run (rotating order)
+#   tracked_stale=Xh   the leaderboard was unreachable; the cached tracked set was used
 
 
 def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetime,
                   finished_at: dt.datetime, *, error: str | None = None,
-                  options: dict | None = None) -> dict:
-    """Turn extract.run's reconciliation into the operator-facing verdict."""
+                  options: dict | None = None, deferred: list[str] | None = None,
+                  soft_wallets: set[str] | None = None) -> dict:
+    """Turn extract.run's reconciliation into the operator-facing verdict.
+
+    deferred: wallets the soft deadline left for the next run (status 'deferred', one
+    warning, never a problem; their stale by_wallet entry from an earlier run is not
+    re-judged). soft_wallets: auto-tracked wallets for which an API-capped window is
+    a warning rather than a hard problem."""
     by = (recon or {}).get("by_wallet", {}) or {}
+    deferred_set = set(deferred or [])
+    soft = set(soft_wallets or [])
     problems: list[str] = []
     warnings: list[str] = []
     per_wallet: dict[str, dict] = {}
@@ -176,8 +190,11 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         problems.append("natural_key")
 
     for w in wallets:
-        r = by.get(w) or {}
         short = w[:10]
+        if w in deferred_set:
+            per_wallet[w] = {"status": "deferred"}
+            continue
+        r = by.get(w) or {}
         if not r:
             per_wallet[w] = {"status": "missing"}
             if recon is not None:
@@ -212,7 +229,10 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         if entry["networth_oracle"] is False:
             hard.append("networth_oracle")
         if entry["fills_truncated"]:
-            hard.append("fills_truncated")
+            if w in soft:
+                warnings.append(f"{short}:fills_truncated")
+            else:
+                hard.append("fills_truncated")
         if entry["fetch_errors"]:
             hard.append("fetch_errors=" + ",".join(entry["fetch_errors"]))
         if entry["pnl_oracle"] is False:
@@ -226,6 +246,8 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
             problems += [f"{short}:{p}" for p in hard]
         per_wallet[w] = entry
 
+    if deferred_set:
+        warnings.append(f"deferred={len(deferred_set)}")
     statuses = [e["status"] for e in per_wallet.values()]
     ok = recon is not None and not problems
     return {
@@ -239,6 +261,7 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         "wallets_ok": statuses.count("ok"),
         "wallets_problem": statuses.count("problem"),
         "wallets_skipped": statuses.count("skipped") + statuses.count("missing"),
+        "wallets_deferred": statuses.count("deferred"),
         "problems": problems,
         "warnings": warnings,
         "error": error,

@@ -38,6 +38,7 @@ numbers exact. This repo covers HyperCore only.
 | `blueblocx_hyperliquid/s3_backfill.py` | fills from `s3://hl-mainnet-node-data/node_fills_by_block/hourly/` (lz4 JSON lines, Requester Pays); same fill shape as the API plus `builderFee`; verified tid-for-tid equal to the API on an overlapping hour |
 | `blueblocx_hyperliquid/iceberg_load.py` | lift CSVs into Iceberg via pyiceberg — schemas parsed from `docs/PROPOSED_SCHEMA.sql`; REST/Nessie when `NESSIE_URI` is set, else a local SQLite catalog under `out/iceberg/`; facts are insert-if-absent, snapshots/dimensions replace-by-key; writes `control.table_watermarks` |
 | `blueblocx_hyperliquid/daily.py` | one-command daily run for a wallet list (incremental + HIP-3 + optional S3/Iceberg) under a single-flight lock; writes the run summary and POSTs the alert webhook; `deploy/dagster_hypercore_assets.py` is the dagster asset template that wraps it |
+| `blueblocx_hyperliquid/tracked.py` | **which wallets**: the Info API is per address, so a run needs a list — pinned wallets (`HL_WALLETS_FILE`, optional) + with `HL_TRACKED_SOURCE=leaderboard` the set the TS platform-backend sweeps live (top 100 whales by account value + up to 50 smart-money wallets from the Hyperliquid leaderboard), refreshed every run from the stats host, cached, rotated so a tail deferred by the soft deadline runs first next hour |
 | `blueblocx_hyperliquid/config.py`, `blueblocx_hyperliquid/ops.py`, `blueblocx_hyperliquid/preflight.py` | env/.env/logging (`ENV_VARS` is the authoritative list), atomic writes + lock + summary + alert, pre-run health check |
 | `blueblocx_hyperliquid/evm_extract.py` | **HyperEVM** per-wallet ERC-20 extract → `out/hyperevm/*` (separate namespace; same `standard="ERC20"` / metadata / upsert invariants; production should use the atlas EVM path) |
 | `blueblocx_hyperliquid/price_job.py` | **shared per-token** L3 price asset (`l3_token_price_usd_1m`); interval chosen from range because `candleSnapshot` only serves the ~5000 most recent candles |
@@ -58,6 +59,7 @@ monitoring, upgrade, what still lives in atlas). The pieces:
 | configuration | environment variables only, documented in `blueblocx_hyperliquid/config.py` (`ENV_VARS`); `deploy/.env.example` mirrors it; `.env` is loaded without overriding the process env |
 | health check | `python -m blueblocx_hyperliquid.preflight [--offline] [--iceberg --s3]` — deps, tzdata, DDL, paths, env sanity, HL API + clock skew, S3 requester-pays, Nessie REST; never prints secrets |
 | scheduler entry point | `python -m blueblocx_hyperliquid.daily` — lock, incremental run, run summary (`_run_summary.json`, `_run_history.jsonl`), webhook alert; exit 0/1/2/3 |
+| wallet list | pins in `HL_WALLETS_FILE` + the automatic tracked set with `HL_TRACKED_SOURCE=leaderboard` (`tracked.py`); `HL_RUN_SOFT_DEADLINE_MIN` defers the tail of a list that outgrows the slot to the next run instead of the service timeout killing the whole run |
 | scheduling | `deploy/hypercore-daily.{service,timer}` (systemd, daily) or `deploy/hypercore-hourly.timer` + `deploy/hourly-override.conf` (hourly), `deploy/run_daily.sh` + `deploy/crontab.example` (cron), `Dockerfile` (batch image), `deploy/dagster_hypercore_assets.py` (template) |
 | catalog | three modes in `blueblocx_hyperliquid/iceberg_load.py`: **standalone** `HL_CATALOG_URI` (PostgreSQL, or SQLite for a single host) + `WAREHOUSE=file:///…` on a NAS mount guarded by `HL_WAREHOUSE_MOUNT` — no Nessie, no object store; **shared atlas lake** `NESSIE_URI` + S3 store; **dev** SQLite under `HL_OUT_DIR/iceberg` |
 | maintenance | `python -m blueblocx_hyperliquid.maintenance --expire-days 7` (nightly timer in `deploy/`): expires old snapshots so `metadata.json` stays small; lifts are ~14 commits per run regardless of wallet count |
@@ -91,7 +93,9 @@ Env (`.env` is auto-loaded, never committed; full list with defaults in
 `blueblocx_hyperliquid/config.py`): `HL_INFO_URL` (default mainnet), `HL_WEIGHT_BUDGET` (default
 900/min; HL caps at 1200 per IP — leave headroom for other pollers on the same
 IP), `HL_OUT_DIR` (state directory), `HL_RETENTION_DAYS` (staged-CSV retention
-after a lift, ≥ 31), `HL_ALERT_WEBHOOK_URL`, `AWS_ACCESS_KEY_ID`/
+after a lift, ≥ 31), `HL_WALLETS_FILE` + `HL_TRACKED_SOURCE=leaderboard` (which
+wallets: pins + the automatic whale/smart-money set), `HL_RUN_SOFT_DEADLINE_MIN`
+(hourly cadence: defer the tail instead of being killed), `HL_ALERT_WEBHOOK_URL`, `AWS_ACCESS_KEY_ID`/
 `AWS_SECRET_ACCESS_KEY` (S3 backfill, Requester Pays — **rotate the key that was
 pasted in chat before any production use**), `NESSIE_URI` + `NESSIE_BRANCH`/
 `WAREHOUSE`/`S3_ENDPOINT`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` (Iceberg REST; unset →
@@ -111,6 +115,7 @@ local catalog), `HYPEREVM_RPC_URL`.
 | `_run_summary.json`, `_run_history.jsonl` | — | written by `blueblocx_hyperliquid.daily`: verdict per run (hard problems vs warnings, per-wallet status, iceberg/retention counts); the history file gets one line per run |
 | `_watermarks.json` | wallet | incremental state: `through_ms`, `coverage_start_ms`, sticky `fills_truncated`, cached lending position |
 | `_lift_state.json` | — | last successful Iceberg lift; the next lift reads only rows updated since (bounded incremental lift) |
+| `_tracked_wallets.json` | — | the leaderboard tracked set of the last refresh (`whales`, `smart`, `fetched_at`) + the rotation `cursor`; reused for `HL_TRACKED_MAX_AGE_HOURS` when the stats host is down |
 
 ### Validation
 1. **Mapping fidelity (raw vs mapped)**: Σ raw `closedPnl` == Σ `perp_realized_pnl`

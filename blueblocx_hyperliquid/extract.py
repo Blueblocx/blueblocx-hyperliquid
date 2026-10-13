@@ -417,8 +417,27 @@ def _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding) -> dict
 def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = False,
         max_workers: int = 4, max_perp_price_coins: int = 30,
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
-        hip3: bool = True, retention_days: int = 0) -> dict:
+        hip3: bool = True, retention_days: int = 0, deadline_ts: float | None = None,
+        soft_wallets: set[str] | None = None) -> dict:
+    """Pull, map, snapshot, analyse and write every wallet in `wallets` (in order).
+
+    deadline_ts (epoch seconds): after it, no further wallet is STARTED and the
+    phase-2 lazy full-ledger pull is skipped (left uncached, so it is retried); the
+    rest of the list comes back as recon["deferred"] with nothing of theirs touched
+    (no watermark, no snapshot scope), and the run completes normally for the
+    wallets it did pull. The scheduled runner sets it well inside the service
+    timeout so a list that outgrows one slot degrades to "the tail waits an hour"
+    instead of the whole run being killed with nothing saved.
+
+    soft_wallets: the auto-tracked (leaderboard) wallets. They are never backfilled
+    from S3 in this run, and an API-capped window is accepted as a hole: the
+    watermark advances and coverage restarts at the oldest fill returned, so the
+    wallet is light again next run instead of re-pulling the capped window every
+    hour forever. Pinned wallets keep the repair semantics (watermark held until an
+    S3 backfill completes the window).
+    """
     wallets = [w.lower() for w in wallets]
+    soft = {w.lower() for w in (soft_wallets or ())}
     client = InfoClient()        # HL_INFO_URL / HL_WEIGHT_BUDGET / HL_HTTP_TIMEOUT from the env
     now_iso = _now_iso()
     now_ms = int(time.time() * 1000)
@@ -481,7 +500,13 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     # ---- phase 1: pull every wallet's API data -----------------------------------
     from .s3_backfill import merge_fills as _merge
     pending: list[dict] = []
-    for wallet in wallets:
+    deferred: list[str] = []
+    for i, wallet in enumerate(wallets):
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            deferred = wallets[i:]
+            log.warning("soft deadline reached after %d of %d wallets - %d deferred to the next run",
+                        i, len(wallets), len(deferred))
+            break
         prior = watermarks.get(wallet) or {}
         w_start_ms = compute_start_ms(default_start_ms, prior.get("through_ms"))
         # The full ledger history (lending position) is pulled LAZILY in phase 2:
@@ -507,12 +532,20 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                             fills_saturated=fills_saturated, oldest_api=oldest_api,
                             twap_fills=twap_fills, need_ledger_all=need_ledger_all,
                             s3_report=None))
+    processed = wallets[:len(wallets) - len(deferred)]
 
     # ---- phase 1b: ONE shared S3 pass for every truncated wallet -------------------
     # Hour files are per chain, not per wallet: N truncated wallets used to download
     # the same ~20 files N times. Now one window covers all gaps and each wallet
     # keeps the fills inside its own [w_start, oldest_api).
-    trunc = [p for p in pending if p["fills_saturated"]]
+    # auto-tracked (soft) wallets are never backfilled from S3 in a scheduled run: a
+    # capped 2-day market-maker window is ~46 hour files (~70 min of Requester-Pays
+    # downloads), far past any deadline; their cap is accepted as a hole below
+    trunc = [p for p in pending if p["fills_saturated"] and p["wallet"] not in soft]
+    for p in pending:
+        if p["fills_saturated"] and p["wallet"] in soft:
+            log.warning("[%s] fills truncated at the API cap - auto-tracked wallet: hole accepted, "
+                        "coverage restarts at the oldest fill returned", p["wallet"][:10])
     if trunc and s3_backfill:
         from .s3_backfill import fetch_fills_s3
         config.load_env()
@@ -610,6 +643,14 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             analysis_rows = merge_rows_by_key(disk_rows, l1_rows)
         else:
             analysis_rows = l1_rows
+        # Auto-tracked wallet at the API cap with no repair path: the fills before the
+        # oldest one returned are a hole we live with. Contiguous coverage therefore
+        # starts at that fill - the 7d/30d windows stay incomplete until genuinely
+        # covered - and the watermark advances below, so the next run pulls ~1h
+        # instead of the same capped window again.
+        accept_hole = fills_saturated and wallet in soft
+        if accept_hole:
+            coverage_start_ms = max(coverage_start_ms, int(p["oldest_api"]))
         # price every symbol the ACCUMULATED ledger touched (fee/quote legs), not
         # just holdings; historical tokens come from l1_token_metadata.csv
         token_meta_all = dict(_load_token_meta(ns_dir / "l1_token_metadata.csv"))
@@ -636,14 +677,23 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         prior_unreal, prior_age_h = prior_unreal_by_wallet.get(wallet, (None, None))
         oracle = analytics.validate_against_oracle(
             wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
-        lending_lazy_pull = False
-        if (not lending_resolved) and oracle.get("checked") and oracle.get("networth_matches") is False:
+        lending_lazy_pull = lending_deferred = lending_pulled_ok = False
+        lending_mismatch = ((not lending_resolved) and bool(oracle.get("checked"))
+                            and oracle.get("networth_matches") is False)
+        if lending_mismatch and deadline_ts is not None and time.time() >= deadline_ts:
+            # the full-history pull is the one unbounded call of phase 2 (541 s on an
+            # old whale): past the deadline it waits for the next run, uncached
+            lending_deferred = True
+            log.warning("[%s] lazy ledger_all pull skipped (soft deadline) - lending unresolved, "
+                        "retried next run", wallet[:10])
+        elif lending_mismatch:
             # Net worth without lending does not match HL: the borrow/lend supply is
             # the one component only the full ledger history reveals — pull it now
             # (expensive for old whales, hence lazy) and recompute.
             lending_lazy_pull = True
             try:
                 ledger_all = client.user_non_funding_ledger_updates(wallet, 0, now_ms)
+                lending_pulled_ok = True
             except Exception as e:  # noqa: BLE001
                 log.warning("[%s] ledger_all failed: %s", wallet[:10], e)
                 ledger_all = []
@@ -662,12 +712,18 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                 wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
             log.info("[%s] lazy ledger_all pull: lending=%s -> networth_matches=%s",
                      wallet[:10], lending_by_token, oracle.get("networth_matches"))
+        # the lending position is cached only when it is actually known: from the
+        # cache, from a successful full-history pull, or implied by an oracle match
+        # (or an unchecked oracle) without it - never after a skipped or failed pull
+        lending_known = lending_resolved or lending_pulled_ok or not lending_mismatch
         recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
         recon["unmapped_ledger_types"] = unknown
         recon["fetch_errors"] = d["_errors"]
         recon["window_start_ms"] = w_start_ms
         recon["twap_slice_fills"] = len(twap_fills)
         recon["lending_lazy_pull"] = lending_lazy_pull
+        recon["lending_deferred"] = lending_deferred
+        recon["hole_accepted"] = accept_hole
         recon["coverage_start_ms"] = coverage_start_ms
         recon["analysis_rows"] = len(analysis_rows)
         recon["s3_backfill"] = s3_report
@@ -676,21 +732,27 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         # Watermark rules:
         #  * a window that is still truncated (no/incomplete S3 backfill) does NOT
         #    advance through_ms, so a later --s3-backfill run re-pulls the same
-        #    window from S3 and genuinely repairs the hole;
+        #    window from S3 and genuinely repairs the hole - except for an
+        #    auto-tracked wallet, whose hole was accepted above (coverage_start_ms
+        #    already moved past it) and whose watermark therefore advances;
         #  * fills_truncated is sticky until a run that is complete AND contiguous
         #    with the prior watermark (w_start_ms <= prior through_ms) clears it.
         prior_through = prior_wm.get("through_ms")
         repaired = (not fills_saturated) and (prior_through is None or w_start_ms <= int(prior_through))
         sticky = fills_saturated or (bool(prior_wm.get("fills_truncated")) and not repaired)
         watermarks[wallet] = {
-            "through_ms": (prior_through if fills_saturated else now_ms),
+            "through_ms": (now_ms if (not fills_saturated or accept_hole) else prior_through),
             "coverage_start_ms": coverage_start_ms,
             "fills_truncated": sticky,
-            "lending_by_token": lending_by_token,
-            "lending_through_ms": now_ms,
+            "lending_by_token": (lending_by_token if lending_known
+                                 else (prior_wm.get("lending_by_token") or {})),
+            "lending_through_ms": (now_ms if lending_known else prior_wm.get("lending_through_ms")),
             "updated_at": now_iso,
         }
-        if fills_saturated:
+        if accept_hole:
+            log.warning("[%s] window capped - hole accepted for an auto-tracked wallet, coverage now starts at %s",
+                        wallet[:10], datetime.fromtimestamp(coverage_start_ms / 1000, tz=timezone.utc).isoformat())
+        elif fills_saturated:
             log.warning("[%s] window incomplete — watermark kept at %s", wallet[:10], prior_through)
         recon["spot_price_source"] = "spotMetaAndAssetCtxs"
         recon["unpriced_held_symbols"] = sorted(s for s in syms
@@ -734,7 +796,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                   len(collisions), dup_within)
         ns_dir.mkdir(parents=True, exist_ok=True)
         (ns_dir / "_reconciliation.json").write_text(json.dumps({
-            "run_at": now_iso, "wallets": wallets, "natural_key_ok": False,
+            "run_at": now_iso, "wallets": processed, "deferred": deferred, "natural_key_ok": False,
             "natural_key_cross_wallet_collisions": collisions[:200],
             "natural_key_duplicates_within_run": dup_within,
             "by_wallet": recon_by_wallet,
@@ -757,7 +819,9 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         return "" if v is None else str(v)
 
     as_of_date = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    l4x_scope = {(as_of_date, w) for w in wallets}
+    # only wallets that produced a snapshot this run: a deferred or skipped wallet keeps
+    # its earlier rows for today instead of having them wiped by an empty replace
+    l4x_scope = {(as_of_date, w) for w in run_wallets}
     upsert_csv(ns_dir / "l1_wallet_ledger.csv", S.L1_WALLET_LEDGER_COLUMNS, all_l1,
                key_fn=lambda r: (s(r["tx_hash"]), s(r["event_index"]), s(r["direction"])),
                sort_fn=lambda r: (s(r["block_timestamp"]), s(r["tx_hash"]), int(r["event_index"])))
@@ -864,7 +928,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     prev_by_wallet.update(recon_by_wallet)
     recon = {
         "run_at": now_iso,
-        "wallets": wallets,
+        "wallets": processed,
+        "deferred": deferred,
         "natural_key_cross_wallet_collisions": collisions,
         "natural_key_duplicates_within_run": dup_within,
         "natural_key_ok": not collisions and dup_within == 0,

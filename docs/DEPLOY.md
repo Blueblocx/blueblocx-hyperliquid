@@ -95,7 +95,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.0.1 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.1.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -118,8 +118,19 @@ sudo mkdir -p /etc/hypercore
 sudo cp /opt/blueblocx-hyperliquid/deploy/.env.example /etc/hypercore/hypercore.env
 sudo chown root:hypercore /etc/hypercore/hypercore.env && sudo chmod 640 /etc/hypercore/hypercore.env
 sudoedit /etc/hypercore/hypercore.env            # fill in the values
-printf '%s\n' 0x... 0x... | sudo tee /etc/hypercore/wallets.txt     # one address per line, # comments ok
+printf '%s\n' 0x... 0x... | sudo tee /etc/hypercore/wallets.txt     # optional PINS: one address per line, # comments ok
 ```
+
+**Which wallets.** The Info API is per address, so a run works from a list. It is
+the union of the **pins** in `wallets.txt` (customer / watchlist wallets, always
+first, may be empty) and — with `HL_TRACKED_SOURCE=leaderboard` — the **tracked
+set** the TS platform-backend sweeps live: the top 100 leaderboard rows by account
+value plus up to 50 smart-money rows (account value ≥ 100k, 30-day roi ≥ 20 %,
+30-day volume ≥ 5M, ranked by 30-day pnl). It is refreshed from the stats host at
+the start of every run (~39 MB, no Info API weight), cached in
+`$HL_OUT_DIR/hypercore/_tracked_wallets.json`, and the automatic part is rotated
+so wallets deferred by the soft deadline run first next hour. Nothing has to be
+typed for the tracked set; pins are for wallets the product must have complete.
 
 Every variable is documented in `blueblocx_hyperliquid/config.py` (`ENV_VARS`); the important ones:
 
@@ -128,6 +139,9 @@ Every variable is documented in `blueblocx_hyperliquid/config.py` (`ENV_VARS`); 
 | `HL_OUT_DIR` | `/var/lib/hypercore` — the state directory (watermarks, staged CSVs, run summaries) on a local disk, never the NAS mount. Back it up or accept re-pulling on loss (see §9) |
 | `HL_WEIGHT_BUDGET` | `600` if anything else on this IP polls Hyperliquid, else up to `900` |
 | `HL_RETENTION_DAYS` | `45` (≥ 31; the 30-day analytics windows read the staged CSV) |
+| `HL_WALLETS_FILE` | `/etc/hypercore/wallets.txt` — the pins; an API-capped window on a pin is a hard problem, on a tracked wallet a warning |
+| `HL_TRACKED_SOURCE` | `leaderboard` (the automatic set above); `HL_WHALE_TOP_N` / `HL_SMART_TOP_N` / `HL_SMART_MIN_*` mirror the TS constants, `HL_TRACKED_MAX_AGE_HOURS` (48) bounds how long a cached set is reused when the stats host is down |
+| `HL_RUN_SOFT_DEADLINE_MIN` | `35` on the hourly cadence (service timeout 50 min): after it no new wallet is started and the rest of the list is deferred to the next run; `0` on the daily cadence |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | the new scoped key from §0 |
 | `HL_CATALOG_URI` + `WAREHOUSE` | **standalone host**: PostgreSQL catalog URL + `file:///mnt/<nas>/hypercore/warehouse` (see "Standalone host" below). No Nessie, no object store |
 | `NESSIE_URI`, `NESSIE_BRANCH`, `WAREHOUSE`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | **shared atlas lake** instead: the same values the atlas Rust services use (`services/rust/*/.env.example`). With neither set the pipeline falls back to a local SQLite catalog under `HL_OUT_DIR/iceberg` that is for dry runs only |
@@ -159,11 +173,14 @@ Standalone host without an AWS key: drop `--s3` here and `--s3-backfill` in §5
 | `clock` (WARN) | host clock > 60 s off HL's — fix NTP before scheduling |
 | `s3` | the IAM key is invalid/rotated, or the policy lacks `s3:GetObject` with requester-pays; `--s3` makes a missing key a FAIL |
 | `iceberg` | the REST catalog is unreachable or rejects the credentials; the S3 endpoint it advertises cannot be reached from this host (fix Nessie `external-endpoint`); the effective FileIO needs a package that is not installed; `--iceberg` makes "no `NESSIE_URI`" a FAIL. `WARN missing […]` is fine on the first run (tables are created from the DDL) |
+| `tracked` | only misconfiguration: unknown `HL_TRACKED_SOURCE` or a non-numeric tracked-set setting. An unreachable or odd-looking stats host is a **WARN** that says what the run will do (cached set within `HL_TRACKED_MAX_AGE_HOURS` → `tracked_stale`; else pins only → `tracked_unavailable`) — this check runs as `ExecStartPre`, so a FAIL would block exactly that fallback |
+| `soft_deadline` | `HL_RUN_SOFT_DEADLINE_MIN` negative or non-numeric; WARN at ≥ 50 (the hourly drop-in kills a run at 50 min, so there it would never fire) |
 
 ## 5. First run — small, then full
 
-Run two or three wallets for a two-day window and read the evidence before
-scheduling anything:
+Optional but recommended: run two or three wallets (any you care about, or the demo
+wallets in the README) for a two-day window and read the evidence before scheduling
+anything — the scheduled run itself needs no wallet input when the tracked set is on:
 
 ```bash
 cd /opt/blueblocx-hyperliquid
@@ -286,10 +303,30 @@ lazy re-fetch when the net-worth oracle fails — a code change not made yet
 
 Rules for hourly operation:
 
-- **Onboard new wallets by hand** (`python -m blueblocx_hyperliquid.extract --wallet 0x… --days 2 --incremental --iceberg --s3-backfill`),
-  never by adding them to the timer's list: a wallet with no watermark gets a
-  2-day window, a market-maker-class one then needs an S3 backfill that can
-  outlast the 50-min cap, and a killed run saves nothing.
+- **Capacity is set by the soft deadline, not by the kill cap.** Wallet starts
+  share `HL_RUN_SOFT_DEADLINE_MIN × HL_WEIGHT_BUDGET` weight (35 × 900 ≈ 31,500;
+  the ~45,000 of a 50-minute run is only the kill cap). Measured 2026-10-13: 100
+  whales + 50 smart-money wallets = 149 addresses (1 overlap); the whales' median
+  30-day volume is 0 (passive capital, light class) and 11 of the 149 trade ≥ $1B a
+  month (market-maker class). Steady state ≈ 149 × 165–200 ≈ 25–30k, inside the
+  window; a market-maker-class wallet costs ~1k only in its first hour (its 2-day
+  window hits the 10k-fill cap once, the hole is accepted, and from then on it is
+  light). An occasional `deferred=N` is normal; every hour means the list has
+  outgrown the slot. One wallet's own pull is never interrupted, so the 15-minute
+  margin covers the wallet in flight, phase 2 (its one unbounded call, the lazy
+  full-ledger pull, is itself skipped once the deadline has passed and retried
+  next run) and the lift.
+- **Tracked wallets onboard themselves** (a wallet with no watermark gets a 2-day
+  window) and are never S3-backfilled by the scheduled run. An API-capped window
+  on a tracked wallet is **accepted as a hole**: `<w>:fills_truncated` is a
+  warning for that run, coverage restarts at the oldest fill returned (the 7d/30d
+  windows stay `*_complete=false` until genuinely covered), the watermark advances
+  and the wallet is light from the next hour. **Pins keep the repair semantics**:
+  the watermark is held until an S3 backfill completes the window, and the
+  incomplete window is a hard problem — so pin a market-maker-class wallet by hand
+  with a backfill first
+  (`python -m blueblocx_hyperliquid.extract --wallet 0x… --days 2 --incremental --iceberg --s3-backfill`),
+  because that backfill can outlast the 50-min cap inside a scheduled run.
 - A killed or OOM-killed run can no longer block the next tick: the lock
   records the PID and is discarded when that process is gone (`HL_LOCK_STALE_HOURS=2`
   is the age fallback), SIGTERM from the timeout unwinds cleanly, and a lock
@@ -400,11 +437,19 @@ appends one line to `_run_history.jsonl`. Exit code and summary agree:
 | `<w>:networth_oracle` | net worth ≠ HL `allTime` by > 1 % / $2 | a component we do not value (new token, new lending market) — see `unvalued_*` in the reconciliation |
 | `<w>:fills_truncated` | window incomplete: API cap hit and S3 backfill missing/incomplete | ensure `--s3-backfill` + valid key; hour files publish ~1 h late — the next run completes it |
 | `<w>:fetch_errors=…` | a non-core pull (staking / vaults / open orders / a dex) failed | net worth may be understated for that run |
+| `tracked_unavailable` | the leaderboard could not be fetched and no cached set was within `HL_TRACKED_MAX_AGE_HOURS`; the run covered the pins only | check that `stats-data.hyperliquid.xyz` is reachable; the next run retries |
 | `error:…` | the run raised | `journalctl -u hypercore-daily` has the traceback |
 
-`warnings` (`pnl_oracle`, `unmapped_ledger_types`, `unpriced`) do not fail the
-run but are in the alert text; promote `pnl_oracle` to hard once it has been
-stable for a few weeks on your wallet set.
+`warnings` do not fail the run but are in the alert text: `pnl_oracle`,
+`unmapped_ledger_types`, `unpriced`; `<w>:fills_truncated` for an **auto-tracked**
+wallet (its API-capped window stays incomplete without S3 backfill — for a pin the
+same thing is a hard problem); `tracked_stale=Xh` (the cached tracked set was used);
+`deferred=N` (the soft deadline left N wallets for the next run — fine now and
+then; every hour means the list has outgrown the slot: raise `HL_WEIGHT_BUDGET`
+toward 1100 if nothing else uses the IP, lower `HL_WHALE_TOP_N`, or add an egress
+IP). The summary's `tracked` object records the source (`fresh` / `cache` / `none`),
+the pin / auto / planned counts and the rotation cursor. Promote `pnl_oracle` to
+hard once it has been stable for a few weeks on your wallet set.
 
 Logs go to stderr (journald under systemd); `HL_LOG_JSON=1` for one JSON object
 per line.

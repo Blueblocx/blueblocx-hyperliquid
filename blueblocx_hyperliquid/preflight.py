@@ -167,8 +167,27 @@ def check_env(env_file: Path | None) -> list[Check]:
     try:
         config.env_int("HL_HTTP_TIMEOUT")
         float(config.env("HL_LOCK_STALE_HOURS"))
+        config.env_int("HL_WHALE_TOP_N")
+        config.env_int("HL_SMART_TOP_N")
+        for k in ("HL_SMART_MIN_ACCOUNT_VALUE", "HL_SMART_MIN_MONTH_ROI", "HL_SMART_MIN_MONTH_VLM",
+                  "HL_TRACKED_MAX_AGE_HOURS"):
+            config.env_float(k)
     except ValueError as e:
         out.append(_fail("env_numeric", str(e)))
+    try:
+        dl = config.env_float("HL_RUN_SOFT_DEADLINE_MIN")
+        if dl < 0:
+            out.append(_fail("soft_deadline", f"HL_RUN_SOFT_DEADLINE_MIN={dl:g} - must be >= 0"))
+        elif dl == 0:
+            out.append(_ok("soft_deadline", "off - a run that outlives the service timeout is killed whole"))
+        elif dl >= 50:
+            out.append(_warn("soft_deadline", f"{dl:g} min - at or above the 50-minute cap of the hourly drop-in "
+                                              f"(deploy/hourly-override.conf), where it would never fire before "
+                                              f"the kill; only meaningful on the daily cadence (4 h timeout)"))
+        else:
+            out.append(_ok("soft_deadline", f"{dl:g} min, then the rest of the list is deferred to the next run"))
+    except ValueError as e:
+        out.append(_fail("soft_deadline", str(e)))
     desc = config.describe_env()
     secrets_set = sorted(k for k in config.SECRET_VARS if desc[k]["set"])
     out.append(_ok("secrets", "set: " + (", ".join(secrets_set) if secrets_set else "none") + " (values not shown)"))
@@ -179,9 +198,15 @@ def check_env(env_file: Path | None) -> list[Check]:
 
 
 def check_wallets(path: Path | None) -> Check:
+    tracked_src = config.env("HL_TRACKED_SOURCE").strip().lower() == "leaderboard"
+    suffix = " + the leaderboard tracked set" if tracked_src else ""
     if path is None:
+        if tracked_src:
+            return _ok("wallets", "no pins file; the leaderboard tracked set is the whole list")
         return _skip("wallets", "no --wallets-file / HL_WALLETS_FILE")
     if not path.is_file():
+        if tracked_src:
+            return _warn("wallets", f"pins file {path} not found - leaderboard tracked set only")
         return _fail("wallets", f"{path} not found")
     from .daily import read_wallets
     wallets = read_wallets(path)
@@ -190,11 +215,64 @@ def check_wallets(path: Path | None) -> Check:
     if bad:
         return _fail("wallets", f"{path}: {len(bad)} invalid address(es), e.g. {bad[0][:20]!r}")
     if not wallets:
-        return _warn("wallets", f"{path}: empty")
-    detail = f"{path}: {len(wallets)} wallet(s)"
+        if tracked_src:
+            return _ok("wallets", f"{path}: no pins{suffix}")
+        return _warn("wallets", f"{path}: empty - nothing to pull (set HL_TRACKED_SOURCE=leaderboard or add addresses)")
+    detail = f"{path}: {len(wallets)} pinned wallet(s){suffix}"
     if dupes:
         return _warn("wallets", detail + f", {dupes} duplicate line(s)")
     return _ok("wallets", detail)
+
+
+def check_tracked(*, offline: bool, out_dir: Path, get=None) -> Check:
+    """HL_TRACKED_SOURCE=leaderboard: the stats host answers with the leaderboard
+    payload; report the cached set (age, sizes) so a stale cache is visible.
+
+    Only misconfiguration FAILS. An unreachable or odd-looking stats host is a WARN:
+    this check runs as ExecStartPre, and the runner itself degrades (cached set within
+    HL_TRACKED_MAX_AGE_HOURS -> tracked_stale; else pins only + tracked_unavailable,
+    exit 1 + webhook) - a FAIL here would block exactly that path."""
+    src = config.env("HL_TRACKED_SOURCE").strip().lower()
+    if not src:
+        return _skip("tracked", "HL_TRACKED_SOURCE unset: the wallets file is the whole list")
+    if src != "leaderboard":
+        return _fail("tracked", f"HL_TRACKED_SOURCE={src!r} - supported: leaderboard (or empty)")
+    from . import schema as S
+    from . import tracked as T
+    try:
+        s = T.settings()
+    except ValueError as e:
+        return _fail("tracked", str(e))
+    cached = T.load_cached(out_dir / S.NS_HYPERCORE)
+    cache_note, age_h = "", None
+    if isinstance(cached.get("whales"), list):
+        age_h = (time.time() - float(cached.get("fetched_at_ts") or 0)) / 3600.0
+        cache_note = (f"; cache: {len(cached.get('whales') or [])} whales + {len(cached.get('smart') or [])} smart, "
+                      f"{age_h:.1f} h old (reused up to {s['max_age_h']:g} h)")
+    if age_h is not None and 0 <= age_h <= s["max_age_h"]:
+        fallback = " - the run would reuse the cached set and report tracked_stale"
+    else:
+        fallback = " - no cached set within the limit: the run would cover the pins only and report tracked_unavailable"
+    rules = f"whales top {s['whale_top_n']} by account value + smart top {s['smart_top_n']} by 30d pnl"
+    if offline:
+        return _skip("tracked", f"offline; {s['url']}; {rules}{cache_note}")
+    if get is None:
+        import requests
+        get = requests.get
+    t0 = time.monotonic()
+    try:
+        r = get(s["url"], stream=True, timeout=(10, 30))
+        try:
+            r.raise_for_status()
+            head = next(r.iter_content(4096), b"")
+        finally:
+            r.close()
+    except Exception as e:  # noqa: BLE001
+        return _warn("tracked", f"{s['url']}: {type(e).__name__}: {str(e)[:120]}{cache_note}{fallback}")
+    if b"leaderboardRows" not in head:
+        return _warn("tracked", f"{s['url']}: unexpected payload (no leaderboardRows){cache_note}{fallback}")
+    return _ok("tracked", f"leaderboard reachable ({(time.monotonic() - t0) * 1000:.0f} ms to first bytes); "
+                          f"{rules}{cache_note}")
 
 
 # --- network checks -----------------------------------------------------------------------
@@ -412,6 +490,7 @@ def run_checks(*, offline: bool = False, require_s3: bool = False, require_icebe
                            check_out_dir(out_dir or config.out_root())]
     checks += check_env(env_file)
     checks.append(check_wallets(wallets_file))
+    checks.append(check_tracked(offline=offline, out_dir=out_dir or config.out_root()))
     if offline:
         checks += [_skip("hl_api", "offline"), _skip("s3", "offline"),
                    check_iceberg(require_iceberg) if not os.environ.get("NESSIE_URI") else _skip("iceberg", "offline"),

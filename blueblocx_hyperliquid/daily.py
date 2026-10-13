@@ -8,16 +8,24 @@ Order of operations:
   1. load .env + logging; install a SIGTERM handler (a systemd timeout must still
      release the lock and write a summary); take the single-flight lock
      (HL_OUT_DIR/hypercore/.daily.lock)
-  2. extract.run(...) over the wallet list — incremental (per-wallet watermark, 1h
+  2. decide the wallet list (tracked.py): the pinned wallets from --wallets-file
+     first, then - with HL_TRACKED_SOURCE=leaderboard - the leaderboard tracked set
+     (top whales by account value + smart money, the same definition the TS
+     platform-backend sweeps live), refreshed now or taken from the cache, rotated
+     by the saved cursor
+  3. extract.run(...) over that list - incremental (per-wallet watermark, 1h
      overlap), HIP-3 dexes, today's l4x snapshot (replace-partition), S3 backfill
-     for API-capped wallets, lift into Iceberg, staged-CSV retention (once a day)
-  3. build the run summary (hard problems vs warnings — see ops.build_summary),
+     for API-capped wallets, lift into Iceberg, staged-CSV retention (once a day);
+     with HL_RUN_SOFT_DEADLINE_MIN the tail of the list is deferred to the next run
+     instead of the service timeout killing everything
+  4. build the run summary (hard problems vs warnings - see ops.build_summary),
      POST the alert webhook (deduplicated: an unchanged problem set repeats only
      every HL_ALERT_REPEAT_HOURS), write _run_summary.json, append _run_history.jsonl
 
-Exit codes: 0 clean · 1 problems or error (details in _run_summary.json) · 2 bad
-configuration (wallet list missing/empty) · 3 another run holds the lock (also
-summarised and alerted, so a stuck lock is never silent).
+Exit codes: 0 clean · 1 problems or error (details in _run_summary.json; includes a
+tracked set that could not be refreshed) · 2 bad configuration (wallet list
+missing/empty with no tracked source, unknown HL_TRACKED_SOURCE) · 3 another run
+holds the lock (also summarised and alerted, so a stuck lock is never silent).
 The dagster asset template in deploy/dagster_hypercore_assets.py wraps this.
 """
 from __future__ import annotations
@@ -28,14 +36,16 @@ import signal
 import sys
 from pathlib import Path
 
-from . import config, extract, ops
+from . import config, extract, ops, tracked
 from . import schema as S
 
 log = logging.getLogger("blueblocx_hyperliquid.daily")
 
 
-class Terminated(Exception):
-    """SIGTERM/SIGINT received: unwind so the lock is released and a summary is written."""
+class Terminated(BaseException):
+    """SIGTERM/SIGINT received: unwind so the lock is released and a summary is written.
+    A BaseException (like KeyboardInterrupt) so no `except Exception` on the way - the
+    Info API retry loop, the leaderboard refresh, a guarded pull - can swallow it."""
 
 
 def _raise_terminated(signum, _frame):
@@ -66,7 +76,8 @@ def main(argv=None) -> int:
     config.load_env()
     config.setup_logging()
     ap = argparse.ArgumentParser(description="HyperCore scheduled extract for a wallet list")
-    ap.add_argument("--wallets-file", default=config.env("HL_WALLETS_FILE") or "wallets.txt")
+    ap.add_argument("--wallets-file", default=config.env("HL_WALLETS_FILE") or "wallets.txt",
+                    help="pinned wallets, always pulled first; optional with HL_TRACKED_SOURCE=leaderboard")
     ap.add_argument("--days", type=int, default=2, help="window for a wallet with no watermark yet")
     ap.add_argument("--iceberg", action="store_true", help="lift into Iceberg (REST / SQL / local catalog)")
     ap.add_argument("--s3-backfill", action="store_true", help="complete API-capped windows from S3 node data")
@@ -74,16 +85,26 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=4, help="concurrent Info API calls per wallet")
     ap.add_argument("--retention-days", type=int, default=config.env_int("HL_RETENTION_DAYS"),
                     help="prune staged l1/l3/l4x CSV rows older than this after a successful lift (0 = never)")
+    ap.add_argument("--deadline-min", type=float, default=config.env_float("HL_RUN_SOFT_DEADLINE_MIN"),
+                    help="start no new wallet after this many minutes; the rest are deferred to the next run (0 = off)")
     ap.add_argument("--out", default=str(config.out_root()))
     ap.add_argument("--no-alert", action="store_true", help="never POST the webhook")
     args = ap.parse_args(argv)
 
+    source = config.env("HL_TRACKED_SOURCE").strip().lower()
+    if source not in ("", "leaderboard"):
+        log.error("HL_TRACKED_SOURCE=%r - supported: leaderboard (or empty = wallets file only)", source)
+        return 2
     wallets_path = Path(args.wallets_file)
-    if not wallets_path.is_file():
+    pins: list[str] = []
+    if wallets_path.is_file():
+        pins = read_wallets(wallets_path)
+    elif not source:
         log.error("wallet list not found: %s", wallets_path)
         return 2
-    wallets = read_wallets(wallets_path)
-    if not wallets:
+    else:
+        log.warning("no pins file at %s - tracked set only", wallets_path)
+    if not pins and not source:
         log.error("no wallets in %s", wallets_path)
         return 2
     out_dir = Path(args.out)
@@ -99,12 +120,28 @@ def main(argv=None) -> int:
     started = ops.utcnow()
     recon, error, rc = None, None, 1
     lock_held = False
+    wallets, auto, cursor, tracked_meta = list(dict.fromkeys(pins)), [], 0, None
     try:
         with ops.RunLock(ns_dir / ".daily.lock"):
+            if source == "leaderboard":
+                sets, tracked_meta = tracked.refresh_tracked(ns_dir)
+                cursor = tracked.load_cursor(ns_dir)
+                wallets, auto = tracked.plan_wallets(pins, sets, cursor)
+                log.info("wallet plan: %d pinned + %d tracked (%d whales, %d smart; %s), cursor %d",
+                         len(wallets) - len(auto), len(auto), len(sets.get("whales") or []),
+                         len(sets.get("smart") or []), tracked_meta.get("source"), cursor)
+                if not wallets:
+                    raise RuntimeError(f"tracked set unavailable ({tracked_meta.get('error')}) "
+                                       f"and no pinned wallets in {wallets_path}")
+            deadline_ts = (started.timestamp() + args.deadline_min * 60.0
+                           if args.deadline_min and args.deadline_min > 0 else None)
             recon = extract.run(wallets, args.days, out_dir, with_prices=args.with_prices,
                                 max_workers=args.workers, s3_backfill=args.s3_backfill,
                                 iceberg=args.iceberg, incremental=True,
-                                retention_days=args.retention_days)
+                                retention_days=args.retention_days, deadline_ts=deadline_ts,
+                                soft_wallets=set(auto))
+            if auto:
+                tracked.save_cursor(ns_dir, tracked.advance_cursor(auto, cursor, set(recon.get("wallets") or [])))
     except ops.LockHeld as e:
         log.error("%s", e)
         error, lock_held, rc = f"LockHeld: {str(e)[:300]}", True, 3
@@ -115,7 +152,16 @@ def main(argv=None) -> int:
         log.exception("run failed")
         error = f"{type(e).__name__}: {str(e)[:300]}"
 
-    summary = ops.build_summary(recon, wallets, started, ops.utcnow(), error=error, options=options)
+    summary = ops.build_summary(recon, wallets, started, ops.utcnow(), error=error, options=options,
+                                deferred=(recon or {}).get("deferred"), soft_wallets=set(auto))
+    if tracked_meta is not None:
+        summary["tracked"] = {**tracked_meta, "pins": len(wallets) - len(auto), "auto": len(auto),
+                              "planned": len(wallets), "cursor": cursor}
+        if tracked_meta.get("source") == "cache":
+            summary["warnings"].append(f"tracked_stale={tracked_meta.get('age_h')}h")
+        elif tracked_meta.get("source") == "none" and recon is not None:
+            summary["problems"].append("tracked_unavailable")
+            summary["ok"] = False
     if lock_held:
         summary["lock_held"] = True
     previous = _read_previous_summary(ns_dir)
@@ -128,8 +174,8 @@ def main(argv=None) -> int:
         summary["alert_sent_at"] = previous.get("alert_sent_at")
         summary["alert_suppressed"] = True
     path = ops.write_summary(ns_dir, summary)
-    log.info("run done: ok=%s wallets ok=%d/%d problems=%s warnings=%d summary=%s",
-             summary["ok"], summary["wallets_ok"], summary["wallets_total"],
+    log.info("run done: ok=%s wallets ok=%d/%d deferred=%d problems=%s warnings=%d summary=%s",
+             summary["ok"], summary["wallets_ok"], summary["wallets_total"], summary["wallets_deferred"],
              summary["problems"], len(summary["warnings"]), path)
     if summary["ok"]:
         return 0
