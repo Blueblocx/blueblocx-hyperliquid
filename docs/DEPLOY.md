@@ -95,7 +95,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.1.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.1.1 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -252,8 +252,12 @@ Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
 - **Guards.** The systemd unit has `RequiresMountsFor=/mnt/blueblocx` and
   `ReadWritePaths=… /mnt/blueblocx/hypercore` (with `ProtectSystem=strict` the
   NAS would otherwise be read-only inside the unit); `HL_WAREHOUSE_MOUNT` makes
-  the run refuse to start when the path is not on that mount instead of
-  quietly creating the warehouse on the root disk.
+  the run refuse to start when the path is not on that filesystem instead of
+  quietly creating the warehouse on the root disk. Inside the unit every
+  `ReadWritePaths` entry is its own bind mount, so `/proc/mounts` shows the
+  warehouse directory as a separate nfs4 mount below `/mnt/blueblocx`; the guard
+  accepts a nested mount of the same filesystem type and rejects a bind mount of
+  the root disk (what you get when the NAS is not mounted).
 - **Readers.** pyiceberg or DuckDB ≥ 1.5 on this host (DuckDB: read
   `metadata_location` from `iceberg_tables` and `iceberg_scan()` it — pyiceberg
   writes no `version-hint.text`). Another host can mount the same export at the

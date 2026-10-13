@@ -418,21 +418,20 @@ def ensure_table(catalog, namespace: str, name: str, spec: dict, tz: bool = True
     return table
 
 
-def require_warehouse_mount(wh_path: Path) -> None:
+def require_warehouse_mount(wh_path: Path, mounts_text: str | None = None) -> None:
     """Fail fast when HL_WAREHOUSE_MOUNT is set and the warehouse path is not on that
-    mount: with the NAS unmounted, mkdir would quietly create the directory on the
-    root disk and the catalog would start pointing at files that vanish when the
-    mount comes back. No-op when the mount table is unavailable (Windows)."""
+    filesystem: with the NAS unmounted, mkdir would quietly create the directory on
+    the root disk and the catalog would start pointing at files that vanish when the
+    mount comes back. Inside the systemd unit the warehouse shows up as its own
+    ReadWritePaths bind mount below the NAS mount point; ops.warehouse_mount_check
+    accepts that. No-op when the mount table is unavailable (Windows)."""
     expected = (os.environ.get("HL_WAREHOUSE_MOUNT") or "").rstrip("/")
     if not expected:
         return
-    from .ops import mount_fstype
-    found = mount_fstype(wh_path.as_posix())
-    if found is None:
-        return
-    if found[0].rstrip("/") != expected:
-        raise RuntimeError(f"warehouse {wh_path} is on mount {found[0]} ({found[1]}), expected "
-                           f"HL_WAREHOUSE_MOUNT={expected} - is the NAS mounted?")
+    from .ops import warehouse_mount_check
+    reason = warehouse_mount_check(wh_path.as_posix(), expected, mounts_text)
+    if reason:
+        raise RuntimeError(f"{reason} (HL_WAREHOUSE_MOUNT={expected})")
 
 
 def conform(arrow: pa.Table, table) -> pa.Table:

@@ -66,6 +66,65 @@ def mount_fstype(target: str, mounts_text: str | None = None) -> tuple[str, str]
     return best
 
 
+def mount_entries(mounts_text: str | None = None) -> list[tuple[str, str, str]] | None:
+    """(source, mount_point, fstype) per /proc/mounts line, in table order. None when
+    the table is unavailable (Windows, macOS)."""
+    if mounts_text is None:
+        try:
+            mounts_text = Path("/proc/mounts").read_text(encoding="utf-8")
+        except OSError:
+            return None
+    out: list[tuple[str, str, str]] = []
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            out.append((parts[0], parts[1].replace("\\040", " "), parts[2]))
+    return out
+
+
+def warehouse_mount_check(target: str, expected: str, mounts_text: str | None = None) -> str | None:
+    """None when `target` lives on the filesystem mounted at `expected`, else the reason.
+
+    Written for the mount table as seen from inside a systemd unit with
+    ProtectSystem=strict + ReadWritePaths: every ReadWritePaths entry is its own bind
+    mount, so the warehouse's longest-prefix mount is e.g. /mnt/blueblocx/hypercore
+    (same source and fstype as /mnt/blueblocx), not the NAS mount point itself. Rules:
+      1. something must be mounted at `expected`;
+      2. that mount must be a separate filesystem, not a bind mount of the root disk
+         (same source as `/`, non-network fstype) - the NAS-unmounted case;
+      3. the warehouse's own mount is `expected`, or nested below it with the same
+         fstype (a ReadWritePaths bind mount, or a nested export of the same NAS).
+    Returns None without a mount table (Windows: nothing to check)."""
+    entries = mount_entries(mounts_text)
+    if entries is None:
+        return None
+    expected = expected.rstrip("/") or "/"
+    target = target.rstrip("/") or "/"
+    root = next((e for e in entries if e[1] == "/"), None)
+    at_expected = [e for e in entries if (e[1].rstrip("/") or "/") == expected]
+    if not at_expected:
+        return f"nothing is mounted at {expected} - is the NAS mounted?"
+    exp_src, _, exp_fs = at_expected[-1]            # the latest mount at that point wins
+    if exp_fs not in _NETWORK_FS and root is not None and exp_src == root[0]:
+        return (f"{expected} is a bind mount of the root disk ({exp_fs}, {exp_src}), not a separate "
+                f"filesystem - is the NAS mounted?")
+    best: tuple[str, str, str] | None = None
+    for src, mp, fs in entries:
+        mp_n = mp.rstrip("/") or "/"
+        if mp_n == "/" or target == mp_n or target.startswith(mp_n + "/"):
+            if best is None or len(mp_n) >= len(best[1].rstrip("/") or "/"):
+                best = (src, mp_n, fs)
+    if best is None:
+        return f"no mount contains {target}"
+    best_src, best_mp, best_fs = best
+    if best_mp == expected:
+        return None
+    if best_mp.startswith(expected + "/") and best_fs == exp_fs:
+        return None
+    return (f"warehouse {target} is on mount {best_mp} ({best_fs}, {best_src}), not on {expected} "
+            f"({exp_fs}) - is the NAS mounted there?")
+
+
 def pid_alive(pid: int) -> bool | None:
     """True/False on Linux (via /proc), None where it cannot be told. Never uses
     os.kill(pid, 0): on Windows that terminates the target."""

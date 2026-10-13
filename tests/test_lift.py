@@ -317,20 +317,46 @@ class CommitFanOutTests(unittest.TestCase):
 
 
 class WarehouseMountTests(unittest.TestCase):
+    ROOT_ONLY = "/dev/nvme0n1p5 / ext4 rw,relatime 0 0\n"
+    NAS = ROOT_ONLY + "192.168.1.121:/volume1/blueblocx /mnt/blueblocx nfs4 rw,vers=4.1 0 0\n"
+    WH = Path("/mnt/blueblocx/hypercore/warehouse")
+
     def test_require_warehouse_mount(self):
-        from blueblocx_hyperliquid import ops
         with mock.patch.dict(os.environ, {"HL_WAREHOUSE_MOUNT": "/mnt/blueblocx"}):
-            with mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
-                with self.assertRaises(RuntimeError) as cm:
-                    il.require_warehouse_mount(Path("/mnt/blueblocx/hypercore/warehouse"))
-                self.assertIn("is the NAS mounted", str(cm.exception))
-            with mock.patch.object(ops, "mount_fstype", return_value=("/mnt/blueblocx", "nfs4")):
-                il.require_warehouse_mount(Path("/mnt/blueblocx/hypercore/warehouse"))      # no raise
-            with mock.patch.object(ops, "mount_fstype", return_value=None):
-                il.require_warehouse_mount(Path("/mnt/blueblocx/hypercore/warehouse"))      # Windows: no table
+            with self.assertRaises(RuntimeError) as cm:
+                il.require_warehouse_mount(self.WH, mounts_text=self.ROOT_ONLY)
+            self.assertIn("nothing is mounted at /mnt/blueblocx", str(cm.exception))
+            self.assertIn("HL_WAREHOUSE_MOUNT=/mnt/blueblocx", str(cm.exception))
+            il.require_warehouse_mount(self.WH, mounts_text=self.NAS)                     # plain host: no raise
+            # inside the systemd unit (ProtectSystem=strict + ReadWritePaths) the warehouse
+            # directory is its own bind mount below the NAS mount point - the production
+            # failure of 2026-10-13: must pass
+            in_unit = (self.NAS.replace("rw,vers=4.1", "ro,vers=4.1")
+                       + "192.168.1.121:/volume1/blueblocx /mnt/blueblocx/hypercore nfs4 rw,vers=4.1 0 0\n"
+                       + "/dev/nvme0n1p5 /var/lib/hypercore ext4 rw 0 0\n")
+            il.require_warehouse_mount(self.WH, mounts_text=in_unit)
+            # NAS unmounted: the ReadWritePaths bind mount of a root-disk directory
+            with self.assertRaises(RuntimeError):
+                il.require_warehouse_mount(self.WH, mounts_text=self.ROOT_ONLY
+                                           + "/dev/nvme0n1p5 /mnt/blueblocx/hypercore ext4 rw 0 0\n")
+            with self.assertRaises(RuntimeError) as cm:
+                il.require_warehouse_mount(self.WH, mounts_text=self.ROOT_ONLY
+                                           + "/dev/nvme0n1p5 /mnt/blueblocx ext4 rw 0 0\n")
+            self.assertIn("bind mount of the root disk", str(cm.exception))
+            # a warehouse path outside the NAS subtree
+            with self.assertRaises(RuntimeError) as cm:
+                il.require_warehouse_mount(Path("/data/warehouse"), mounts_text=self.NAS)
+            self.assertIn("not on /mnt/blueblocx", str(cm.exception))
+            from blueblocx_hyperliquid import ops
+            with mock.patch.object(ops, "mount_entries", return_value=None):
+                il.require_warehouse_mount(self.WH)                                       # Windows: no table
+        with mock.patch.dict(os.environ, {"HL_WAREHOUSE_MOUNT": "/data"}):
+            local = self.ROOT_ONLY + "/dev/sdb1 /data ext4 rw 0 0\n"
+            il.require_warehouse_mount(Path("/data/hypercore/warehouse"), mounts_text=local)   # second disk
+            il.require_warehouse_mount(Path("/data/hypercore/warehouse"),
+                                       mounts_text=local + "/dev/sdb1 /data/hypercore ext4 rw 0 0\n")
         with mock.patch.dict(os.environ, {"HL_WAREHOUSE_MOUNT": ""}):
-            with mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
-                il.require_warehouse_mount(Path("/anything"))                               # unset: no-op
+            il.require_warehouse_mount(Path("/anything"), mounts_text=self.ROOT_ONLY)        # unset: no-op
 
     def test_preflight_fails_when_nas_not_mounted(self):
         from blueblocx_hyperliquid import ops
@@ -339,7 +365,7 @@ class WarehouseMountTests(unittest.TestCase):
             env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
                    "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": "/mnt/blueblocx"}
             with mock.patch.dict(os.environ, env), \
-                    mock.patch.object(ops, "mount_fstype", return_value=("/", "ext4")):
+                    mock.patch.object(ops, "mount_entries", return_value=ops.mount_entries(self.ROOT_ONLY)):
                 c = preflight.check_iceberg(required=True)
             self.assertEqual(c.status, "FAIL")
             self.assertIn("HL_WAREHOUSE_MOUNT=/mnt/blueblocx", c.detail)
