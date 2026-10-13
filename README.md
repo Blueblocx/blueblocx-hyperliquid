@@ -60,6 +60,7 @@ monitoring, upgrade, what still lives in atlas). The pieces:
 | health check | `python -m blueblocx_hyperliquid.preflight [--offline] [--iceberg --s3]` — deps, tzdata, DDL, paths, env sanity, HL API + clock skew, S3 requester-pays, Nessie REST; never prints secrets |
 | scheduler entry point | `python -m blueblocx_hyperliquid.daily` — lock, incremental run, run summary (`_run_summary.json`, `_run_history.jsonl`), webhook alert; exit 0/1/2/3 |
 | wallet list | pins in `HL_WALLETS_FILE` + the automatic tracked set with `HL_TRACKED_SOURCE=leaderboard` (`tracked.py`); `HL_RUN_SOFT_DEADLINE_MIN` defers the tail of a list that outgrows the slot to the next run instead of the service timeout killing the whole run |
+| monitoring | `python -m blueblocx_hyperliquid.status` (`hypercore-status` on the server): running / phase / wallet i/N / STUCK after `HL_STUCK_MINUTES` quiet, last verdict and its age, timers; exit 0/1. Live `_run_progress.json`; webhook on problems; `HL_HEARTBEAT_URL` dead man's switch (healthchecks.io); `deploy/hypercore-failure@.service` posts when a unit fails before the run could report. No daemon: systemd is the controller |
 | scheduling | `deploy/hypercore-daily.{service,timer}` (systemd, daily) or `deploy/hypercore-hourly.timer` + `deploy/hourly-override.conf` (hourly), `deploy/run_daily.sh` + `deploy/crontab.example` (cron), `Dockerfile` (batch image), `deploy/dagster_hypercore_assets.py` (template) |
 | catalog | three modes in `blueblocx_hyperliquid/iceberg_load.py`: **standalone** `HL_CATALOG_URI` (PostgreSQL, or SQLite for a single host) + `WAREHOUSE=file:///…` on a NAS mount guarded by `HL_WAREHOUSE_MOUNT` — no Nessie, no object store; **shared atlas lake** `NESSIE_URI` + S3 store; **dev** SQLite under `HL_OUT_DIR/iceberg` |
 | maintenance | `python -m blueblocx_hyperliquid.maintenance --expire-days 7` (nightly timer in `deploy/`): expires old snapshots so `metadata.json` stays small; lifts are ~14 commits per run regardless of wallet count |
@@ -116,6 +117,7 @@ local catalog), `HYPEREVM_RPC_URL`.
 | `_watermarks.json` | wallet | incremental state: `through_ms`, `coverage_start_ms`, sticky `fills_truncated`, cached lending position |
 | `_lift_state.json` | — | last successful Iceberg lift; the next lift reads only rows updated since (bounded incremental lift) |
 | `_tracked_wallets.json` | — | the leaderboard tracked set of the last refresh (`whales`, `smart`, `fetched_at`) + the rotation `cursor`; reused for `HL_TRACKED_MAX_AGE_HOURS` when the stats host is down |
+| `_run_progress.json` | — | live state of the current run: `state`, `phase` (tracked-set / pull / s3-backfill / analyse / write / lift / finalise), `wallets_done`/`wallets_total`/`wallets_deferred`, `current`, `updated_at`; read by `status` |
 
 ### Validation
 1. **Mapping fidelity (raw vs mapped)**: Σ raw `closedPnl` == Σ `perp_realized_pnl`

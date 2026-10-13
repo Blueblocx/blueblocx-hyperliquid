@@ -1,0 +1,37 @@
+# /etc/systemd/system/hypercore-failure@.service
+#
+# Instantiated by `OnFailure=hypercore-failure@%n.service` in the hypercore units.
+# Posts to HL_ALERT_WEBHOOK_URL (and, for the data run, pings HL_HEARTBEAT_URL/fail)
+# when a unit failed WITHOUT the run writing its own summary: preflight FAIL in
+# ExecStartPre, a crash before the summary, a SIGKILL after the stop timeout, a venv
+# whose pipeline dependencies (pyarrow, pyiceberg, boto3) no longer import. A data
+# run that reported itself within the last 5 minutes (exit 1 with a summary + its
+# own webhook) keeps this hook quiet, so nothing is alerted twice; the maintenance
+# unit writes no summary, so its failure always posts.
+#
+#   sudo cp deploy/hypercore-failure@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   # Webhook-only test, as a member of group hypercore, from /opt/blueblocx-hyperliquid
+#   # (the empty HL_HEARTBEAT_URL keeps the real healthchecks check untouched):
+#   HL_ENV_FILE=/etc/hypercore/hypercore.env HL_HEARTBEAT_URL= \
+#     .venv/bin/python -m blueblocx_hyperliquid.notify --failed-unit test --grace-minutes 0
+#   # `systemctl start hypercore-failure@hypercore-daily.service.service` is NOT a dry
+#   # run: it also GETs HL_HEARTBEAT_URL/fail (healthchecks shows DOWN until the next
+#   # clean run) and stays quiet when a run wrote its summary in the last 5 min.
+[Unit]
+Description=HyperCore failure notifier for %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=hypercore
+Group=hypercore
+WorkingDirectory=/opt/blueblocx-hyperliquid
+EnvironmentFile=/etc/hypercore/hypercore.env
+Environment=HL_ENV_FILE=/etc/hypercore/hypercore.env
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.notify --failed-unit %i
+TimeoutStartSec=2min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

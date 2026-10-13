@@ -95,7 +95,9 @@ def main(argv=None) -> int:
         with ops.RunLock(ns_dir / ".daily.lock"):
             report = run(args.namespace, args.expire_days)
     except ops.LockHeld as e:
-        log.error("%s", e)
+        # a data run holds the lock: yield (exit 3 = SuccessExitStatus in the unit, so no
+        # OnFailure alert); the next nightly tick will do the work
+        log.warning("%s - yielding to the running data run", e)
         return 3
     print(json.dumps(report, indent=2, default=str))
     errors = [t for t, e in report["tables"].items() if "expire_error" in e or "properties_error" in e]

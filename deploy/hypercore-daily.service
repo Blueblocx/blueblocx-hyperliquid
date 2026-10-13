@@ -17,6 +17,9 @@ Wants=network-online.target
 # write the lake onto the root disk (HL_WAREHOUSE_MOUNT in the env file is the
 # second guard: the run refuses to start when the path is not on that mount).
 RequiresMountsFor=/mnt/blueblocx
+# alert when the unit fails before the run could write its own summary (preflight
+# FAIL, crash, kill); a run that reported itself keeps the notifier quiet
+OnFailure=hypercore-failure@%n.service
 
 [Service]
 Type=oneshot
@@ -29,6 +32,10 @@ ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.d
 # a 24h window of S3 hour files for market-maker wallets takes ~35 min; whales with
 # a lazy full-ledger pull add ~10 min. Anything past this is stuck, not slow.
 TimeoutStartSec=4h
+# SIGTERM at TimeoutStartSec must leave the runner time to drop the wallet in flight
+# and write its summary (+ webhook, heartbeat); the 90 s default is too short under
+# a slow API. Hourly: start <= :12 + 50 min + 3 min -> SIGKILL <= :05, next tick :10.
+TimeoutStopSec=3min
 # S3 hour files are parsed one at a time (<= ~330 MB decompressed, ~1.5 GB RSS); the
 # staged l1 CSV is merged in memory on every upsert (~1 KB per row: 45 days of a
 # market-maker wallet is several GB) and the lift keeps the touched partitions' keys.

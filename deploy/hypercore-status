@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# `hypercore-status [--json]` - is the pipeline running, stuck, or was the last run fine?
+# Installed to /usr/local/bin by deploy/bootstrap.sh; works for any user in the hypercore
+# group (the env file and the state directory are group-readable). Exit 0 = healthy.
+cd /opt/blueblocx-hyperliquid || exit 2
+exec env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.status "$@"

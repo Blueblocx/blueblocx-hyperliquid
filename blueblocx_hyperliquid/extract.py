@@ -243,6 +243,24 @@ def merge_rows_by_key(existing: list[dict], new: list[dict]) -> list[dict]:
     return list(merged.values())
 
 
+def _gather(tasks: dict, max_workers: int) -> dict:
+    """Run the pulls concurrently. If a BaseException escapes result() (SIGTERM ->
+    daily.Terminated) cancel the queued pulls and do NOT wait for the in-flight ones:
+    `with ThreadPoolExecutor` would call shutdown(wait=True) and block until every
+    queued call had finished - past systemd's stop timeout on a slow API, which
+    would SIGKILL the runner before it writes its summary. The interpreter joins
+    the leftover workers at exit, after the summary, lock release and heartbeat."""
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futs = {k: pool.submit(fn) for k, fn in tasks.items()}
+        out = {k: f.result() for k, f in futs.items()}
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    return out
+
+
 def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
                   max_workers: int, dexes: list[str] | None = None,
                   need_ledger_all: bool = True) -> dict:
@@ -290,9 +308,7 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
         # watermark; later runs apply only the window's new borrowLend deltas.
         tasks["ledger_all"] = guarded(
             "ledger_all", lambda: client.user_non_funding_ledger_updates(wallet, 0, now_ms), [])
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futs = {k: pool.submit(fn) for k, fn in tasks.items()}
-        out = {k: f.result() for k, f in futs.items()}
+    out = _gather(tasks, max_workers)
     # HIP-3 dexes: query a dex's clearinghouse ONLY if the wallet touched it in
     # this window (fills or funding coin prefixed "dex:"). Funding accrues hourly
     # on every open position, so any open HIP-3 position surfaces in funding for
@@ -310,9 +326,7 @@ def _fetch_wallet(client: InfoClient, wallet: str, start_ms: int, now_ms: int,
     dex_tasks = {f"chs:{dx}": guarded(f"chs:{dx}", (lambda d: lambda: client.clearinghouse_state(wallet, dex=d))(dx), {})
                  for dx in (dexes or []) if dx in touched}
     if dex_tasks:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = {k: pool.submit(fn) for k, fn in dex_tasks.items()}
-            out.update({k: f.result() for k, f in futs.items()})
+        out.update(_gather(dex_tasks, max_workers))
     out["_dexes_queried"] = sorted(touched & set(dexes or []))
     out["_errors"] = errors
     return out
@@ -418,7 +432,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         max_workers: int = 4, max_perp_price_coins: int = 30,
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
         hip3: bool = True, retention_days: int = 0, deadline_ts: float | None = None,
-        soft_wallets: set[str] | None = None) -> dict:
+        soft_wallets: set[str] | None = None, progress=None) -> dict:
     """Pull, map, snapshot, analyse and write every wallet in `wallets` (in order).
 
     deadline_ts (epoch seconds): after it, no further wallet is STARTED and the
@@ -435,9 +449,13 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     wallet is light again next run instead of re-pulling the capped window every
     hour forever. Pinned wallets keep the repair semantics (watermark held until an
     S3 backfill completes the window).
+
+    progress: optional callable taking keyword fields (phase, wallets_done, current,
+    ...) - ops.Progress.update - called at every phase change and before every wallet.
     """
     wallets = [w.lower() for w in wallets]
     soft = {w.lower() for w in (soft_wallets or ())}
+    progress = progress or (lambda **kw: None)
     client = InfoClient()        # HL_INFO_URL / HL_WEIGHT_BUDGET / HL_HTTP_TIMEOUT from the env
     now_iso = _now_iso()
     now_ms = int(time.time() * 1000)
@@ -501,12 +519,15 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     from .s3_backfill import merge_fills as _merge
     pending: list[dict] = []
     deferred: list[str] = []
+    progress(phase="pull", wallets_total=len(wallets), wallets_done=0, current=None)
     for i, wallet in enumerate(wallets):
         if deadline_ts is not None and time.time() >= deadline_ts:
             deferred = wallets[i:]
             log.warning("soft deadline reached after %d of %d wallets - %d deferred to the next run",
                         i, len(wallets), len(deferred))
             break
+        progress(current=wallet, wallets_done=i)
+        t_wallet = time.monotonic()
         prior = watermarks.get(wallet) or {}
         w_start_ms = compute_start_ms(default_start_ms, prior.get("through_ms"))
         # The full ledger history (lending position) is pulled LAZILY in phase 2:
@@ -532,7 +553,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                             fills_saturated=fills_saturated, oldest_api=oldest_api,
                             twap_fills=twap_fills, need_ledger_all=need_ledger_all,
                             s3_report=None))
+        # one line per wallet while pulling: the only sign of life in this phase
+        log.info("[%d/%d] %s pulled in %.1fs: %d fills, %d funding, %d ledger%s",
+                 i + 1, len(wallets), wallet[:10], time.monotonic() - t_wallet, len(fills),
+                 len(d["funding"] or []), len(d["ledger"] or []), " [API cap]" if fills_saturated else "")
     processed = wallets[:len(wallets) - len(deferred)]
+    progress(wallets_done=len(processed), wallets_deferred=len(deferred), current=None)
 
     # ---- phase 1b: ONE shared S3 pass for every truncated wallet -------------------
     # Hour files are per chain, not per wallet: N truncated wallets used to download
@@ -548,10 +574,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                         "coverage restarts at the oldest fill returned", p["wallet"][:10])
     if trunc and s3_backfill:
         from .s3_backfill import fetch_fills_s3
+        progress(phase="s3-backfill")
         config.load_env()
         window = plan_s3_window([(p["w_start_ms"], p["oldest_api"]) for p in trunc])
         if window:
-            res = fetch_fills_s3([p["wallet"] for p in trunc], window[0], window[1])
+            res = fetch_fills_s3([p["wallet"] for p in trunc], window[0], window[1],
+                                 on_file=lambda done, total: progress(detail=f"s3 hour file {done}/{total}"))
             for p in trunc:
                 mine = [f for f in res.fills.get(p["wallet"], [])
                         if p["w_start_ms"] <= int(f.get("time", 0) or 0) < p["oldest_api"]]
@@ -569,13 +597,15 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
     # ---- phase 2: map, snapshot, analyse ---------------------------------------
     # The staged CSVs are read ONCE per run for all wallets (not once per wallet).
+    progress(phase="analyse")
     run_wallets = {p["wallet"] for p in pending}
     disk_rows_by_wallet = (_load_ledger_rows_by_wallet(ns_dir / "l1_wallet_ledger.csv", run_wallets)
                            if incremental else {})
     prior_unreal_by_wallet = _load_prior_unrealized_all(ns_dir / "l4x_perp_position_snapshot.csv",
                                                         run_wallets, now_ms)
-    for p in pending:
+    for k, p in enumerate(pending):
         wallet, prior_wm, w_start_ms, d = p["wallet"], p["prior"], p["w_start_ms"], p["d"]
+        progress(current=wallet, analysed=k, analysed_total=len(pending))
         fills, fills_saturated, twap_fills, s3_report = (p["fills"], p["fills_saturated"],
                                                         p["twap_fills"], p["s3_report"])
         funding, ledger_updates = d["funding"], d["ledger"]
@@ -691,6 +721,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             # the one component only the full ledger history reveals — pull it now
             # (expensive for old whales, hence lazy) and recompute.
             lending_lazy_pull = True
+            progress(current=wallet, detail="ledger_all pull (full history; up to ~10 min on an old whale)")
+            log.info("[%s] lazy ledger_all pull started (full history; up to ~10 min on an old whale)", wallet[:10])
             try:
                 ledger_all = client.user_non_funding_ledger_updates(wallet, 0, now_ms)
                 lending_pulled_ok = True
@@ -712,6 +744,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                 wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
             log.info("[%s] lazy ledger_all pull: lending=%s -> networth_matches=%s",
                      wallet[:10], lending_by_token, oracle.get("networth_matches"))
+            progress(detail=None)
         # the lending position is cached only when it is actually known: from the
         # cache, from a successful full-history pull, or implied by an oracle match
         # (or an unchecked oracle) without it - never after a skipped or failed pull
@@ -776,6 +809,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                  oracle.get("account_value_matches"), oracle.get("networth_matches"),
                  recon["realized_pnl_window"], recon["unrealized_pnl_now"])
 
+    progress(current=None, detail=None)
     if unknown_types_all:
         log.warning("UNMAPPED ledger delta.type(s) — extend _LEDGER_EVENT_TYPE: %s",
                     unknown_types_all)
@@ -815,6 +849,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     } for addr in reg_items]
 
     # --- write (upsert by natural key) -----------------------------------------
+    progress(phase="write")
+
     def s(v):  # key component -> str; None and "" (CSV read-back) compare equal
         return "" if v is None else str(v)
 
@@ -870,6 +906,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         # a daily run costs O(new rows), not O(45 days of staging) over the network.
         lift_state = read_lift_state(ns_dir) if incremental else {}
         prev_lift = lift_state.get("last_success_run_iso")
+        progress(phase="lift")
         iceberg_report = lift_directory(ns_dir, since_iso=since_with_margin(prev_lift))  # raises on failure
         # Staged-CSV retention: the lake now holds these rows durably, so the
         # staging files only need to keep the analytics windows (30d) + margin.
@@ -901,6 +938,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                     retention_days)
 
     # --- incremental watermarks (per wallet) -----------------------------------
+    progress(phase="finalise")
     if incremental:
         atomic_write_text(wm_path, json.dumps(watermarks, indent=2))
 

@@ -75,6 +75,19 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
     "HL_ALERT_REPEAT_HOURS": ("6", False,
                               "re-send the webhook for an UNCHANGED problem set only this often (hourly runs "
                               "would otherwise post 24 times a day)"),
+    "HL_HEARTBEAT_URL": ("", True,
+                         "healthchecks.io-style ping URL: GET after every run (URL/fail when the run had "
+                         "problems). The monitor alerts when no ping arrives in its period, which covers "
+                         "what no in-process alert can: timer disabled, preflight FAIL, host down"),
+    "HL_STUCK_MINUTES": ("15", False,
+                         "`status` reports a running run as STUCK when _run_progress.json has not been "
+                         "updated for this long. The clock also spans one first-time full-ledger lookup "
+                         "(~9 min measured on an old whale), one S3 hour file (~90 s) and the lift, so 10 "
+                         "is the floor, not a value to lower"),
+    "HL_STATUS_MAX_AGE_HOURS": ("", False,
+                                "`status` reports the last run as STALE after this many hours. Empty = 2 with "
+                                "the hourly timer, 26 when only hypercore-daily.timer is active; set it for a "
+                                "cron or Docker schedule, where no timer can be read (daily: 26)"),
     "HL_WAREHOUSE_MOUNT": ("", False,
                            "standalone mode: the mount point the file:// warehouse must live on, e.g. "
                            "/mnt/blueblocx - the lift refuses to run (and preflight fails) when the NAS is not "

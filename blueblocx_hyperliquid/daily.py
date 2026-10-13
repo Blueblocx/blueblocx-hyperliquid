@@ -20,7 +20,10 @@ Order of operations:
      instead of the service timeout killing everything
   4. build the run summary (hard problems vs warnings - see ops.build_summary),
      POST the alert webhook (deduplicated: an unchanged problem set repeats only
-     every HL_ALERT_REPEAT_HOURS), write _run_summary.json, append _run_history.jsonl
+     every HL_ALERT_REPEAT_HOURS), write _run_summary.json, append _run_history.jsonl,
+     ping HL_HEARTBEAT_URL (or its /fail variant)
+  Throughout, _run_progress.json records the phase and the wallet being pulled;
+  `python -m blueblocx_hyperliquid.status` reads it to answer "running, stuck, or fine?".
 
 Exit codes: 0 clean · 1 problems or error (details in _run_summary.json; includes a
 tracked set that could not be refreshed) · 2 bad configuration (wallet list
@@ -31,6 +34,7 @@ The dagster asset template in deploy/dagster_hypercore_assets.py wraps this.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import signal
 import sys
@@ -121,9 +125,12 @@ def main(argv=None) -> int:
     recon, error, rc = None, None, 1
     lock_held = False
     wallets, auto, cursor, tracked_meta = list(dict.fromkeys(pins)), [], 0, None
+    progress: ops.Progress | None = None
     try:
         with ops.RunLock(ns_dir / ".daily.lock"):
+            progress = ops.Progress(ns_dir, planned=len(wallets))
             if source == "leaderboard":
+                progress.update(phase="tracked-set")
                 sets, tracked_meta = tracked.refresh_tracked(ns_dir)
                 cursor = tracked.load_cursor(ns_dir)
                 wallets, auto = tracked.plan_wallets(pins, sets, cursor)
@@ -135,11 +142,14 @@ def main(argv=None) -> int:
                                        f"and no pinned wallets in {wallets_path}")
             deadline_ts = (started.timestamp() + args.deadline_min * 60.0
                            if args.deadline_min and args.deadline_min > 0 else None)
+            progress.update(wallets_total=len(wallets),
+                            deadline_at=(dt.datetime.fromtimestamp(deadline_ts, tz=dt.timezone.utc).isoformat()
+                                         if deadline_ts else None))
             recon = extract.run(wallets, args.days, out_dir, with_prices=args.with_prices,
                                 max_workers=args.workers, s3_backfill=args.s3_backfill,
                                 iceberg=args.iceberg, incremental=True,
                                 retention_days=args.retention_days, deadline_ts=deadline_ts,
-                                soft_wallets=set(auto))
+                                soft_wallets=set(auto), progress=progress.update)
             if auto:
                 tracked.save_cursor(ns_dir, tracked.advance_cursor(auto, cursor, set(recon.get("wallets") or [])))
     except ops.LockHeld as e:
@@ -174,6 +184,11 @@ def main(argv=None) -> int:
         summary["alert_sent_at"] = previous.get("alert_sent_at")
         summary["alert_suppressed"] = True
     path = ops.write_summary(ns_dir, summary)
+    if progress is not None:
+        progress.finish(ok=summary["ok"], problems=len(summary["problems"]), error=error)
+    hb_url = config.env("HL_HEARTBEAT_URL")
+    if hb_url:
+        log.info("heartbeat %s: %s", "ok" if summary["ok"] else "fail", ops.heartbeat(hb_url, summary["ok"]))
     log.info("run done: ok=%s wallets ok=%d/%d deferred=%d problems=%s warnings=%d summary=%s",
              summary["ok"], summary["wallets_ok"], summary["wallets_total"], summary["wallets_deferred"],
              summary["problems"], len(summary["warnings"]), path)

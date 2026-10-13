@@ -19,6 +19,7 @@ log = logging.getLogger("blueblocx_hyperliquid.ops")
 
 SUMMARY_FILE = "_run_summary.json"      # latest run, full detail
 HISTORY_FILE = "_run_history.jsonl"     # one compact line per run, append-only
+PROGRESS_FILE = "_run_progress.json"    # live state of the current run (phase, wallet i/N)
 
 
 def utcnow() -> dt.datetime:
@@ -350,6 +351,74 @@ def write_summary(ns_dir: Path, summary: dict) -> Path:
     return latest
 
 
+def read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+# --- live progress --------------------------------------------------------------------
+
+class Progress:
+    """Live state of the current run for `python -m blueblocx_hyperliquid.status`: one
+    small JSON file (HL_OUT_DIR/hypercore/_run_progress.json) rewritten atomically at
+    every phase change and after every wallet. The pull phase is otherwise quiet in
+    the logs for minutes at a time, which looks exactly like a hang."""
+
+    def __init__(self, ns_dir: Path, planned: int = 0):
+        self.path = Path(ns_dir) / PROGRESS_FILE
+        self.state: dict = {
+            "state": "running", "pid": os.getpid(), "host": socket.gethostname(),
+            "started_at": utcnow().isoformat(), "phase": "starting",
+            "wallets_total": planned, "wallets_done": 0, "wallets_deferred": 0, "current": None,
+        }
+        self._write()
+
+    def update(self, **fields) -> None:
+        self.state.update(fields)
+        self._write()
+
+    def finish(self, **fields) -> None:
+        self.update(state="finished", phase="done", current=None, finished_at=utcnow().isoformat(), **fields)
+
+    def _write(self) -> None:
+        self.state["updated_at"] = utcnow().isoformat()
+        try:
+            atomic_write_text(self.path, json.dumps(self.state, indent=2, default=str))
+        except OSError as e:          # progress is observability, never a reason to fail the run
+            log.warning("progress file %s not written: %s", self.path, e)
+
+
+def read_progress(ns_dir: Path) -> dict | None:
+    return read_json(Path(ns_dir) / PROGRESS_FILE)
+
+
+# --- heartbeat (dead man's switch) ------------------------------------------------------
+
+def heartbeat(url: str | None, ok: bool, timeout: float = 10.0, get=None) -> bool:
+    """Ping a healthchecks.io-style URL after a run: the URL itself on a clean run,
+    URL/fail otherwise. The monitor alerts when no ping arrives within its period,
+    which covers the cases no in-process alert can: timer disabled, preflight FAIL,
+    host down. Never raises."""
+    if not url:
+        return False
+    target = url if ok else url.rstrip("/") + "/fail"
+    try:
+        if get is None:
+            import requests
+            get = requests.get
+        resp = get(target, timeout=timeout)
+        good = 200 <= int(getattr(resp, "status_code", 0)) < 300
+        if not good:
+            log.warning("heartbeat returned HTTP %s", getattr(resp, "status_code", "?"))
+        return good
+    except Exception as e:  # noqa: BLE001
+        log.warning("heartbeat failed: %s", type(e).__name__)
+        return False
+
+
 # --- alerting ------------------------------------------------------------------------
 
 def should_alert(summary: dict, previous: dict | None, repeat_hours: float | None = None,
@@ -387,24 +456,23 @@ def format_alert_text(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def send_alert(summary: dict, url: str | None = None, timeout: float = 10.0, post=None) -> bool:
-    """POST the summary to a Slack/Discord-style incoming webhook. Returns True when
-    the hook accepted it. Never logs the URL (it is a secret)."""
+def post_text(text: str, url: str | None = None, extra: dict | None = None, timeout: float = 10.0,
+              post=None) -> bool:
+    """POST a message to a Slack/Discord-style incoming webhook (HL_ALERT_WEBHOOK_URL by
+    default). Returns True when the hook accepted it. Never logs the URL (a secret),
+    never raises."""
     url = url or config.env("HL_ALERT_WEBHOOK_URL")
     if not url:
         return False
-    text = format_alert_text(summary)
     payload = {
         "text": text,                 # Slack
         "content": text[:1900],       # Discord (2000-char cap)
-        "hypercore": {"ok": summary.get("ok"), "run_at": summary.get("run_at"),
-                      "problems": (summary.get("problems") or [])[:50],
-                      "warnings": (summary.get("warnings") or [])[:50]},
     }
-    if post is None:
-        import requests
-        post = requests.post
+    payload.update(extra or {})
     try:
+        if post is None:
+            import requests
+            post = requests.post
         resp = post(url, json=payload, timeout=timeout)
         ok = 200 <= int(getattr(resp, "status_code", 0)) < 300
         if not ok:
@@ -413,3 +481,12 @@ def send_alert(summary: dict, url: str | None = None, timeout: float = 10.0, pos
     except Exception as e:  # noqa: BLE001 — an alert failure must not fail the run
         log.warning("alert webhook failed: %s", type(e).__name__)
         return False
+
+
+def send_alert(summary: dict, url: str | None = None, timeout: float = 10.0, post=None) -> bool:
+    """POST the run summary to the webhook (see post_text)."""
+    return post_text(format_alert_text(summary), url=url, timeout=timeout, post=post, extra={
+        "hypercore": {"ok": summary.get("ok"), "run_at": summary.get("run_at"),
+                      "problems": (summary.get("problems") or [])[:50],
+                      "warnings": (summary.get("warnings") or [])[:50]},
+    })

@@ -1,11 +1,12 @@
 # /etc/systemd/system/hypercore-maintenance.timer
-#   sudo cp deploy/hypercore-maintenance.{service,timer} /etc/systemd/system/
+#   sudo cp deploy/hypercore-maintenance.{service,timer} deploy/hypercore-failure@.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now hypercore-maintenance.timer
 #
 # 00:05 UTC is the gap in both cadences: the previous hourly run (minute 10, up to
 # 2 min jitter, 50-minute cap) is over by 00:02 and the next tick is 00:10; the daily
 # timer fires at 00:20. Maintenance takes seconds and shares the run lock, so on an
-# overlap it is maintenance (exit 3, no alert) that yields, never the data run.
+# overlap it is maintenance (exit 3 = SuccessExitStatus, no alert) that yields, never
+# the data run.
 [Unit]
 Description=Run hypercore-maintenance.service nightly
 

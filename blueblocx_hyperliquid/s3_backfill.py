@@ -175,12 +175,14 @@ def _iter_wallet_fills(raw: bytes, wallets: set[str], start_ms: int,
 
 
 def fetch_fills_s3(wallets: Iterable[str], start_ms: int, end_ms: int, *,
-                   workers: int = 8, batch: int = 8) -> S3Result:
+                   workers: int = 8, batch: int = 8, on_file=None) -> S3Result:
     """Read fills for `wallets` in [start_ms, end_ms) from S3 hour files.
 
     Compressed bytes are downloaded `batch` at a time; each file is decompressed
     and parsed in the main thread, then released. Missing (unpublished) and
     failed keys are reported in the result — the caller decides completeness.
+    on_file(done, total) is called as each hour file is taken up (progress for the
+    operator: a 24h market-maker window is ~23 files and ~35 min).
     """
     wset = {w.lower() for w in wallets}
     res = S3Result(fills={w: [] for w in wset})
@@ -190,6 +192,7 @@ def fetch_fills_s3(wallets: Iterable[str], start_ms: int, end_ms: int, *,
              dt.datetime.fromtimestamp(end_ms / 1000, tz=dt.timezone.utc).isoformat())
     seen: set = set()
     keys = res.keys_requested
+    done = 0
     for i in range(0, len(keys), batch):
         chunk = keys[i:i + batch]
         compressed: dict[str, tuple[str, bytes | None]] = {}
@@ -199,6 +202,9 @@ def fetch_fills_s3(wallets: Iterable[str], start_ms: int, end_ms: int, *,
                 compressed[futs[fut]] = fut.result()      # S3AccessError propagates
         del futs
         for k in chunk:
+            done += 1
+            if on_file is not None:
+                on_file(done, len(keys))
             status, body = compressed.pop(k, ("failed", None))
             if status == "missing":
                 res.keys_missing.append(k)
