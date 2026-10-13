@@ -433,6 +433,16 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary["per_wallet"][W1]["status"], "ok")
         self.assertEqual(summary["per_wallet"][P1]["status"], "problem")
 
+    def test_networth_mismatch_is_pending_when_the_lending_lookup_was_deferred(self):
+        recon = _clean_recon([P1, W1])
+        for w in (P1, W1):
+            recon["by_wallet"][w]["oracle"]["networth_matches"] = False
+        recon["by_wallet"][W1]["lending_deferred"] = True
+        summary = ops.build_summary(recon, [P1, W1], ops.utcnow(), ops.utcnow())
+        self.assertEqual(summary["problems"], [f"{P1[:10]}:networth_oracle"])
+        self.assertEqual(summary["warnings"], [f"{W1[:10]}:networth_pending"])
+        self.assertEqual(summary["per_wallet"][W1]["status"], "ok")
+
     def test_deferred_wallet_with_a_stale_entry_is_not_rejudged(self):
         recon = _clean_recon([W1], deferred=[W1])
         recon["by_wallet"][W1]["fidelity_ok"] = False       # stale, from an earlier run

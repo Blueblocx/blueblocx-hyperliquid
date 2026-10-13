@@ -225,6 +225,9 @@ class RunLock:
 #   unmapped_ledger_types   a ledger delta.type the mapper does not know (rows skipped)
 #   unpriced           a held non-stable symbol with no spot price (net worth understated)
 #   deferred=N         the soft deadline left N wallets for the next run (rotating order)
+#   networth_pending   net worth != HL, but the full-ledger lending lookup that could explain
+#                      it was skipped by the soft deadline; the next run pulls it (then the
+#                      wallet is either clean or a real networth_oracle problem)
 #   tracked_stale=Xh   the leaderboard was unreachable; the cached tracked set was used
 
 
@@ -278,6 +281,7 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
             "raw_fills": r.get("raw_fills"),
             "open_positions": r.get("open_positions"),
             "lending_lazy_pull": bool(r.get("lending_lazy_pull")),
+            "lending_deferred": bool(r.get("lending_deferred")),
             "unmapped_ledger_types": r.get("unmapped_ledger_types") or {},
             "unpriced_held_symbols": r.get("unpriced_held_symbols") or [],
         }
@@ -287,7 +291,12 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         if entry["perp_oracle"] is not True:
             hard.append("perp_oracle")
         if entry["networth_oracle"] is False:
-            hard.append("networth_oracle")
+            if entry["lending_deferred"]:
+                # the one component that could explain the gap (borrow/lend supply) was not
+                # pulled because the soft deadline had passed; the next run pulls it
+                warnings.append(f"{short}:networth_pending")
+            else:
+                hard.append("networth_oracle")
         if entry["fills_truncated"]:
             if w in soft:
                 warnings.append(f"{short}:fills_truncated")

@@ -95,7 +95,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.2.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.2.1 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -459,7 +459,10 @@ appends one line to `_run_history.jsonl`. Exit code and summary agree:
 | `error:…` | the run raised | `journalctl -u hypercore-daily` has the traceback |
 
 `warnings` do not fail the run but are in the alert text: `pnl_oracle`,
-`unmapped_ledger_types`, `unpriced`; `<w>:fills_truncated` for an **auto-tracked**
+`unmapped_ledger_types`, `unpriced`; `<w>:networth_pending` (net worth differs
+from HL but the full-ledger lending lookup that could explain it was skipped by the
+soft deadline — the next run pulls it, and the wallet is then either clean or a
+real `networth_oracle` problem); `<w>:fills_truncated` for an **auto-tracked**
 wallet (its API-capped window stays incomplete without S3 backfill — for a pin the
 same thing is a hard problem); `tracked_stale=Xh` (the cached tracked set was used);
 `deferred=N` (the soft deadline left N wallets for the next run — fine now and
