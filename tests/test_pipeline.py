@@ -317,6 +317,19 @@ class EvmDecimalsTests(unittest.TestCase):
         rows = prices.token_metadata_rows({"0xabc": {"symbol": "X", "decimals": None, "is_stablecoin": False}}, NOW)
         self.assertIsNone(rows[0]["decimals"])
 
+    def test_token_name_symbol_capped_and_nul_stripped(self):
+        from blueblocx_hyperliquid import prices
+        long = ("ก" * 150) + "\x00" + ("Z" * 200)            # 350 code points incl. Thai + a NUL byte
+        rows = prices.token_metadata_rows({"0xabc": {"symbol": long, "decimals": 8, "is_stablecoin": False},
+                                           "hlcore:token:150": {"symbol": "HYPE", "decimals": 8, "is_stablecoin": False},
+                                           "0xnull": {"symbol": None, "decimals": 8, "is_stablecoin": False}}, NOW)
+        by = {r["token_address"]: r for r in rows}
+        self.assertEqual(len(by["0xabc"]["symbol"]), 100)                   # code points, not bytes
+        self.assertEqual(len(by["0xabc"]["name"]), 200)
+        self.assertNotIn("\x00", by["0xabc"]["name"])
+        self.assertEqual((by["hlcore:token:150"]["symbol"], by["hlcore:token:150"]["name"]), ("HYPE", "HYPE"))
+        self.assertIsNone(by["0xnull"]["symbol"])
+
     def test_missing_block_timestamp_drops_row_and_counts(self):
         TRANSFER = EvmMapperTests.TRANSFER
         pad = lambda a: "0x" + a[2:].rjust(64, "0")  # noqa: E731

@@ -136,6 +136,23 @@ def pid_alive(pid: int) -> bool | None:
     return None
 
 
+def pid_is_ours(pid: int) -> bool | None:
+    """Is the live process `pid` one of this pipeline's entry points (python -m
+    blueblocx_hyperliquid.<module>)? True/False from /proc/<pid>/cmdline on Linux;
+    None where that cannot be read (Windows, permissions, process just exited).
+    Guards the lock against a recycled PID: a lock whose PID now belongs to an
+    unrelated process must not block the scheduler forever."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return b"blueblocx_hyperliquid" in raw
+
+
 # --- single-flight lock ------------------------------------------------------------
 
 class LockHeld(RuntimeError):
@@ -143,14 +160,22 @@ class LockHeld(RuntimeError):
 
 
 class RunLock:
-    """Single-flight guard for the scheduled run.
+    """Single-flight guard shared by every writer of the state dir (daily, extract,
+    iceberg_load, maintenance).
 
     Atomic O_EXCL create of a small JSON lock file holding pid/host/started_at. A
     lock is treated as abandoned - and replaced - when its recorded PID is no longer
     alive on this host (Linux, via /proc; a SIGKILL/OOM-killed run never reaches
-    __exit__) or when it is older than HL_LOCK_STALE_HOURS. Liveness is never probed
-    with os.kill(pid, 0), which terminates the target on Windows. systemd timers
-    never overlap a running service anyway; cron does, hence the lock.
+    __exit__). A lock whose PID IS alive on this host AND is one of this pipeline's
+    processes (/proc/<pid>/cmdline) is never discarded, however old: a hand-run S3
+    backfill of a market-maker wallet legitimately runs for hours and stealing its
+    lock would let the hourly tick interleave CSV writes, roll back watermarks and
+    drop the backfill's rows from its own lift. A live PID that belongs to an
+    unrelated process (PID recycled after a crash or reboot) is discarded. The age
+    rule (HL_LOCK_STALE_HOURS) applies only when liveness or identity cannot be told
+    (another host, no /proc, unreadable cmdline). Liveness is never probed with
+    os.kill(pid, 0), which terminates the target on Windows. systemd timers never
+    overlap a running service anyway; cron and hand runs do, hence the lock.
     """
 
     def __init__(self, path: Path, stale_hours: float | None = None):
@@ -172,9 +197,17 @@ class RunLock:
             return "vanished"
         holder = self._holder()
         if holder.get("host") in (None, socket.gethostname()):
-            alive = pid_alive(holder.get("pid")) if holder else None
+            pid = holder.get("pid")
+            alive = pid_alive(pid) if holder else None
             if alive is False:
-                return f"pid {holder.get('pid')} is not running"
+                return f"pid {pid} is not running"
+            if alive is True:
+                ours = pid_is_ours(pid)
+                if ours is False:
+                    return f"pid {pid} was recycled by an unrelated process"
+                if ours is True:
+                    return None                  # a live pipeline run on this host is never stolen
+                # cmdline unreadable: liveness known but identity not -> the age rule decides
         if age > self.stale_s:
             return f"{age / 3600:.1f} h old"
         return None

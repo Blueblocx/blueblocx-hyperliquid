@@ -422,6 +422,47 @@ class SoftDeadlineTests(unittest.TestCase):
             self.assertFalse(recon["by_wallet"][W1]["hole_accepted"])
 
 
+class ReferentialGuardTests(unittest.TestCase):
+    FILL = {"coin": "BTC", "px": "100", "sz": "1", "side": "B", "time": 1_760_000_000_000 - 3_600_000,
+            "startPosition": "0", "dir": "Close Long", "closedPnl": "1.5", "hash": "0x" + "ab" * 32,
+            "oid": 1, "crossed": True, "fee": "0.1", "tid": 1, "feeToken": "USDC", "twapId": None}
+
+    def _fake(self):
+        fake = _FakeClient
+        fake.clock, fake.bump, fake.fills = _FakeTime(1_760_000_000.0), 0.0, {W1: [dict(self.FILL)]}
+        return fake
+
+    def test_duplicate_wallets_are_pulled_once_and_recon_reports_referential_ok(self):
+        fake = self._fake()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(extract, "InfoClient", fake), \
+                mock.patch.object(extract, "time", fake.clock):
+            recon = extract.run([W1, W1.upper()], 2, Path(d), hip3=False)
+        self.assertEqual(recon["wallets"], [W1])
+        self.assertTrue(recon["referential_ok"])
+        self.assertTrue(recon["dimension_keys_distinct"])
+        self.assertEqual(recon["ledger_tokens_without_metadata"], [])
+        self.assertLess(recon["stamp_age_min"], 1.0)
+
+    def test_run_fails_when_a_ledger_token_has_no_metadata_row(self):
+        from blueblocx_hyperliquid import prices
+        fake = self._fake()
+        real = prices.token_metadata_rows
+
+        def drop_usdc(items, now):
+            return real({k: v for k, v in items.items() if k != S.USDC_ADDRESS}, now)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(extract, "InfoClient", fake), \
+                mock.patch.object(extract, "time", fake.clock), \
+                mock.patch.object(extract.prices, "token_metadata_rows", side_effect=drop_usdc):
+            with self.assertRaises(RuntimeError) as cm:
+                extract.run([W1], 2, Path(d), hip3=False)
+            self.assertIn("referential violation", str(cm.exception))
+            ns = Path(d) / S.NS_HYPERCORE
+            recon = json.loads((ns / "_reconciliation.json").read_text(encoding="utf-8"))
+            self.assertFalse(recon["referential_ok"])
+            self.assertEqual(recon["ledger_tokens_without_metadata"], [S.USDC_ADDRESS])
+            self.assertFalse((ns / "l1_wallet_ledger.csv").exists())          # nothing staged
+
+
 class SummaryTests(unittest.TestCase):
     def test_truncation_is_a_warning_for_auto_tracked_wallets_only(self):
         recon = _clean_recon([P1, W1])

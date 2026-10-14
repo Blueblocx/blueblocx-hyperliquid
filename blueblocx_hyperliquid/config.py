@@ -67,8 +67,11 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                  "0 = off"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
-                            "a run lock older than this is treated as abandoned (a lock whose PID is dead is "
-                            "discarded immediately on Linux regardless of age)"),
+                            "a run lock whose holder cannot be observed (another host, no /proc) is treated as "
+                            "abandoned after this many hours. On Linux a lock whose PID is dead or recycled by an "
+                            "unrelated process is discarded immediately and a lock whose PID is a live pipeline "
+                            "process (/proc/<pid>/cmdline) is never discarded (a hand-run S3 backfill may "
+                            "legitimately hold it for hours; scheduled ticks then exit 3)"),
     "HL_WEB_BIND": ("0.0.0.0", False,
                     "address the web monitor (blueblocx_hyperliquid.web, hypercore-web.service) listens on; "
                     "it has no authentication - a LAN/VPN address or a firewalled port"),
@@ -201,6 +204,48 @@ def out_root() -> Path:
 
 def ddl_path() -> Path:
     return Path(env("HL_DDL_PATH")).expanduser()
+
+
+# --- catalog selection (stdlib only: shared by the lift and by the DuckDB reader smoke,
+# which runs in a venv WITHOUT pyarrow/pyiceberg) ------------------------------------
+
+def catalog_mode() -> str:
+    """Which catalog the environment selects: 'rest' (NESSIE_URI), 'sql'
+    (HL_CATALOG_URI: PostgreSQL or SQLite via SQLAlchemy) or 'local' (the dev
+    SQLite catalog under HL_OUT_DIR/iceberg)."""
+    if os.environ.get("NESSIE_URI"):
+        return "rest"
+    if os.environ.get("HL_CATALOG_URI"):
+        return "sql"
+    return "local"
+
+
+def redacted_uri(uri: str) -> str:
+    """Catalog URI safe for logs (password hidden)."""
+    try:
+        from sqlalchemy.engine import make_url
+        return make_url(uri).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001
+        return uri.split("@")[-1] if "@" in uri else uri
+
+
+def warehouse_local_path(warehouse: str) -> Path | None:
+    """Filesystem path of a file:// warehouse (or metadata location), else None.
+    Accepts file:///abs/path, file://localhost/abs/path and the Windows forms
+    file://D:/x and file:///D:/x (the dev catalog has always written file://{drive}:/...)."""
+    if not warehouse.startswith("file://"):
+        return None
+    from urllib.parse import unquote
+    rest = unquote(warehouse[len("file://"):])
+    if rest.startswith("localhost/"):
+        rest = rest[len("localhost"):]
+    if len(rest) >= 3 and rest[0] == "/" and rest[2] == ":":
+        rest = rest[1:]                                # file:///D:/x -> D:/x
+    is_posix_abs = rest.startswith("/")
+    is_windows_abs = len(rest) >= 2 and rest[1] == ":" and rest[0].isalpha()
+    if not (is_posix_abs or is_windows_abs):
+        return None                                    # file://host/share is not local
+    return Path(rest)
 
 
 def describe_env() -> dict[str, dict]:

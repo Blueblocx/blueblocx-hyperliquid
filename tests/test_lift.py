@@ -6,16 +6,18 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import io
 import json
 import os
 import socket
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from blueblocx_hyperliquid import iceberg_load as il
+from blueblocx_hyperliquid import duckdb_smoke, iceberg_load as il
 from blueblocx_hyperliquid import preflight
 
 
@@ -65,6 +67,18 @@ class BoundedLiftTests(unittest.TestCase):
         self.assertIsNone(il.since_with_margin("garbage"))
         out = il.since_with_margin("2026-10-09T00:20:00+00:00")
         self.assertEqual(out, "2026-10-08T23:20:00+00:00")
+
+    def test_lift_since_never_excludes_the_current_runs_rows(self):
+        t0 = "2026-10-09T00:20:00+00:00"
+        # a scheduled lift finished 3 h after this (long, hand-run) run started: the
+        # cut-off must still be this run's own stamp minus the margin
+        self.assertEqual(il.lift_since("2026-10-09T03:20:00+00:00", t0), "2026-10-08T23:20:00+00:00")
+        # the normal case: the previous lift is older than this run
+        self.assertEqual(il.lift_since("2026-10-08T23:00:00+00:00", t0), il.since_with_margin("2026-10-08T23:00:00+00:00"))
+        self.assertIsNone(il.lift_since(None, t0))
+        # datetimes are compared, not strings: a microsecond-bearing marker vs a plain one
+        self.assertEqual(il.lift_since("2026-10-09T00:20:00.000000+00:00", "2026-10-09T00:20:00+00:00"),
+                         "2026-10-08T23:20:00+00:00")
 
     def test_lift_state_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -235,8 +249,39 @@ class CatalogModeTests(unittest.TestCase):
             self.assertIn("/cat2/warehouse", catalog.properties["warehouse"])
 
 
+def _sqlite_env(root: Path) -> dict:
+    return {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
+            "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": ""}
+
+
+def _write_rows(path: Path, cols: list[str], rows: list[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _committed_states(table) -> list[tuple[str, int]]:
+    """(operation, current snapshot id) of every metadata.json this table ever had,
+    oldest first - i.e. every state a reader of the catalog pointer could observe."""
+    import json as _json
+    states = []
+    locations = [e.metadata_file for e in table.metadata.metadata_log] + [table.metadata_location]
+    for loc in locations:
+        p = il.warehouse_local_path(loc)
+        meta = _json.loads(Path(p).read_text(encoding="utf-8"))
+        sid = meta.get("current-snapshot-id")
+        if sid is None or sid == -1:
+            states.append(("empty", None))
+            continue
+        snap = next(s for s in meta["snapshots"] if s["snapshot-id"] == sid)
+        states.append((snap["summary"]["operation"], sid))
+    return states
+
+
 class CommitFanOutTests(unittest.TestCase):
-    """Hourly cadence lives or dies by the number of Iceberg commits per lift."""
+    """Hourly cadence lives or dies by the number of Iceberg commits per lift, and the
+    ETL's DuckDB reads the catalog pointer: every committed state must be complete."""
 
     def _l4x_rows(self, wallets, as_of_date, as_of_ts):
         from blueblocx_hyperliquid import schema as S
@@ -245,11 +290,11 @@ class CommitFanOutTests(unittest.TestCase):
             for coin in ("BTC", "ETH"):
                 r = {c: "" for c in S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS}
                 r.update({"as_of_date": as_of_date, "wallet_address": w, "coin": coin, "as_of_ts": as_of_ts,
-                          "dex": "main", "unrealized_pnl_usd": "1.5"})
+                          "dex": "main", "unrealized_pnl_usd": "1.5", "created_at": as_of_ts})
                 rows.append(r)
         return rows
 
-    def test_replace_scope_is_one_delete_per_day_and_watermarks_two_commits(self):
+    def test_replace_scope_is_one_commit_per_lift_and_reader_never_sees_missing_rows(self):
         from blueblocx_hyperliquid import schema as S
         wallets = [f"0x{i:040x}" for i in range(1, 8)]          # 7 wallets, same day
         day = "2026-10-12"
@@ -258,38 +303,260 @@ class CommitFanOutTests(unittest.TestCase):
             src = root / "staging"
             src.mkdir()
             cols = S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS
-            ts1 = "2026-10-12T01:00:00+00:00"
-            with (src / "l4x_perp_position_snapshot.csv").open("w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=cols)
-                w.writeheader()
-                w.writerows(self._l4x_rows(wallets, day, ts1))
-            env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(root / 'c.db').as_posix()}",
-                   "WAREHOUSE": f"file://{(root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": ""}
-            with mock.patch.dict(os.environ, env):
+            _write_rows(src / "l4x_perp_position_snapshot.csv", cols,
+                        self._l4x_rows(wallets, day, "2026-10-12T01:00:00+00:00"))
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
                 catalog, _ = il.load_catalog_from_env()
                 try:
-                    rep1 = il.lift_directory(src, catalog=catalog)                 # empty table: no delete commit
-                    ts2 = "2026-10-12T02:00:00+00:00"
-                    with (src / "l4x_perp_position_snapshot.csv").open("w", newline="", encoding="utf-8") as fh:
-                        w = csv.DictWriter(fh, fieldnames=cols)
-                        w.writeheader()
-                        w.writerows(self._l4x_rows(wallets, day, ts2))
+                    rep1 = il.lift_directory(src, catalog=catalog)                 # empty table: plain append
+                    l4x = catalog.load_table("hypercore.l4x_perp_position_snapshot")
+                    log_after_1, loc_after_1 = len(l4x.metadata.metadata_log), l4x.metadata_location
+                    _write_rows(src / "l4x_perp_position_snapshot.csv", cols,
+                                self._l4x_rows(wallets, day, "2026-10-12T02:00:00+00:00"))
                     rep2 = il.lift_directory(src, catalog=catalog)                 # replaces the day for all 7
                     l4x = catalog.load_table("hypercore.l4x_perp_position_snapshot")
                     wm = catalog.load_table("control.table_watermarks")
-                    l4x_snaps = len(list(l4x.snapshots()))
-                    wm_snaps = len(list(wm.snapshots()))
+                    states = _committed_states(l4x)
+                    wm_states = _committed_states(wm)
+                    rows_per_state = {sid: l4x.scan(snapshot_id=sid).to_arrow().num_rows
+                                      for op, sid in states if sid is not None}
                     total = il._table_row_count(l4x)
+                    props = dict(l4x.properties)
+                    log_after_2 = len(l4x.metadata.metadata_log)
+                    prev_file = l4x.metadata.metadata_log[-1].metadata_file
                 finally:
                     catalog.engine.dispose()
             self.assertEqual(rep1["l4x_perp_position_snapshot"]["written"], 14)
-            self.assertEqual(rep2["l4x_perp_position_snapshot"]["delete_commits"], 1)     # not 7
+            self.assertEqual(rep2["l4x_perp_position_snapshot"]["commits"], 1)
             self.assertEqual(rep2["l4x_perp_position_snapshot"]["replaced_scopes"], 7)
             self.assertEqual(total, 14)                                                   # replaced, not doubled
-            self.assertLessEqual(l4x_snaps, 3)            # append, delete, append
-            self.assertLessEqual(wm_snaps, 3)             # (skipped delete +) append, then delete + append
+            # exactly ONE catalog commit for the replace: the metadata log grew by one and
+            # the previous pointer is the state lift 1 left behind
+            self.assertEqual(log_after_2, log_after_1 + 1)
+            self.assertEqual(prev_file, loc_after_1)
+            # every state a reader could have fetched is an append holding all 14 rows
+            self.assertTrue(all(op == "append" for op, sid in states if sid is not None), states)
+            self.assertEqual(set(rows_per_state.values()), {14})
             self.assertEqual(rep2["_watermarks"], {"l4x_perp_position_snapshot": "written"})
-            self.assertEqual(l4x.properties.get("write.metadata.delete-after-commit.enabled"), "true")
+            # the control table: its creation (empty) + one commit per lift
+            self.assertEqual([op for op, sid in wm_states], ["empty", "append", "append"])
+            self.assertEqual(props.get("write.metadata.delete-after-commit.enabled"), "true")
+
+    def test_replace_keys_is_one_commit_and_keys_never_vanish(self):
+        from blueblocx_hyperliquid import schema as S
+        cols = S.TOKEN_WHITELIST_COLUMNS
+
+        def rows(n, stamp, start=0):
+            return [{"token_address": f"hlcore:token:{i}", "token_group": i % 4000, "is_active": True,
+                     "whitelist_reason": "hypercore_token", "created_at": stamp, "updated_at": stamp}
+                    for i in range(start, start + n)]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    _write_rows(src / "token_whitelist.csv", cols, rows(600, "2026-10-12T01:00:00+00:00"))
+                    il.lift_directory(src, catalog=catalog)                                   # 600 keys, one In()
+                    _write_rows(src / "token_whitelist.csv", cols, rows(605, "2026-10-12T02:00:00+00:00"))
+                    rep2 = il.lift_directory(src, catalog=catalog)                            # 600 replaced + 5 new
+                    _write_rows(src / "token_whitelist.csv", cols, rows(10, "2026-10-12T03:00:00+00:00", 100))
+                    rep3 = il.lift_directory(src, catalog=catalog)
+                    t = catalog.load_table("hypercore.token_whitelist")
+                    states = _committed_states(t)
+                    keys_per_state = {sid: set(t.scan(snapshot_id=sid, selected_fields=("token_address",))
+                                               .to_arrow().column("token_address").to_pylist())
+                                      for op, sid in states if sid is not None}
+                    total = il._table_row_count(t)
+                finally:
+                    catalog.engine.dispose()
+            self.assertEqual((rep2["token_whitelist"]["commits"], rep3["token_whitelist"]["commits"]), (1, 1))
+            self.assertEqual(total, 605)
+            # table creation (empty) + exactly one committed state per lift, each an append
+            self.assertEqual([op for op, sid in states], ["empty", "append", "append", "append"])
+            original = {f"hlcore:token:{i}" for i in range(600)}
+            for sid, keys in keys_per_state.items():
+                self.assertTrue(original <= keys, "a committed state lacks keys that were present before")
+
+    def test_failed_commit_leaves_previous_snapshot_intact(self):
+        from pyiceberg.exceptions import CommitFailedException
+        from blueblocx_hyperliquid import schema as S
+        wallets = [f"0x{i:040x}" for i in range(1, 8)]
+        cols = S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            _write_rows(src / "l4x_perp_position_snapshot.csv", cols,
+                        self._l4x_rows(wallets, "2026-10-12", "2026-10-12T01:00:00+00:00"))
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    il.lift_directory(src, catalog=catalog)
+                    t = catalog.load_table("hypercore.l4x_perp_position_snapshot")
+                    loc1, log1 = t.metadata_location, len(t.metadata.metadata_log)
+                    _write_rows(src / "l4x_perp_position_snapshot.csv", cols,
+                                self._l4x_rows(wallets, "2026-10-12", "2026-10-12T02:00:00+00:00"))
+                    with mock.patch.object(type(catalog), "commit_table", side_effect=CommitFailedException("injected")):
+                        with self.assertRaises(CommitFailedException):
+                            il.lift_directory(src, catalog=catalog, watermarks=False)
+                    t = catalog.load_table("hypercore.l4x_perp_position_snapshot")
+                    self.assertEqual((t.metadata_location, len(t.metadata.metadata_log)), (loc1, log1))
+                    self.assertEqual(il._table_row_count(t), 14)
+                finally:
+                    catalog.engine.dispose()
+
+    def test_failed_table_writes_failed_watermark_and_reraises(self):
+        from blueblocx_hyperliquid import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            now = "2026-10-12T01:00:00+00:00"
+            _write_rows(src / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS,
+                        [{"token_address": "hlcore:token:1", "token_group": 7, "is_active": True,
+                          "whitelist_reason": "x", "created_at": now, "updated_at": now}])
+            _write_rows(src / "l4x_perp_position_snapshot.csv", S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS,
+                        self._l4x_rows(["0x" + "1" * 40], "2026-10-12", now))
+            real_load = il.load_table
+
+            def boom(table, *a, **kw):
+                if "l4x" in il._ident(table):
+                    raise RuntimeError("injected")
+                return real_load(table, *a, **kw)
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    with mock.patch.object(il, "load_table", side_effect=boom):
+                        with self.assertRaises(RuntimeError):
+                            il.lift_directory(src, catalog=catalog)
+                    wm = {r["table_name"]: r for r in catalog.load_table("control.table_watermarks")
+                          .scan().to_arrow().to_pylist()}
+                    self.assertEqual(wm["token_whitelist"]["status"], il.WM_STATUS_OK)
+                    self.assertEqual(wm["l4x_perp_position_snapshot"]["status"], il.WM_STATUS_FAILED)
+                    self.assertIsNone(wm["l4x_perp_position_snapshot"]["watermark_ts"])
+                    rep = il.lift_directory(src, catalog=catalog)                # unpatched: heals the row
+                    wm = {r["table_name"]: r for r in catalog.load_table("control.table_watermarks")
+                          .scan().to_arrow().to_pylist()}
+                    self.assertEqual(wm["l4x_perp_position_snapshot"]["status"], il.WM_STATUS_OK)
+                    self.assertEqual(rep["_watermarks"]["l4x_perp_position_snapshot"], "written")
+                finally:
+                    catalog.engine.dispose()
+
+    def test_failed_watermark_row_keeps_the_previous_value_column_and_count(self):
+        # a failed lift must not move the cursor the ETL reads NOR change what it was measured on
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            good_ts = dt.datetime(2026, 10, 12, 8, 0, tzinfo=dt.timezone.utc)
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    il.write_watermarks(catalog, "hypercore",
+                                        [("t1", "updated_at", good_ts, 5, 11, dt.date(2026, 10, 10), il.WM_STATUS_OK)],
+                                        "run-1")
+                    il.write_watermarks(catalog, "hypercore",
+                                        [("t1", "created_at", None, None, None, None, il.WM_STATUS_FAILED)], "run-2")
+                    rows = catalog.load_table("control.table_watermarks").scan().to_arrow().to_pylist()
+                finally:
+                    catalog.engine.dispose()
+            self.assertEqual(len(rows), 1)                                  # one row per table, replaced
+            wm = rows[0]
+            self.assertEqual(wm["status"], il.WM_STATUS_FAILED)
+            self.assertEqual(wm["watermark_col"], "updated_at")              # not the failed row's column
+            self.assertEqual(wm["watermark_ts"], dt.datetime(2026, 10, 12, 8, 0))
+            self.assertEqual(wm["watermark_date"], dt.date(2026, 10, 10))
+            self.assertEqual(wm["row_count"], 5)
+
+    def test_watermark_ts_is_write_stamp_and_date_is_business_date(self):
+        from blueblocx_hyperliquid import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            row = {c: "" for c in S.L1_WALLET_LEDGER_COLUMNS}
+            row.update({"tx_hash": "hlcore:0xa:tid:1", "event_index": 0, "direction": "in", "event_type": "spot_fill",
+                        "wallet_address": "0x" + "a" * 40, "token_address": "hlcore:usdc",
+                        "block_timestamp": "2026-10-10T05:00:00+00:00", "block_date": "2026-10-10",
+                        "amount_signed": "1", "created_at": "2026-10-12T08:00:00+00:00",
+                        "updated_at": "2026-10-12T08:00:00+00:00"})
+            _write_rows(src / "l1_wallet_ledger.csv", S.L1_WALLET_LEDGER_COLUMNS, [row])
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    il.lift_directory(src, catalog=catalog)
+                    wm = catalog.load_table("control.table_watermarks").scan().to_arrow().to_pylist()[0]
+                finally:
+                    catalog.engine.dispose()
+            self.assertEqual(wm["watermark_col"], "updated_at")
+            self.assertEqual(wm["watermark_ts"], dt.datetime(2026, 10, 12, 8, 0))        # naive UTC write stamp
+            self.assertEqual(wm["watermark_date"], dt.date(2026, 10, 10))                # business date
+            self.assertEqual(wm["status"], il.WM_STATUS_OK)
+
+    def test_null_in_required_column_or_duplicate_key_fails_before_any_commit(self):
+        from blueblocx_hyperliquid import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            now = "2026-10-12T01:00:00+00:00"
+            bad = {"token_address": "hlcore:token:1", "token_group": 7, "is_active": "",     # NULL is_active
+                   "whitelist_reason": "x", "created_at": now, "updated_at": now}
+            _write_rows(src / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS, [bad])
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    with self.assertRaises(ValueError) as cm:
+                        il.lift_directory(src, catalog=catalog, watermarks=False)
+                    self.assertIn("is_active", str(cm.exception))
+                    t = catalog.load_table("hypercore.token_whitelist")
+                    self.assertIsNone(t.current_snapshot())                               # nothing committed
+                    good = dict(bad, is_active=True)
+                    _write_rows(src / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS, [good, dict(good)])
+                    with self.assertRaises(ValueError) as cm:                              # duplicate key in batch
+                        il.lift_directory(src, catalog=catalog, watermarks=False)
+                    self.assertIn("duplicate", str(cm.exception))
+                    # a fresh table carries required=True for the by-construction columns
+                    self.assertTrue(t.schema().find_field("is_active").required)
+                    self.assertTrue(t.schema().find_field("token_address").required)
+                    self.assertFalse(t.schema().find_field("whitelist_reason").required)
+                    _write_rows(src / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS, [good])
+                    rep = il.lift_directory(src, catalog=catalog)                           # valid row lands
+                    self.assertEqual(rep["token_whitelist"]["written"], 1)
+                finally:
+                    catalog.engine.dispose()
+
+    def test_restated_status_and_iceberg_load_main_lock(self):
+        from blueblocx_hyperliquid import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            now = "2026-10-12T01:00:00+00:00"
+            _write_rows(src / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS,
+                        [{"token_address": "hlcore:token:1", "token_group": 7, "is_active": True,
+                          "whitelist_reason": "x", "created_at": now, "updated_at": now}])
+            env = dict(_sqlite_env(root), HL_OUT_DIR=str(root / "out"))
+            with mock.patch.dict(os.environ, env):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(il.main(["--from", str(src), "--full"]), 0)
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    wm = catalog.load_table("control.table_watermarks").scan().to_arrow().to_pylist()[0]
+                    self.assertEqual(wm["status"], il.WM_STATUS_RESTATED)
+                finally:
+                    catalog.engine.dispose()
+                self.assertTrue((src / il.LIFT_STATE_FILE).exists())
+                # a live lock on the state dir: the hand-run lift yields with exit 3 and lifts nothing
+                import socket
+                from blueblocx_hyperliquid import ops
+                lock = src / ".daily.lock"
+                lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}), encoding="utf-8")
+                with mock.patch.object(il, "lift_directory", side_effect=AssertionError("must not lift")):
+                    self.assertEqual(il.main(["--from", str(src)]), 3)
+                self.assertTrue(lock.exists())
+                lock.unlink()
+                self.assertIsInstance(ops.RunLock(lock), ops.RunLock)
 
     def test_write_watermarks_batch_is_monotonic_per_table(self):
         with tempfile.TemporaryDirectory() as d:
@@ -407,6 +674,119 @@ class MaintenanceTests(unittest.TestCase):
             entry = rep["tables"]["hypercore.token_whitelist"]
             self.assertEqual(entry["expired"], before - 1)
             self.assertIn("skipped", rep["tables"]["hypercore.l1_wallet_ledger"])   # never created: skipped
+
+
+class LiftOrderTests(unittest.TestCase):
+    def test_table_plan_parents_before_facts_before_derived(self):
+        names = list(il.TABLE_PLAN)
+        for parent in ("l1_token_metadata", "token_whitelist", "wallet_watchlist"):
+            self.assertLess(names.index(parent), names.index("l1_wallet_ledger"))
+        self.assertLess(names.index("l1_wallet_ledger"), names.index("l4_wallet_metadata"))
+        self.assertLess(names.index("l3_token_price_usd_1m"), names.index("l4x_perp_position_snapshot"))
+
+    def test_partial_lift_never_leaves_an_orphan_ledger_row(self):
+        """The ledger fails to lift: its token's metadata row must already be committed
+        (parents first) and no ledger row may exist (facts are committed after)."""
+        from blueblocx_hyperliquid import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            now = "2026-10-12T01:00:00+00:00"
+            meta = {c: "" for c in S.L1_TOKEN_METADATA_COLUMNS}
+            meta.update({"token_address": "hlcore:token:9", "token_group": 1, "standard": "ERC20", "symbol": "X",
+                         "name": "X", "is_stablecoin": False, "created_at": now, "updated_at": now})
+            _write_rows(src / "l1_token_metadata.csv", S.L1_TOKEN_METADATA_COLUMNS, [meta])
+            row = {c: "" for c in S.L1_WALLET_LEDGER_COLUMNS}
+            row.update({"tx_hash": "hlcore:0xa:tid:1", "event_index": 0, "direction": "in", "event_type": "spot_fill",
+                        "wallet_address": "0x" + "a" * 40, "token_address": "hlcore:token:9",
+                        "block_timestamp": now, "block_date": "2026-10-12", "amount_signed": "1",
+                        "created_at": now, "updated_at": now})
+            _write_rows(src / "l1_wallet_ledger.csv", S.L1_WALLET_LEDGER_COLUMNS, [row])
+            order: list[str] = []
+            real_load = il.load_table
+
+            def record(table, *a, **kw):
+                order.append(il._ident(table))
+                if "l1_wallet_ledger" in order[-1]:
+                    raise RuntimeError("injected")
+                return real_load(table, *a, **kw)
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    with mock.patch.object(il, "load_table", side_effect=record):
+                        with self.assertRaises(RuntimeError):
+                            il.lift_directory(src, catalog=catalog, watermarks=False)
+                    self.assertEqual(order, ["hypercore.l1_token_metadata", "hypercore.l1_wallet_ledger"])
+                    self.assertEqual(il._table_row_count(catalog.load_table("hypercore.l1_token_metadata")), 1)
+                    self.assertEqual(il._table_row_count(catalog.load_table("hypercore.l1_wallet_ledger")), 0)
+                finally:
+                    catalog.engine.dispose()
+
+
+class DuckDBSmokeTests(unittest.TestCase):
+    def test_pointer_query_and_scan_variants(self):
+        sql, params = duckdb_smoke.pointer_query("hl", "hypercore")
+        self.assertIn("FROM iceberg_tables", sql)
+        self.assertEqual(params, {"catalog_name": "hl", "namespace": "hypercore"})
+        loc = "file:///mnt/blueblocx/hypercore/warehouse/hypercore.db/l1_wallet_ledger/metadata/00009-x.metadata.json"
+        variants = duckdb_smoke.scan_variants(loc)
+        self.assertEqual([v for v, _ in variants], ["raw", "stripped", "moved"])
+        self.assertEqual(variants[0][1], f"iceberg_scan('{loc}')")
+        self.assertEqual(variants[1][1], "iceberg_scan('/mnt/blueblocx/hypercore/warehouse/hypercore.db/l1_wallet_ledger"
+                                         "/metadata/00009-x.metadata.json')")
+        # the table root with the committed version pinned: never reads an uncommitted file
+        self.assertEqual(variants[2][1], "iceberg_scan('/mnt/blueblocx/hypercore/warehouse/hypercore.db/l1_wallet_ledger', "
+                                         "version = '00009-x', allow_moved_paths = true)")
+        self.assertEqual(duckdb_smoke.table_root_and_version("s3://b/wh/ns/t/metadata/00001-abc.gz.metadata.json"),
+                         ("s3://b/wh/ns/t", "00001-abc"))
+        self.assertIsNone(duckdb_smoke.table_root_and_version("s3://bucket/m.json"))          # no metadata/ dir
+        self.assertIsNone(duckdb_smoke.table_root_and_version("file:///x/metadata/.metadata.json"))
+        self.assertEqual(duckdb_smoke.local_path("file://D:/x/wh/m.json"), "D:/x/wh/m.json")
+        self.assertEqual(duckdb_smoke.local_path("s3://bucket/m.json"), "s3://bucket/m.json")
+        self.assertEqual([v for v, _ in duckdb_smoke.scan_variants("s3://bucket/m.json")], ["raw"])
+        self.assertEqual([v for v, _ in duckdb_smoke.scan_variants("s3://b/wh/ns/t/metadata/00001-abc.metadata.json")],
+                         ["raw", "moved"])
+        # a quote in a NAS path cannot break the statement
+        self.assertIn("iceberg_scan('/mnt/Leo''s/wh/t/metadata/00001-a.metadata.json')",
+                      dict(duckdb_smoke.scan_variants("file:///mnt/Leo's/wh/t/metadata/00001-a.metadata.json"))["stripped"])
+
+    def test_pointer_select_against_the_sqlite_catalog(self):
+        from blueblocx_hyperliquid import schema as S
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            src = root / "staging"
+            src.mkdir()
+            now = "2026-10-12T01:00:00+00:00"
+            _write_rows(src / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS,
+                        [{"token_address": "hlcore:token:1", "token_group": 7, "is_active": True,
+                          "whitelist_reason": "x", "created_at": now, "updated_at": now}])
+            with mock.patch.dict(os.environ, _sqlite_env(root)):
+                catalog, _ = il.load_catalog_from_env()
+                try:
+                    il.lift_directory(src, catalog=catalog)
+                finally:
+                    catalog.engine.dispose()
+                pointers = duckdb_smoke.fetch_pointers(os.environ["HL_CATALOG_URI"], "hl", "hypercore")
+            self.assertEqual(list(pointers), ["token_whitelist"])
+            self.assertTrue(pointers["token_whitelist"].endswith(".metadata.json"))
+            self.assertTrue(pointers["token_whitelist"].startswith("file://"))
+
+    def test_duckdb_missing_is_skip_unless_required(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def no_duckdb(name, *a, **k):
+            if name == "duckdb":
+                raise ModuleNotFoundError("duckdb")
+            return real_import(name, *a, **k)
+        with mock.patch.object(builtins, "__import__", side_effect=no_duckdb):
+            self.assertEqual(preflight.check_duckdb(required=False).status, "SKIP")
+            self.assertEqual(preflight.check_duckdb(required=True).status, "FAIL")
+            with tempfile.TemporaryDirectory() as d, redirect_stdout(io.StringIO()), \
+                    mock.patch.dict(os.environ, {"NESSIE_URI": "", "HL_CATALOG_URI": "", "HL_WEIGHT_BUDGET": "600"}):
+                self.assertEqual(preflight.main(["--offline", "--out", d]), 0)              # SKIP row, exit 0
+                self.assertEqual(preflight.main(["--offline", "--duckdb", "--out", d]), 1)  # required -> FAIL
 
 
 class PreflightSqlCatalogTests(unittest.TestCase):

@@ -50,7 +50,7 @@ def expire_snapshots(table, older_than: dt.datetime) -> dict:
 
 
 def run(namespace: str, expire_days: float, catalog=None) -> dict:
-    from .iceberg_load import CONTROL_NS, TABLE_PLAN, TABLE_PROPERTIES, load_catalog_from_env
+    from .iceberg_load import CONTROL_NS, OPTIONAL_TABLES, TABLE_PLAN, TABLE_PROPERTIES, load_catalog_from_env
     if catalog is None:
         catalog, _ = load_catalog_from_env()
     cutoff = dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(days=expire_days)
@@ -61,7 +61,8 @@ def run(namespace: str, expire_days: float, catalog=None) -> dict:
         try:
             table = catalog.load_table(ident)
         except Exception as e:  # noqa: BLE001 — a table that does not exist yet is not an error
-            report["tables"][ident] = {"skipped": f"{type(e).__name__}"}
+            report["tables"][ident] = {"skipped": ("optional table not created (development-only output)"
+                                                   if name in OPTIONAL_TABLES else f"{type(e).__name__}")}
             continue
         entry: dict = {}
         missing = {k: v for k, v in TABLE_PROPERTIES.items() if table.properties.get(k) != v}

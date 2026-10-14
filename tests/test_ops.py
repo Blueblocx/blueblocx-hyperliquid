@@ -117,15 +117,76 @@ class OpsTests(unittest.TestCase):
             with ops.RunLock(p, stale_hours=12):
                 pass
 
-    def test_run_lock_replaces_stale_lock(self):
+    def test_run_lock_replaces_stale_lock_of_unobservable_holder(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / ".daily.lock"
-            p.write_text('{"pid": 1}', encoding="utf-8")
+            p.write_text('{"pid": 1, "host": "some-other-host"}', encoding="utf-8")   # liveness unknown
             old = time.time() - 3 * 3600
             os.utime(p, (old, old))
             with ops.RunLock(p, stale_hours=1):
-                self.assertNotEqual(p.read_text(encoding="utf-8"), '{"pid": 1}')
+                self.assertNotIn("some-other-host", p.read_text(encoding="utf-8"))
             self.assertFalse(p.exists())
+
+    @staticmethod
+    def _old_lock(d: str, pid: int = 4242) -> tuple[Path, str]:
+        import socket
+        p = Path(d) / ".daily.lock"
+        holder = json.dumps({"pid": pid, "host": socket.gethostname()})
+        p.write_text(holder, encoding="utf-8")
+        old = time.time() - 3 * 3600                       # far past stale_hours=1
+        os.utime(p, (old, old))
+        return p, holder
+
+    def test_run_lock_never_steals_a_live_pipeline_lock_however_old(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, holder = self._old_lock(d)
+            with mock.patch.object(ops, "pid_alive", return_value=True), \
+                 mock.patch.object(ops, "pid_is_ours", return_value=True):
+                with self.assertRaises(ops.LockHeld):
+                    with ops.RunLock(p, stale_hours=1):
+                        pass
+            self.assertEqual(p.read_text(encoding="utf-8"), holder)
+
+    def test_run_lock_discards_lock_whose_pid_was_recycled(self):
+        # the PID is alive but belongs to an unrelated process (reboot / crash + PID reuse):
+        # even a FRESH lock is abandoned, otherwise the scheduler would be blocked forever
+        with tempfile.TemporaryDirectory() as d:
+            p, _ = self._old_lock(d)
+            os.utime(p, None)                              # fresh
+            with mock.patch.object(ops, "pid_alive", return_value=True), \
+                 mock.patch.object(ops, "pid_is_ours", return_value=False):
+                with ops.RunLock(p, stale_hours=12):
+                    self.assertNotIn("4242", p.read_text(encoding="utf-8"))
+
+    def test_run_lock_live_pid_of_unknown_identity_falls_back_to_the_age_rule(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, _ = self._old_lock(d)
+            with mock.patch.object(ops, "pid_alive", return_value=True), \
+                 mock.patch.object(ops, "pid_is_ours", return_value=None):
+                with self.assertRaises(ops.LockHeld):      # 3 h old, stale_hours=12: still held
+                    with ops.RunLock(p, stale_hours=12):
+                        pass
+                with ops.RunLock(p, stale_hours=1):        # 3 h old, stale_hours=1: abandoned
+                    pass
+
+    def test_pid_is_ours_reads_proc_cmdline(self):
+        import subprocess
+        import sys
+        # a sleeping child whose argv carries the module marker vs one that does not
+        marked = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "blueblocx_hyperliquid.extract"])
+        plain = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            if Path("/proc").is_dir():
+                self.assertTrue(ops.pid_is_ours(marked.pid))
+                self.assertFalse(ops.pid_is_ours(plain.pid))
+            else:                                          # Windows: no /proc -> unknown
+                self.assertIsNone(ops.pid_is_ours(marked.pid))
+            self.assertIsNone(ops.pid_is_ours(0))
+            self.assertIsNone(ops.pid_is_ours(-1))
+        finally:
+            for proc in (marked, plain):
+                proc.kill()
+                proc.wait()
 
     def test_run_lock_discards_lock_of_dead_pid(self):
         import socket
@@ -346,6 +407,26 @@ class DailyMainTests(unittest.TestCase):
             self.assertTrue(summary["lock_held"])
             self.assertTrue(summary["problems"][0].startswith("error:LockHeld"))
             self.assertTrue(lock.exists())           # we did not steal a live lock
+
+
+class ExtractMainLockTests(unittest.TestCase):
+    W = "0xaaaa0000000000000000000000000000000000aa"
+
+    def test_extract_main_exits_three_when_the_lock_is_held_and_releases_on_success(self):
+        import socket
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / "hypercore" / ".daily.lock"
+            lock.parent.mkdir(parents=True)
+            lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}), encoding="utf-8")
+            with mock.patch.object(extract, "run", side_effect=AssertionError("must not run")):
+                self.assertEqual(extract.main(["--wallet", self.W, "--out", d]), 3)
+            self.assertTrue(lock.exists())
+            lock.unlink()
+            captured = {}
+            with mock.patch.object(extract, "run", side_effect=lambda *a, **kw: captured.update(kw) or {}):
+                self.assertEqual(extract.main(["--wallet", self.W, "--out", d, "--incremental"]), 0)
+            self.assertTrue(captured["incremental"])
+            self.assertFalse(lock.exists())
 
 
 class PreflightTests(unittest.TestCase):

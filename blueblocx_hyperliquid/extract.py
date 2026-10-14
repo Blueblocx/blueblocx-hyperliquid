@@ -39,13 +39,14 @@ import csv
 import json
 import logging
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import schema as S
-from . import analytics, config, mappers, prices
+from . import analytics, config, mappers, ops, prices
 from .info_client import InfoClient
 from .ops import atomic_write_text
 from .spot_meta import SpotMetaResolver, empty as empty_resolver
@@ -57,10 +58,19 @@ OUT_ROOT = Path(__file__).resolve().parent.parent / "out"     # repo default; HL
 # Reconciliation tolerance for the USDC cashflow identity (float rounding).
 _RECON_EPSILON = 1.0  # USD
 _STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD"}
+# ETL contract 4.4(c): a row must be readable within 2 h of its updated_at. Rows are
+# stamped at run START and committed at the end; warn when the gap grows past this.
+_STAMP_AGE_WARN_MIN = 60.0
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _s(v) -> str:
+    """Key/compare normalisation: a typed value and its CSV read-back are equal
+    (None and '' both become '', everything else str()); csv writes str(v) too."""
+    return "" if v is None else str(v)
 
 
 def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
@@ -453,7 +463,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     progress: optional callable taking keyword fields (phase, wallets_done, current,
     ...) - ops.Progress.update - called at every phase change and before every wallet.
     """
-    wallets = [w.lower() for w in wallets]
+    wallets = list(dict.fromkeys(w.lower() for w in wallets))   # dedupe: one pull and one dimension row per wallet
     soft = {w.lower() for w in (soft_wallets or ())}
     progress = progress or (lambda **kw: None)
     client = InfoClient()        # HL_INFO_URL / HL_WEIGHT_BUDGET / HL_HTTP_TIMEOUT from the env
@@ -814,6 +824,23 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         log.warning("UNMAPPED ledger delta.type(s) — extend _LEDGER_EVENT_TYPE: %s",
                     unknown_types_all)
 
+    def abort_run(reason: str, **evidence) -> None:
+        """HARD FAIL before the write phase: persist the evidence (this run's wallets
+        only; the merged history is not touched) and raise. Nothing is staged, so the
+        lake and the ETL never see the bad batch."""
+        log.error("%s - nothing written", reason)
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(ns_dir / "_reconciliation.json", json.dumps({
+            "run_at": now_iso, "wallets": processed, "deferred": deferred,
+            "natural_key_ok": not collisions and dup_within == 0,
+            "natural_key_cross_wallet_collisions": collisions[:200], "natural_key_duplicates_within_run": dup_within,
+            # None = not reached (the natural-key check aborted first)
+            "referential_ok": None if orphans is None else (not orphans and bool(dims_distinct)),
+            "ledger_tokens_without_metadata": (orphans or [])[:200], "dimension_keys_distinct": dims_distinct,
+            **evidence, "by_wallet": recon_by_wallet,
+        }, indent=2))
+        raise RuntimeError(f"{reason} - nothing written (see _reconciliation.json)")
+
     # --- chain-wide natural-key uniqueness (the Rust dedup key, NO wallet) -----
     seen: dict[tuple, str] = {}
     collisions: list[dict] = []
@@ -823,21 +850,11 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             collisions.append({"key": list(k), "wallets": [seen[k], r["wallet_address"]]})
         seen.setdefault(k, r["wallet_address"])
     dup_within = len(all_l1) - len(seen)
+    orphans: list[str] | None = None            # set by the referential check below
+    dims_distinct: bool | None = None
     if collisions or dup_within:
-        # HARD FAIL: writing would let upsert_csv silently collapse the colliding
-        # rows. Persist the evidence, then abort with a non-zero exit.
-        log.error("NATURAL KEY VIOLATION: %d cross-wallet collisions, %d duplicate keys",
-                  len(collisions), dup_within)
-        ns_dir.mkdir(parents=True, exist_ok=True)
-        (ns_dir / "_reconciliation.json").write_text(json.dumps({
-            "run_at": now_iso, "wallets": processed, "deferred": deferred, "natural_key_ok": False,
-            "natural_key_cross_wallet_collisions": collisions[:200],
-            "natural_key_duplicates_within_run": dup_within,
-            "by_wallet": recon_by_wallet,
-        }, indent=2), encoding="utf-8")
-        raise RuntimeError(
-            f"natural key violation: {len(collisions)} cross-wallet collisions, "
-            f"{dup_within} duplicates — nothing written (see _reconciliation.json)")
+        # writing would let upsert_csv silently collapse the colliding rows
+        abort_run(f"natural key violation: {len(collisions)} cross-wallet collisions, {dup_within} duplicates")
 
     all_l1.sort(key=lambda r: (r["block_timestamp"], r["tx_hash"], r["event_index"]))
     reg_items = registry.items()
@@ -848,11 +865,30 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "created_at": now_iso, "updated_at": now_iso,
     } for addr in reg_items]
 
+    # --- referential closure + dimension keys (ETL contract 4.2 / 4.3) -----------
+    # Every token_address on a ledger row must have its l1_token_metadata row in the
+    # SAME batch (the destination has an FK on it), and every dimension CSV must be
+    # keyed uniquely. Both hold by construction (_ledger_row registers every token;
+    # one row per registry key / wallet) - this is the regression guard, failing the
+    # run like the natural-key check so a bad batch is never staged or lifted.
+    ledger_tokens = {r["token_address"] for r in all_l1}
+    orphans = sorted(ledger_tokens - {r["token_address"] for r in meta_rows})
+    dims_distinct = all(len(rows) == len({_s(r[k]) for r in rows}) for rows, k in (
+        (meta_rows, "token_address"), (whitelist_rows, "token_address"),
+        (watchlist_rows, "wallet_address"), (wallet_meta_rows, "wallet_address")))
+    if orphans or not dims_distinct:
+        abort_run(f"referential violation: {len(orphans)} ledger token(s) without metadata, "
+                  f"dimension keys distinct={dims_distinct}")
+
     # --- write (upsert by natural key) -----------------------------------------
     progress(phase="write")
-
-    def s(v):  # key component -> str; None and "" (CSV read-back) compare equal
-        return "" if v is None else str(v)
+    s = _s
+    # rows carry the run-start stamp; the ETL re-reads a Tier-A row only within 2 h of it
+    stamp_age_min = (time.time() * 1000 - _iso_to_ms(now_iso)) / 60_000
+    if stamp_age_min > _STAMP_AGE_WARN_MIN:
+        log.warning("rows carry updated_at %.0f min older than their commit - the ETL's 2 h Tier-A "
+                    "visibility margin is at risk (long run: keep hand runs under 2 h or announce them)",
+                    stamp_age_min)
 
     as_of_date = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     # only wallets that produced a snapshot this run: a deferred or skipped wallet keeps
@@ -899,15 +935,17 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     iceberg_report = None
     retention_report = None
     if iceberg:
-        from .iceberg_load import lift_directory, read_lift_state, since_with_margin, write_lift_state
+        from .iceberg_load import lift_directory, lift_since, read_lift_state, write_lift_state
         config.load_env()
         # Bounded lift: only rows written since the previous successful lift (minus a
         # 1h margin) are read from the staged CSVs and checked against the lake, so
         # a daily run costs O(new rows), not O(45 days of staging) over the network.
+        # The cut-off never passes THIS run's own stamp (a long hand run that overlaps
+        # a scheduled lift must still lift its rows).
         lift_state = read_lift_state(ns_dir) if incremental else {}
         prev_lift = lift_state.get("last_success_run_iso")
         progress(phase="lift")
-        iceberg_report = lift_directory(ns_dir, since_iso=since_with_margin(prev_lift))  # raises on failure
+        iceberg_report = lift_directory(ns_dir, since_iso=lift_since(prev_lift, now_iso))  # raises on failure
         # Staged-CSV retention: the lake now holds these rows durably, so the
         # staging files only need to keep the analytics windows (30d) + margin.
         # Pruning rewrites the files whole, so it runs at most once a day (hourly
@@ -971,6 +1009,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "natural_key_cross_wallet_collisions": collisions,
         "natural_key_duplicates_within_run": dup_within,
         "natural_key_ok": not collisions and dup_within == 0,
+        "referential_ok": True,
+        "ledger_tokens_without_metadata": [],
+        "dimension_keys_distinct": True,
+        "stamp_age_min": round(stamp_age_min, 2),
         "unmapped_ledger_types": unknown_types_all,
         "price_job": price_report,
         "iceberg": iceberg_report,
@@ -990,7 +1032,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     return recon
 
 
-def main() -> None:
+def main(argv=None) -> int:
+    """Exit codes: 0 done, 1 the run raised (traceback), 3 another run holds the state
+    dir's lock (the hourly tick, a lift or maintenance): nothing was pulled - retry when
+    it is free. While a long hand run holds the lock, scheduled ticks exit 3 themselves."""
     config.load_env()
     config.setup_logging()
     ap = argparse.ArgumentParser(description="Hyperliquid HyperCore -> staged CSVs -> Iceberg")
@@ -1012,13 +1057,20 @@ def main() -> None:
     ap.add_argument("--retention-days", type=int, default=config.env_int("HL_RETENTION_DAYS"),
                     help="with --iceberg: prune staged l1/l3 CSV rows older than this (0 = never)")
     ap.add_argument("--out", default=str(config.out_root()))
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     wallets = [w.strip() for w in args.wallet.split(",") if w.strip()]
-    run(wallets, args.days, Path(args.out), with_prices=args.with_prices,
-        max_workers=args.workers, max_perp_price_coins=args.max_price_coins,
-        s3_backfill=args.s3_backfill, iceberg=args.iceberg, incremental=args.incremental,
-        hip3=not args.no_hip3, retention_days=args.retention_days)
+    ns_dir = Path(args.out) / S.NS_HYPERCORE
+    try:
+        with ops.RunLock(ns_dir / ".daily.lock"):
+            run(wallets, args.days, Path(args.out), with_prices=args.with_prices,
+                max_workers=args.workers, max_perp_price_coins=args.max_price_coins,
+                s3_backfill=args.s3_backfill, iceberg=args.iceberg, incremental=args.incremental,
+                hip3=not args.no_hip3, retention_days=args.retention_days)
+    except ops.LockHeld as e:
+        log.error("%s - another run owns the state dir; retry when it has finished", e)
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

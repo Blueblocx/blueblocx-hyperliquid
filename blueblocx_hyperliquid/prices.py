@@ -14,6 +14,7 @@ span (not sampled) so USDC-denominated rows can always be valued.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from . import schema as S
@@ -144,11 +145,33 @@ def clearinghouse_to_snapshot(state: dict, wallet: str, as_of_ms: int,
     return rows
 
 
+log = logging.getLogger("blueblocx_hyperliquid.prices")
+
+# ETL contract 4.6: the destination keeps btree indexes on (chain_id, name) and
+# (chain_id, symbol); a value above these code-point caps fails its whole hourly job.
+SYMBOL_MAX_CP = 100
+NAME_MAX_CP = 200
+
+
+def _clip_text(value, max_cp: int, what: str = "text"):
+    """Cap a free-text value at `max_cp` code points and strip NUL bytes (which the
+    ETL's CSV export would otherwise silently edit). None stays None; a cut is logged."""
+    if value is None:
+        return None
+    s = str(value).replace("\x00", "")
+    if len(s) > max_cp:
+        log.warning("token %s truncated to %d code points: %r...", what, max_cp, s[:40])
+        s = s[:max_cp]
+    return s
+
+
 def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
     """token registry -> l1_token_metadata rows (symbol/decimals/is_stablecoin).
 
     This is where the HL coin symbol lives now that `standard`=="ERC20" on the
-    ledger. is_stablecoin lets stable_coin_pct compute downstream.
+    ledger. is_stablecoin lets stable_coin_pct compute downstream. name == symbol
+    (Hyperliquid tokens have no separate display name); both are capped at the
+    ETL's btree limits (symbol 100, name 200 code points) and NUL-stripped.
     """
     rows = []
     for addr, meta in registry_items.items():
@@ -156,8 +179,8 @@ def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
             "token_address": addr,
             "token_group": S.addr_group(addr),
             "standard": S.STANDARD_ERC20,
-            "symbol": meta.get("symbol"),
-            "name": meta.get("symbol"),
+            "symbol": _clip_text(meta.get("symbol"), SYMBOL_MAX_CP, "symbol"),
+            "name": _clip_text(meta.get("symbol"), NAME_MAX_CP, "name"),
             # NULL when unresolved (nullable INT in the DDL) — never a fake 0
             "decimals": (int(meta["decimals"]) if meta.get("decimals") is not None else None),
             "first_seen": now_iso,

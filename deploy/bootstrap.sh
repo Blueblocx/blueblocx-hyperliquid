@@ -22,12 +22,16 @@
 #      that removes the S3 flags (no AWS key in this layout) and caps a run at 50 min;
 #      the web monitor (hypercore-web.service, port 8787) is enabled and started
 #   9. preflight as the service user
+#   5b. (only with READER_CIDR=<etl host ip>/32) a READ-ONLY catalog role `hl_ro` for the
+#      ETL's DuckDB reader + /etc/hypercore/reader.env, PostgreSQL listening on the LAN
+#      address with a pg_hba rule for that CIDR only (docs/DEPLOY.md "Serving the lake
+#      to DuckDB readers"); the NFS read-only export is a Synology setting, printed below
 # It does NOT start the timers or run the pipeline (next steps are printed at the end).
-# Overrides: export RELEASE_TAG / GIT_ALIAS / NAS_MOUNT / WEIGHT_BUDGET before running.
+# Overrides: export RELEASE_TAG / GIT_ALIAS / NAS_MOUNT / WEIGHT_BUDGET / READER_CIDR (/ HOST_LAN_IP) before running.
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.3.0}"
+RELEASE_TAG="${RELEASE_TAG:-v1.4.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -42,6 +46,9 @@ WAREHOUSE_DIR="${NAS_BASE}/warehouse"
 PG_DB="hl_catalog"
 PG_ROLE="hl"
 WEIGHT_BUDGET="${WEIGHT_BUDGET:-900}"
+READER_CIDR="${READER_CIDR:-}"            # e.g. 192.168.1.50/32: the ETL host allowed to read the catalog
+READER_ENV="$CONF_DIR/reader.env"
+PG_RO_ROLE="hl_ro"
 ME="$(id -un)"
 WORKDIR="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_LOG="/tmp/hypercore-bootstrap-tests.log"
@@ -60,6 +67,19 @@ for unit in hypercore-daily.service hypercore-maintenance.service hypercore-hour
     die "$unit is active - stop the timers first and wait for the services to finish: sudo systemctl stop hypercore-hourly.timer hypercore-daily.timer hypercore-maintenance.timer && while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done  (upgrades: docs/DEPLOY.md section 8)"
   fi
 done
+# a HAND-RUN extract / lift / maintenance is invisible to systemctl but holds the state-dir
+# lock and executes code from a checkout: refuse while one is alive
+if pgrep -f 'blueblocx_hyperliquid\.(daily|extract|iceberg_load|maintenance|migrate)( |$)' >/dev/null 2>&1; then
+  die "a hand-run pipeline process is active ($(pgrep -af 'blueblocx_hyperliquid\.' | head -3 | tr '\n' ';')) - let it finish or stop it first"
+fi
+LOCK_FILE="$STATE_DIR/hypercore/.daily.lock"
+if sudo test -f "$LOCK_FILE"; then
+  LOCK_PID="$(sudo jq -r '.pid // empty' "$LOCK_FILE" 2>/dev/null || true)"
+  if [ -n "$LOCK_PID" ] && [ -d "/proc/$LOCK_PID" ]; then
+    die "the run lock $LOCK_FILE is held by live pid $LOCK_PID - wait for that run to finish"
+  fi
+  warn "stale run lock $LOCK_FILE (holder gone) - the next run discards it"
+fi
 # GitHub closes the test connection with exit 1 even on success, so capture and match
 SSH_OUT="$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new "git@${GIT_ALIAS}" 2>&1 || true)"
 case "$SSH_OUT" in
@@ -132,6 +152,72 @@ END \$\$;
 SELECT 'CREATE DATABASE ${PG_DB} OWNER ${PG_ROLE}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${PG_DB}')\gexec
 SQL
   )
+fi
+
+# ----------------------------------------------------------------------------- 5b. read-only catalog role for the ETL's DuckDB reader
+if [ -n "$READER_CIDR" ]; then
+  say "read-only catalog role ${PG_RO_ROLE} for ${READER_CIDR}"
+  RO_PASS=""
+  if sudo test -f "$READER_ENV"; then
+    RO_PASS="$(sudo sed -n 's#^HL_CATALOG_URI=postgresql+psycopg2://[^:]*:\([^@]*\)@.*#\1#p' "$READER_ENV")"
+  fi
+  [ -n "$RO_PASS" ] || RO_PASS="$(openssl rand -hex 24)"
+  # the address the ETL host can reach = the source address of the route TO it (not the
+  # first entry of `hostname -I`, which may be docker0 or a VPN interface); HOST_LAN_IP overrides
+  READER_HOST="${READER_CIDR%%/*}"
+  HOST_LAN_IP="${HOST_LAN_IP:-$(ip -o route get "$READER_HOST" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)}"
+  [ -n "$HOST_LAN_IP" ] || HOST_LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$HOST_LAN_IP" ] || die "could not determine this host's address towards ${READER_CIDR} - export HOST_LAN_IP=<lan ip>"
+  echo "reader connects to ${HOST_LAN_IP}:5432 (override with HOST_LAN_IP=... if that is not the LAN address)"
+  # SELECT-only role; default_transaction_read_only stops even an accidental UPDATE of the
+  # catalog pointer (the writer's commit path) from this role
+  ( cd / && sudo -u postgres psql -v ON_ERROR_STOP=1 -q <<SQL
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${PG_RO_ROLE}') THEN
+    CREATE ROLE ${PG_RO_ROLE} LOGIN PASSWORD '${RO_PASS}';
+  ELSE
+    ALTER ROLE ${PG_RO_ROLE} WITH LOGIN PASSWORD '${RO_PASS}';
+  END IF;
+END \$\$;
+ALTER ROLE ${PG_RO_ROLE} SET default_transaction_read_only = on;
+GRANT CONNECT ON DATABASE ${PG_DB} TO ${PG_RO_ROLE};
+SQL
+  )
+  # the catalog tables are created lazily by role hl on the first lift: grant what exists
+  # now AND default privileges for whatever hl creates later
+  ( cd / && sudo -u postgres psql -v ON_ERROR_STOP=1 -q -d "$PG_DB" <<SQL
+GRANT USAGE ON SCHEMA public TO ${PG_RO_ROLE};
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${PG_RO_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${PG_ROLE} IN SCHEMA public GRANT SELECT ON TABLES TO ${PG_RO_ROLE};
+SQL
+  )
+  # reader.env: the connection the ETL host (and blueblocx_hyperliquid.duckdb_smoke) use;
+  # yours, mode 600, never pasted anywhere
+  sudo install -m 600 -o "$ME" -g "$ME" /dev/null "$READER_ENV"
+  sudo tee "$READER_ENV" >/dev/null <<EOF
+# read-only access to the hypercore Iceberg catalog for DuckDB readers (ETL). Never commit.
+HL_CATALOG_URI=postgresql+psycopg2://${PG_RO_ROLE}:${RO_PASS}@${HOST_LAN_IP}:5432/${PG_DB}
+WAREHOUSE=file://${WAREHOUSE_DIR}
+EOF
+  # PostgreSQL: listen on the LAN address too, accept ONLY the reader role from the ETL CIDR
+  PG_MAIN="$(ls -d /etc/postgresql/*/main 2>/dev/null | head -1)"
+  [ -n "$PG_MAIN" ] || die "no /etc/postgresql/<version>/main found"
+  sudo mkdir -p "$PG_MAIN/conf.d"
+  printf "# written by deploy/bootstrap.sh (READER_CIDR): the ETL's DuckDB reader connects from the LAN\nlisten_addresses = 'localhost,%s'\n" "$HOST_LAN_IP" \
+    | sudo tee "$PG_MAIN/conf.d/hypercore-reader.conf" >/dev/null
+  PG_HBA="$(cd / && sudo -u postgres psql -Atc 'SHOW hba_file')"
+  PG_SSL="$(cd / && sudo -u postgres psql -Atc 'SHOW ssl')"
+  HBA_TYPE="host"; [ "$PG_SSL" = "on" ] && HBA_TYPE="hostssl"
+  HBA_LINE="${HBA_TYPE} ${PG_DB} ${PG_RO_ROLE} ${READER_CIDR} scram-sha-256"
+  if ! sudo grep -qF "${PG_DB} ${PG_RO_ROLE} ${READER_CIDR}" "$PG_HBA"; then
+    printf "# hypercore reader (deploy/bootstrap.sh READER_CIDR)\n%s\n" "$HBA_LINE" | sudo tee -a "$PG_HBA" >/dev/null
+  fi
+  if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    sudo ufw allow from "$READER_CIDR" to any port 5432 proto tcp >/dev/null
+  fi
+  sudo systemctl restart postgresql           # listen_addresses needs a restart; no run is active here
+  echo "reader role ready: ${READER_ENV} (600, ${ME}); PostgreSQL listens on ${HOST_LAN_IP}:5432 for ${PG_RO_ROLE}@${READER_CIDR} (${HBA_TYPE})"
+  echo "NAS: add a Synology NFS rule for the ETL host (Read only) so it can mount ${NAS_MOUNT} at the identical path"
 fi
 
 # ----------------------------------------------------------------------------- 6. env + wallets
@@ -281,5 +367,7 @@ Web monitor:               http://${HOST_IP:-<this-host>}:${WEB_PORT:-8787}/    
    then:                   sudo jq '{ok,wallets_ok,wallets_deferred,tracked,problems,warnings}' ${STATE_DIR}/hypercore/_run_summary.json
 3. Enable the schedule:    sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
 4. Any time:               the web monitor, or hypercore-status (exit 0 = healthy; --json for scripts)
+5. ETL / DuckDB readers:   READER_CIDR=<etl host ip>/32 bash deploy/bootstrap.sh creates the read-only role and
+                           ${READER_ENV}; smoke test: HL_ENV_FILE=${READER_ENV} <venv with duckdb>/bin/python -m blueblocx_hyperliquid.duckdb_smoke
 Note: your group membership (${SERVICE_USER}) applies after you log in again (hypercore-status needs it).
 EOF

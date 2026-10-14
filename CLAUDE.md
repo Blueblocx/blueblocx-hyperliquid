@@ -10,6 +10,7 @@ the distinction is the whole safety model:
 | `/opt/blueblocx-hyperliquid` | **production checkout**, detached at a release tag; the hourly timer executes whatever is on disk here | read only. Never edit, never `git pull`, never run pip in it by hand. It moves only via the release flow below |
 | `/etc/hypercore/hypercore.env` | production config, root:hypercore 640, contains the catalog password | read (group); edit only with `sudoedit`; **never print or paste its values** |
 | `/etc/hypercore/wallets.txt` | optional pinned wallets (owned by the login user) | edit |
+| `/etc/hypercore/reader.env` | read-only catalog credentials for the ETL's DuckDB reader (`hl_ro`), written by `READER_CIDR=… bash deploy/bootstrap.sh`; mode 600, owned by the login user | read; **never print or paste its values** |
 | `/var/lib/hypercore/hypercore/` | production state: `_run_summary.json`, `_run_progress.json`, `_run_history.jsonl`, `_watermarks.json`, `_tracked_wallets.json`, staged CSVs | read; never write or delete by hand |
 | `/mnt/blueblocx/hypercore/warehouse` | the Iceberg warehouse on the NAS | never touch by hand (the catalog in PostgreSQL points at these files) |
 
@@ -48,15 +49,21 @@ the distinction is the whole safety model:
 git add -A && git commit -m "..." && git push
 git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
 
-# move production between timer ticks (bootstrap refuses while a timer or run is active)
+# move production between timer ticks (bootstrap refuses while a timer, a run or a hand-run
+# pipeline process is active; a hand run holds .daily.lock and is invisible to systemctl)
 sudo systemctl stop hypercore-hourly.timer hypercore-maintenance.timer
 while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done
+pgrep -af 'blueblocx_hyperliquid\.' ; sudo cat /var/lib/hypercore/hypercore/.daily.lock 2>/dev/null   # nothing live
+# when the release notes (docs/DEPLOY.md section 8) list a state-file change: tar HL_OUT_DIR first
 RELEASE_TAG=vX.Y.Z bash deploy/bootstrap.sh        # checkout, pip, tests, units, env keys, web monitor restart, preflight
 sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
 ```
 
-Rollback is the same with the previous tag. `docs/DEPLOY.md` has the long form and
-the reasoning; `README.md` the module map.
+Rollback is the same with the previous tag (always via bootstrap when the release
+changed `deploy/`; a release that changed the lake schema says in its release note
+what must run before the tag moves back). `docs/DEPLOY.md` has the long form and
+the reasoning; `README.md` the module map; `docs/ETL_HANDOFF_HYPERCORE.md` is what
+the ETL team reads.
 
 ## Decisions already made (do not reopen without the owner)
 

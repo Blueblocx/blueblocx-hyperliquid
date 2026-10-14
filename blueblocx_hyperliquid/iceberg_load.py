@@ -31,9 +31,19 @@ does not):
     existing natural keys in the touched partitions are read and only new rows
     appended (facts are immutable; l3 only receives CLOSED candles).
   * snapshot / dimension tables: REPLACE — delete the incoming keys (or the
-    (as_of_date, wallet) scope for l4x), then append. Null keys are rejected and
-    an empty key list never becomes a DELETE predicate.
-  * watermarks are written in a FINAL step, monotonic, and never abort data lifts.
+    (as_of_date, wallet) scope for l4x) and append the batch inside ONE Iceberg
+    transaction, i.e. one catalog commit: a reader never observes the keys
+    missing, and a crash leaves the previous snapshot intact. Null keys are
+    rejected and an empty key list never becomes a DELETE predicate.
+  * lift order = TABLE_PLAN order: FK parents (token metadata, gates) first, then
+    facts, then derived tables, so a lift that fails part-way never leaves ledger
+    rows whose token has no metadata row.
+  * watermarks are written in a FINAL step (one commit for all tables), monotonic,
+    and never abort data lifts; a table whose lift raised gets a 'failed' row.
+
+Readers (the ETL's DuckDB, see docs/DEPLOY.md "Serving the lake to DuckDB readers")
+resolve metadata_location from the catalog's iceberg_tables and iceberg_scan() it;
+every lift advances a table's pointer at most once (plus the watermark table).
 
 Usage:
     python -m blueblocx_hyperliquid.iceberg_load --from out/hypercore
@@ -49,13 +59,17 @@ import json
 import logging
 import os
 import re
+import sys
 import uuid
+import warnings
 from pathlib import Path
 
 import pyarrow as pa
 
 from . import config
-from .ops import atomic_write_text
+# re-exported under their historical names: preflight/maintenance/tests import them from here
+from .config import catalog_mode, redacted_uri as _redacted_uri, warehouse_local_path  # noqa: F401
+from .ops import LockHeld, RunLock, atomic_write_text
 
 log = logging.getLogger("blueblocx_hyperliquid.iceberg_load")
 
@@ -67,20 +81,57 @@ LIFT_STATE_FILE = "_lift_state.json"  # last successful lift per staging dir (bo
 DEFAULT_PY_IO_IMPL = "pyiceberg.io.pyarrow.PyArrowFileIO"
 
 # table -> (natural key columns, mode, partition/scope columns)
+# Dict order IS the lift order (lift_directory iterates it): FK parents first
+# (l1_token_metadata is the parent of every token_address; the two gates next),
+# then the facts that reference them, then tables derived from the facts. A lift
+# that fails part-way therefore never leaves child rows without their parent row
+# (ETL contract 4.3: referential closure at export time).
 TABLE_PLAN = {
+    "l1_token_metadata": (["token_address"], "replace_keys", []),
+    "token_whitelist": (["token_address"], "replace_keys", []),
+    "wallet_watchlist": (["wallet_address"], "replace_keys", []),
     "l1_wallet_ledger": (["tx_hash", "event_index", "direction"], "insert_if_absent", ["block_date"]),
     "l3_token_price_usd_1m": (["token_address", "bucket_minute"], "insert_if_absent", ["bucket_date"]),
-    "l4x_perp_position_snapshot": (["as_of_date", "wallet_address", "coin"], "replace_scope", ["as_of_date", "wallet_address"]),
-    "l1_token_metadata": (["token_address"], "replace_keys", []),
     "l4_wallet_metadata": (["wallet_address"], "replace_keys", []),
-    "wallet_watchlist": (["wallet_address"], "replace_keys", []),
-    "token_whitelist": (["token_address"], "replace_keys", []),
+    "l4x_perp_position_snapshot": (["as_of_date", "wallet_address", "coin"], "replace_scope", ["as_of_date", "wallet_address"]),
 }
 
-_WATERMARK_COL = {"l1_wallet_ledger": "block_timestamp", "l3_token_price_usd_1m": "bucket_minute",
-                  "l4x_perp_position_snapshot": "as_of_ts", "l1_token_metadata": "updated_at",
-                  "l4_wallet_metadata": "updated_at", "wallet_watchlist": "updated_at",
-                  "token_whitelist": "updated_at"}
+# Tables that production is not expected to populate: l3_token_price_usd_1m is the
+# development-only output of `--with-prices` (the production unit never passes it),
+# so its absence from the catalog is normal, not a missing-table warning.
+OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"})
+
+# Per table: the per-row WRITE stamp (what the ETL's Tier-A cursor reads: `updated_at`,
+# except l4x which has none), the business-date column (for watermark_date) and the
+# column the bounded lift falls back to when a CSV has no updated_at.
+_STAMP_COL = {name: "updated_at" for name in TABLE_PLAN}
+_STAMP_COL["l4x_perp_position_snapshot"] = "created_at"
+_BUSINESS_DATE_COL = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m": "bucket_date",
+                      "l4x_perp_position_snapshot": "as_of_date"}
+_SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts"}
+
+# Columns that are NOT NULL by construction (natural keys, business dates, stamps,
+# the gates' is_active). The Iceberg schema of the tables created before v1.4.0
+# declares every column optional (Iceberg cannot evolve optional -> required), so the
+# guarantee is enforced at lift time: load_table refuses a batch with a NULL in one of
+# these BEFORE anything is committed. Tables created from v1.4.0 on carry required=True.
+REQUIRED_COLS = {
+    "l1_wallet_ledger": ["tx_hash", "event_index", "direction", "block_timestamp", "block_date", "event_type",
+                         "wallet_address", "token_address", "created_at", "updated_at"],
+    "l3_token_price_usd_1m": ["token_address", "bucket_minute", "bucket_date", "created_at", "updated_at"],
+    "l4x_perp_position_snapshot": ["as_of_ts", "as_of_date", "wallet_address", "coin"],
+    "l1_token_metadata": ["token_address", "standard", "is_stablecoin", "created_at", "updated_at"],
+    "l4_wallet_metadata": ["wallet_address", "updated_at"],
+    "wallet_watchlist": ["wallet_address", "is_active", "created_at", "updated_at"],
+    "token_whitelist": ["token_address", "is_active", "created_at", "updated_at"],
+}
+
+# control.table_watermarks status vocabulary. 'completed' is python-ingestion's value
+# (kept so the shared atlas table stays consistent); the ETL contract proposes
+# ok/running/failed/restated - the constant makes a vocabulary change a one-line edit.
+WM_STATUS_OK = "completed"
+WM_STATUS_FAILED = "failed"          # the last lift of that table raised; previous watermark kept
+WM_STATUS_RESTATED = "restated"      # an operator re-lifted the table (--full / --since)
 
 # control.table_watermarks — python-ingestion/src/table_watermarks.py shape (5 required)
 _WM_COLS = [("namespace", "STRING", True), ("table_name", "STRING", True), ("layer", "STRING", False),
@@ -201,6 +252,22 @@ def since_with_margin(last_success_iso: str | None, hours: float = 1.0) -> str |
     return (t - dt.timedelta(hours=hours)).isoformat()
 
 
+def lift_since(last_success_iso: str | None, run_iso: str | None, hours: float = 1.0) -> str | None:
+    """since_with_margin, but never later than THIS run's own stamp minus the margin.
+
+    Rows are stamped with the run's start instant. A long hand-run (an S3 backfill)
+    that overlaps a scheduled run would otherwise find the lift marker advanced past
+    its own stamp and filter its own rows out of its lift - silently. Compares
+    datetimes, never ISO strings (isoformat drops .000000, so string order lies).
+    None = no marker yet = full lift."""
+    prev = _parse_iso(last_success_iso)
+    if prev is None:
+        return None
+    run = _parse_iso(run_iso)
+    base = min(prev, run) if run is not None else prev
+    return (base - dt.timedelta(hours=hours)).isoformat()
+
+
 def read_lift_state(src_dir: Path) -> dict:
     p = Path(src_dir) / LIFT_STATE_FILE
     if not p.exists():
@@ -270,26 +337,6 @@ def _s3_props() -> dict:
     return props
 
 
-def _redacted_uri(uri: str) -> str:
-    """Catalog URI safe for logs (password hidden)."""
-    try:
-        from sqlalchemy.engine import make_url
-        return make_url(uri).render_as_string(hide_password=True)
-    except Exception:  # noqa: BLE001
-        return uri.split("@")[-1] if "@" in uri else uri
-
-
-def catalog_mode() -> str:
-    """Which catalog the environment selects: 'rest' (NESSIE_URI), 'sql'
-    (HL_CATALOG_URI: PostgreSQL or SQLite via SQLAlchemy) or 'local' (the dev
-    SQLite catalog under HL_OUT_DIR/iceberg)."""
-    if os.environ.get("NESSIE_URI"):
-        return "rest"
-    if os.environ.get("HL_CATALOG_URI"):
-        return "sql"
-    return "local"
-
-
 def _sql_props(sql_uri: str, local_dir: Path | None = None) -> dict:
     """pyiceberg SQL-catalog properties: the catalog rows live in the database
     named by HL_CATALOG_URI (PostgreSQL in production — SQLite is single-writer,
@@ -306,25 +353,6 @@ def _sql_props(sql_uri: str, local_dir: Path | None = None) -> dict:
     if warehouse.startswith(("s3://", "s3a://", "s3n://")):
         props.update(_s3_props())
     return props
-
-
-def warehouse_local_path(warehouse: str) -> Path | None:
-    """Filesystem path of a file:// warehouse, else None. Accepts file:///abs/path,
-    file://localhost/abs/path and the Windows forms file://D:/x and file:///D:/x
-    (the dev catalog has always written file://{drive}:/...)."""
-    if not warehouse.startswith("file://"):
-        return None
-    from urllib.parse import unquote
-    rest = unquote(warehouse[len("file://"):])
-    if rest.startswith("localhost/"):
-        rest = rest[len("localhost"):]
-    if len(rest) >= 3 and rest[0] == "/" and rest[2] == ":":
-        rest = rest[1:]                                # file:///D:/x -> D:/x
-    is_posix_abs = rest.startswith("/")
-    is_windows_abs = len(rest) >= 2 and rest[1] == ":" and rest[0].isalpha()
-    if not (is_posix_abs or is_windows_abs):
-        return None                                    # file://host/share is not local
-    return Path(rest)
 
 
 def load_catalog_from_env(local_dir: Path | None = None):
@@ -397,10 +425,15 @@ TABLE_PROPERTIES = {
 }
 
 
-def ensure_table(catalog, namespace: str, name: str, spec: dict, tz: bool = True):
+def ensure_table(catalog, namespace: str, name: str, spec: dict, tz: bool = True, required=()):
+    """Create the table from the DDL shape when absent (required=True for the columns
+    in `required`); an EXISTING table is returned as is - Iceberg cannot promote an
+    optional column to required, so older tables keep their nullable schema."""
     catalog.create_namespace_if_not_exists(namespace)
     ident = f"{namespace}.{name}"
-    schema = _iceberg_schema(spec["columns"], tz)
+    req = set(required or ())
+    cols = [(c[0], c[1], (c[2] if len(c) > 2 else c[0] in req)) for c in spec["columns"]]
+    schema = _iceberg_schema(cols, tz)
     if spec.get("partition"):
         table = catalog.create_table_if_not_exists(
             ident, schema=schema, partition_spec=_partition_spec(schema, spec["partition"]),
@@ -474,14 +507,54 @@ def _and(*exprs):
     return out
 
 
-def load_table(table, arrow: pa.Table, key_cols: list[str], mode: str, scope_cols: list[str]) -> dict:
-    """Apply one of the idempotent strategies; returns counts."""
+_NO_MATCH_WARNING = "Delete operation did not match any records"
+
+
+def _replace(table, arrow: pa.Table, predicates: list) -> int:
+    """Delete every row matching `predicates`, then append `arrow`, in ONE Iceberg
+    transaction = one new metadata.json and one optimistic catalog UPDATE. The
+    committed current snapshot is always the append, so a reader never sees the
+    replaced keys missing and a failure before the commit leaves the previous
+    snapshot untouched (verified against pyiceberg 0.12: metadata_log grows by one).
+    A delete that matches nothing (new keys) only warns inside pyiceberg; that
+    warning is expected here and silenced. Returns the number of catalog commits (1)."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_NO_MATCH_WARNING)
+        with table.transaction() as tx:
+            for p in predicates:
+                if p is not None:
+                    tx.delete(p)
+            tx.append(arrow)
+    return 1
+
+
+def check_batch(table_name: str, arrow: pa.Table, key_cols: list[str], required_cols=()) -> None:
+    """Refuse a batch that would violate the contract BEFORE any commit: a NULL in a
+    natural-key or NOT-NULL-by-construction column, or two rows with the same natural
+    key inside one batch (insert-if-absent only compares against the lake; the
+    staged CSV is keyed, so a duplicate means a hand-edited file)."""
+    for c in list(key_cols) + [c for c in required_cols if c not in key_cols]:
+        if c in arrow.column_names and arrow.column(c).null_count:
+            kind = "natural key" if c in key_cols else "NOT-NULL-by-construction column"
+            raise ValueError(f"{table_name}: NULL in {kind} {c} ({arrow.column(c).null_count} row(s))")
+    keys = list(zip(*[arrow.column(c).to_pylist() for c in key_cols]))
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"{table_name}: {len(keys) - len(set(keys))} duplicate natural key(s) within the batch")
+
+
+def _ident(table) -> str:
+    name = table.name()
+    return ".".join(name) if isinstance(name, tuple) else str(name)
+
+
+def load_table(table, arrow: pa.Table, key_cols: list[str], mode: str, scope_cols: list[str],
+               required_cols=()) -> dict:
+    """Apply one of the idempotent strategies; returns counts (`commits` = catalog
+    commits made for this table, 0 when nothing had to be written)."""
     if arrow.num_rows == 0:
-        return {"incoming": 0, "written": 0, "skipped_existing": 0}
+        return {"incoming": 0, "written": 0, "skipped_existing": 0, "commits": 0}
+    check_batch(_ident(table), arrow, key_cols, required_cols)
     arrow = conform(arrow, table)
-    for c in key_cols:
-        if arrow.column(c).null_count:
-            raise ValueError(f"{table.name()}: null natural key in {c}")
     if mode == "insert_if_absent":
         part_col = scope_cols[0]
         touched = sorted(set(arrow.column(part_col).to_pylist()))
@@ -494,82 +567,100 @@ def load_table(table, arrow: pa.Table, key_cols: list[str], mode: str, scope_col
         if new.num_rows:
             table.append(new)
         return {"incoming": arrow.num_rows, "written": new.num_rows,
-                "skipped_existing": arrow.num_rows - new.num_rows}
+                "skipped_existing": arrow.num_rows - new.num_rows, "commits": 1 if new.num_rows else 0}
     if mode == "replace_scope":
         from pyiceberg.expressions import EqualTo
         scope = sorted(set(zip(*[arrow.column(c).to_pylist() for c in scope_cols])))
-        # ONE delete per leading scope value (the partition, e.g. as_of_date) with an
-        # In() over the trailing column (wallets) — not one commit per tuple. Every
-        # pyiceberg delete is a copy-on-write commit that rewrites the touched data
-        # file and the whole metadata.json; at hourly cadence W wallets used to cost
-        # W commits per lift (thousands of snapshots a day).
-        deletes = 0
+        # One predicate per leading scope value (the partition, e.g. as_of_date) with an
+        # In() over the trailing column (wallets); all of them plus the append go into
+        # one transaction (one commit per lift for this table, whatever the day count).
+        predicates = []
         if len(scope_cols) == 2:
             by_lead: dict = {}
             for lead, tail in scope:
                 by_lead.setdefault(lead, []).append(tail)
             for lead, tails in sorted(by_lead.items()):
-                for i in range(0, len(tails), 500):
-                    table.delete(_and(EqualTo(scope_cols[0], lead), _in_filter(scope_cols[1], tails[i:i + 500])))
-                    deletes += 1
+                predicates.append(_and(EqualTo(scope_cols[0], lead), _in_filter(scope_cols[1], tails)))
         else:
             for tup in scope:
-                table.delete(_and(*[EqualTo(c, v) for c, v in zip(scope_cols, tup)]))
-                deletes += 1
-        table.append(arrow)
+                predicates.append(_and(*[EqualTo(c, v) for c, v in zip(scope_cols, tup)]))
+        commits = _replace(table, arrow, predicates)
         return {"incoming": arrow.num_rows, "written": arrow.num_rows, "replaced_scopes": len(scope),
-                "delete_commits": deletes}
+                "commits": commits}
     if mode == "replace_keys":
         c = key_cols[0]  # single-column keys for dimension tables
-        vals = arrow.column(c).to_pylist()
-        for i in range(0, len(vals), 500):
-            flt = _in_filter(c, vals[i:i + 500])
-            if flt is not None:
-                table.delete(flt)
-        table.append(arrow)
-        return {"incoming": arrow.num_rows, "written": arrow.num_rows}
+        commits = _replace(table, arrow, [_in_filter(c, arrow.column(c).to_pylist())])
+        return {"incoming": arrow.num_rows, "written": arrow.num_rows, "commits": commits}
     raise ValueError(mode)
 
 
 # --- control.table_watermarks ------------------------------------------------------
 
+def _naive_utc(ts):
+    if ts is None:
+        return None
+    return ts.astimezone(dt.timezone.utc).replace(tzinfo=None) if ts.tzinfo else ts
+
+
 def write_watermarks(catalog, namespace: str, entries: list[tuple], run_id: str) -> dict[str, str]:
-    """Upsert the watermark rows of one lift in TWO commits (one delete + one append)
-    instead of two per table. `entries` = (table_name, watermark_col, watermark_ts,
-    row_count, snapshot_id). Monotonic per table: an older watermark never replaces
-    a newer one ("kept_newer"). Returns {table_name: written|kept_newer}."""
+    """Upsert the watermark rows of one lift in ONE commit (delete + append in one
+    transaction). `entries` = (table_name, watermark_col, watermark_ts, row_count,
+    snapshot_id[, watermark_date[, status]]):
+      * status completed (default): monotonic per table - an older watermark never
+        replaces a newer one ("kept_newer"); watermark_ts = max WRITE stamp of the
+        lifted batch, watermark_date = max business date of the batch;
+      * failed: the lift of that table raised; the previous row's watermark values
+        are kept and only status/run_id/updated_at change;
+      * restated: an operator re-lifted the table (--full / --since); written even
+        when the stamp is not newer.
+    Returns {table_name: written|kept_newer}."""
     from pyiceberg.expressions import EqualTo
     if not entries:
         return {}
     tbl = ensure_table(catalog, CONTROL_NS, "table_watermarks", {"columns": _WM_COLS}, tz=False)
     names = sorted({e[0] for e in entries})
     pred = _and(EqualTo("namespace", namespace), _in_filter("table_name", names))
-    existing = tbl.scan(row_filter=pred, selected_fields=("table_name", "watermark_ts")).to_arrow().to_pylist()
-    prev: dict[str, dt.datetime] = {}
+    existing = tbl.scan(row_filter=pred, selected_fields=("table_name", "watermark_col", "watermark_ts",
+                                                          "watermark_date", "row_count")).to_arrow().to_pylist()
+    prev: dict[str, dict] = {}
     for r in existing:
-        if r.get("watermark_ts") is not None:
-            prev[r["table_name"]] = max(prev.get(r["table_name"], r["watermark_ts"]), r["watermark_ts"])
+        cur = prev.get(r["table_name"])
+        if cur is None or (r.get("watermark_ts") or dt.datetime.min) > (cur.get("watermark_ts") or dt.datetime.min):
+            prev[r["table_name"]] = r
     now_naive = dt.datetime.now(tz=dt.timezone.utc).replace(tzinfo=None)
     status: dict[str, str] = {}
     rows: list[dict] = []
-    for table_name, watermark_col, watermark_ts, row_count, snapshot_id in entries:
-        wm_naive = (watermark_ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
-                    if watermark_ts.tzinfo else watermark_ts)
-        if table_name in prev and prev[table_name] > wm_naive:
+    for entry in entries:
+        table_name, watermark_col, watermark_ts, row_count, snapshot_id = entry[:5]
+        watermark_date = entry[5] if len(entry) > 5 else None
+        wm_status = entry[6] if len(entry) > 6 else WM_STATUS_OK
+        wm_naive = _naive_utc(watermark_ts)
+        old = prev.get(table_name)
+        if wm_status == WM_STATUS_OK and old is not None and old.get("watermark_ts") is not None \
+                and wm_naive is not None and old["watermark_ts"] > wm_naive:
             status[table_name] = "kept_newer"
             continue
+        if wm_status == WM_STATUS_FAILED and old is not None:
+            # keep the last good watermark (value AND the column it was measured on);
+            # only the status says the table is behind
+            wm_naive = old.get("watermark_ts")
+            watermark_col = old.get("watermark_col") or watermark_col
+            watermark_date = old.get("watermark_date")
+            row_count = old.get("row_count") if row_count is None else row_count
+        if watermark_date is None and wm_naive is not None:
+            watermark_date = wm_naive.date()
         status[table_name] = "written"
         rows.append({
             "namespace": namespace, "table_name": table_name, "layer": table_name.split("_")[0],
             "producer": "blueblocx_hyperliquid.iceberg_load", "watermark_col": watermark_col,
-            "watermark_date": wm_naive.date(), "watermark_ts": wm_naive,
+            "watermark_date": watermark_date, "watermark_ts": wm_naive,
             "row_count": row_count, "snapshot_id": str(snapshot_id) if snapshot_id is not None else None,
-            "job_name": f"{namespace}_lift", "run_id": run_id, "updated_at": now_naive, "status": "completed",
+            "job_name": f"{namespace}_lift", "run_id": run_id, "updated_at": now_naive, "status": wm_status,
         })
     if rows:
         written = [r["table_name"] for r in rows]
-        tbl.delete(_and(EqualTo("namespace", namespace), _in_filter("table_name", written)))
-        tbl.append(conform(rows_to_arrow(rows, _WM_COLS, tz=False), tbl))
+        _replace(tbl, conform(rows_to_arrow(rows, _WM_COLS, tz=False), tbl),
+                 [_and(EqualTo("namespace", namespace), _in_filter("table_name", written))])
     return status
 
 
@@ -605,14 +696,55 @@ def _table_row_count(table) -> int | None:
         return None
 
 
+def _max_value(arrow: pa.Table, col: str):
+    """max() of a column computed in Arrow (no Python materialisation; nulls skipped);
+    None for an absent column, an empty batch or an all-null column."""
+    import pyarrow.compute as pc
+    if col not in arrow.column_names or arrow.num_rows == 0:
+        return None
+    return pc.max(arrow.column(col)).as_py()
+
+
+def dispose_catalog(catalog) -> None:
+    """Release a SQL catalog's connection pool (SQLite keeps the file open on Windows;
+    PostgreSQL holds a server connection). A no-op for REST catalogs."""
+    engine = getattr(catalog, "engine", None)
+    if engine is not None:
+        engine.dispose()
+
+
+def missing_tables(have) -> tuple[list[str], list[str]]:
+    """(tables the lift creates and are absent, optional tables absent) given the set
+    of table names present in the namespace - the one place that knows which planned
+    tables production is not expected to populate."""
+    have = set(have)
+    return ([t for t in TABLE_PLAN if t not in have and t not in OPTIONAL_TABLES],
+            [t for t in TABLE_PLAN if t not in have and t in OPTIONAL_TABLES])
+
+
 def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
                    tables: list[str] | None = None, namespace: str = DDL_NAMESPACE,
-                   since_iso: str | None = None) -> dict:
+                   since_iso: str | None = None, status: str = WM_STATUS_OK,
+                   watermarks: bool = True) -> dict:
     """Load every known CSV in src_dir into Iceberg `namespace`. Returns a report.
-    Data lifts first; watermarks are a final, non-fatal step. With `since_iso` only
-    rows updated after that instant are lifted (bounded incremental lift)."""
-    if catalog is None:
+    Data lifts first, in TABLE_PLAN order; watermarks are a final, non-fatal step
+    (`watermarks=False` skips them, e.g. for an early partial lift). With `since_iso`
+    only rows updated after that instant are lifted (bounded incremental lift).
+    `status` is the control.table_watermarks status to record (restated for an
+    operator re-lift). If a table's lift raises, a 'failed' watermark row is written
+    for it (best effort) and the exception propagates."""
+    own_catalog = catalog is None
+    if own_catalog:
         catalog, _ = load_catalog_from_env(local_dir)
+    try:
+        return _lift_directory(src_dir, catalog, tables, namespace, since_iso, status, watermarks)
+    finally:
+        if own_catalog:
+            dispose_catalog(catalog)
+
+
+def _lift_directory(src_dir: Path, catalog, tables, namespace: str, since_iso: str | None,
+                    status: str, watermarks: bool) -> dict:
     ddl = parse_ddl()
     run_id = uuid.uuid4().hex[:12]
     report: dict[str, dict] = {"_since": since_iso}
@@ -624,35 +756,53 @@ def lift_directory(src_dir: Path, catalog=None, local_dir: Path | None = None,
         if not csv_path.exists():
             continue
         spec = ddl[name]
-        rows = read_csv_rows(csv_path, since_iso, fallback_ts_col=_WATERMARK_COL[name])
-        arrow = rows_to_arrow(rows, spec["columns"], tz=True)
-        table = ensure_table(catalog, namespace, name, spec, tz=True)
-        counts = load_table(table, arrow, key_cols, mode, scope_cols)
-        table.refresh()
+        stamp_col = _STAMP_COL[name]
+        table = None
+        try:
+            rows = read_csv_rows(csv_path, since_iso, fallback_ts_col=_SINCE_FALLBACK_COL.get(name, stamp_col))
+            arrow = rows_to_arrow(rows, spec["columns"], tz=True)
+            table = ensure_table(catalog, namespace, name, spec, tz=True, required=REQUIRED_COLS.get(name, ()))
+            counts = load_table(table, arrow, key_cols, mode, scope_cols, required_cols=REQUIRED_COLS.get(name, ()))
+            table.refresh()
+        except Exception as e:
+            log.error("lift %s failed: %s: %s", name, type(e).__name__, str(e)[:200])
+            if watermarks:
+                failed = (name, stamp_col, None, _table_row_count(table) if table is not None else None, None,
+                          None, WM_STATUS_FAILED)
+                try:
+                    write_watermarks(catalog, namespace, pending_wm + [failed], run_id)
+                except Exception as e2:  # noqa: BLE001 — the data error is the one to report
+                    log.warning("could not record the failed watermark for %s: %s", name, e2)
+            raise
         total = _table_row_count(table)
         snap = table.current_snapshot()
-        wm_col = _WATERMARK_COL[name]
-        wm_vals = [v for v in arrow.column(wm_col).to_pylist() if v is not None] if arrow.num_rows else []
-        if wm_vals:
-            wm = max(wm_vals)
-            wm_ts = wm if isinstance(wm, dt.datetime) else dt.datetime.combine(wm, dt.time(), dt.timezone.utc)
-            pending_wm.append((name, wm_col, wm_ts, total, snap.snapshot_id if snap else None))
+        wm_ts = _max_value(arrow, stamp_col)
+        if wm_ts is not None:
+            assert isinstance(wm_ts, dt.datetime), f"{name}: stamp column {stamp_col} is not a timestamp"
+            biz_col = _BUSINESS_DATE_COL.get(name)
+            wm_date = _max_value(arrow, biz_col) if biz_col else None
+            if isinstance(wm_date, dt.datetime):
+                wm_date = wm_date.date()
+            pending_wm.append((name, stamp_col, wm_ts, total, snap.snapshot_id if snap else None, wm_date, status))
         counts["table_total"] = total
         report[name] = counts
-        log.info("lift %-28s incoming=%6d written=%6d total=%7s", name, counts["incoming"],
-                 counts["written"], "?" if total is None else total)
+        log.info("lift %-28s incoming=%6d written=%6d commits=%d total=%7s", name, counts["incoming"],
+                 counts["written"], counts.get("commits", 0), "?" if total is None else total)
     wm_status: dict[str, str] = {}
-    if pending_wm:
+    if pending_wm and watermarks:
         try:
-            wm_status = write_watermarks(catalog, namespace, pending_wm, run_id)      # 2 commits for all tables
+            wm_status = write_watermarks(catalog, namespace, pending_wm, run_id)      # 1 commit for all tables
         except Exception as e:  # noqa: BLE001 — never abort data lifts over watermark rows
             wm_status = {name: f"failed: {type(e).__name__}: {str(e)[:120]}" for name, *_ in pending_wm}
             log.warning("watermark write failed for %s: %s", namespace, e)
     report["_watermarks"] = wm_status
+    report["_run_id"] = run_id
     return report
 
 
-def main() -> None:
+def main(argv=None) -> int:
+    """Exit codes: 0 lifted, 1 the lift raised (traceback), 3 another run holds the
+    state dir's lock (daily / extract / maintenance share it; retry when it is free)."""
     config.load_env()
     config.setup_logging()
     ap = argparse.ArgumentParser(description="Lift HyperCore/HyperEVM CSVs into Iceberg")
@@ -664,19 +814,28 @@ def main() -> None:
                     help="lift only rows updated after this ISO instant (default: the last successful "
                          f"lift recorded in {LIFT_STATE_FILE} minus 1h)")
     ap.add_argument("--full", action="store_true", help="ignore the lift state: lift every staged row")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     tables = [t for t in args.tables.split(",") if t] if args.tables else None
     src = Path(args.src)
     run_iso = dt.datetime.now(tz=dt.timezone.utc).isoformat()
     since = None
     if not args.full:
-        since = args.since or since_with_margin(read_lift_state(src).get("last_success_run_iso"))
-    rep = lift_directory(src, local_dir=Path(args.local_dir) if args.local_dir else None,
-                         tables=tables, namespace=args.namespace, since_iso=since)
-    if not tables:                    # a partial (subset) lift must not advance the marker
-        write_lift_state(src, run_iso, rep)
+        since = args.since or lift_since(read_lift_state(src).get("last_success_run_iso"), run_iso)
+    # a deliberate re-lift (--full / --since) re-lands rows with their existing stamps:
+    # recorded as 'restated' so a reader of control.table_watermarks can tell
+    status = WM_STATUS_RESTATED if (args.full or args.since) else WM_STATUS_OK
+    try:
+        with RunLock(src / ".daily.lock"):
+            rep = lift_directory(src, local_dir=Path(args.local_dir) if args.local_dir else None,
+                                 tables=tables, namespace=args.namespace, since_iso=since, status=status)
+            if not tables:                    # a partial (subset) lift must not advance the marker
+                write_lift_state(src, run_iso, rep)
+    except LockHeld as e:
+        log.error("%s - another run owns the state dir; retry when it has finished", e)
+        return 3
     print(json.dumps(rep, indent=2, default=str))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

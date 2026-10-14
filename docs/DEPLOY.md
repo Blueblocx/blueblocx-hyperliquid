@@ -7,9 +7,11 @@ and lifts the rows into Iceberg (`nessie.hypercore.*`). Serving those rows to th
 product (Rust L4 crates, Trino view, Postgres export, core-api) is work in the
 `atlas-project` repo — see [§11](#11-what-this-repo-does-not-do).
 
-Validated on 39 live wallets (6 account shapes); the code and its 100 unit tests
+Validated on 39 live wallets (6 account shapes); the code and its unit tests
 run on Linux (Ubuntu 24.04 / Python 3.12.3) and Windows (Python 3.14); CI covers
-Python 3.12 + 3.13 and the Docker image build.
+Python 3.12 + 3.13 and the Docker image build. The lake is read by the
+dagster_blueblocx ETL with DuckDB through the PostgreSQL catalog; what the ETL team
+needs is in [`docs/ETL_HANDOFF_HYPERCORE.md`](ETL_HANDOFF_HYPERCORE.md).
 
 ---
 
@@ -95,7 +97,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.3.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.4.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -237,9 +239,10 @@ warehouse**; `HL_OUT_DIR` must stay on the local disk).
 Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
 
 - **Volume.** Hourly lifts write a few MB of Parquet (a market-maker wallet is
-  ~30 MB/day); a lift is ~14 Iceberg commits regardless of wallet count (one
-  delete + one append per replaced table, two for all watermark rows). On a
-  synchronous NFS export that is ~5–10 s of NFS time per hour.
+  ~30 MB/day); a lift is at most one Iceberg commit per table that received rows
+  (delete + append of a replaced table happen in ONE transaction since v1.4.0)
+  plus one commit for all watermark rows, i.e. ~8 commits regardless of wallet
+  count. On a synchronous NFS export that is a few seconds of NFS time per hour.
 - **Atomicity.** Every file pyiceberg writes gets a new unique name and is
   closed (NFS flushes on close) before the catalog pointer is swapped with an
   optimistic `UPDATE … WHERE metadata_location = <previous>` in PostgreSQL.
@@ -258,16 +261,13 @@ Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
   warehouse directory as a separate nfs4 mount below `/mnt/blueblocx`; the guard
   accepts a nested mount of the same filesystem type and rejects a bind mount of
   the root disk (what you get when the NAS is not mounted).
-- **Readers.** pyiceberg or DuckDB ≥ 1.5 on this host (DuckDB: read
-  `metadata_location` from `iceberg_tables` and `iceberg_scan()` it — pyiceberg
-  writes no `version-hint.text`). Another host can mount the same export at the
-  **identical path** (manifests store absolute `file:///mnt/…` paths) and use
-  the same PostgreSQL catalog: iceberg-rust `iceberg-catalog-sql` with catalog
-  name `hl` + an fs storage factory (the atlas crates hard-code REST + S3 and
-  would need a second catalog in the one crate that reads hypercore), or Trino
-  ≥ 471 with `iceberg.catalog.type=jdbc`, `fs.local.enabled=true`,
-  `local.location=local:///`. Plain Parquet globs are unsafe for the replaced
-  tables (old snapshot files coexist until expired).
+- **Readers.** pyiceberg or DuckDB on this host, and the ETL's DuckDB from the
+  ETL host — see "Serving the lake to DuckDB readers" below. Alternatives that
+  were considered and not chosen: iceberg-rust `iceberg-catalog-sql` + an fs
+  storage factory (the atlas crates hard-code REST + S3), Trino ≥ 471 with
+  `iceberg.catalog.type=jdbc` + `fs.local.enabled=true` (the atlas Trino is 465).
+  Plain Parquet globs are unsafe for the replaced tables (old snapshot files
+  coexist until expired).
 - **If nothing cross-host ever reads the lake**, PostgreSQL is optional:
   `HL_CATALOG_URI=sqlite:////var/lib/hypercore/catalog.db` is a single-writer
   catalog on the local disk and this pipeline is exactly one writer (preflight
@@ -280,6 +280,98 @@ Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
   `write.metadata.delete-after-commit.enabled=true`. pyiceberg deletes no data
   files on expiry (small orphans remain; sweeper is a follow-up) and has no
   compaction (hourly lifts leave one small Parquet per partition per hour).
+
+### Serving the lake to DuckDB readers
+
+The dagster_blueblocx ETL reads hypercore with **DuckDB** through this catalog
+(owner decision, 2026-10-14) — no Nessie, no Trino. Two things make that work:
+
+- **Identical mount path.** pyiceberg stores absolute `file:///mnt/blueblocx/hypercore/warehouse/…`
+  locations in every metadata and manifest file, so the reader host mounts the
+  same NFS export **read-only at the same path** (Synology: an NFS rule for the
+  ETL host with privilege *Read only*; mount options
+  `ro,vers=4.1,hard,noatime,_netdev,lookupcache=positive`).
+- **A read-only catalog role.** `READER_CIDR=<etl host ip>/32 bash deploy/bootstrap.sh`
+  creates role `hl_ro` (SELECT on the catalog tables, `default_transaction_read_only`,
+  default privileges for tables `hl` creates later), makes PostgreSQL listen on this
+  host's LAN address, adds a `pg_hba` rule for exactly that CIDR (and a `ufw` rule
+  when ufw is active), and writes `/etc/hypercore/reader.env` (mode 600, owned by
+  you) with `HL_CATALOG_URI` for `hl_ro` and `WAREHOUSE`. Hand the credentials to
+  the ETL team out of band — never in chat, commits or docs.
+
+How a reader works (the two-step read; `iceberg_scan()` needs a constant path):
+
+```sql
+-- 1. one catalog read per ETL run (never cache a pointer across runs: metadata files
+--    older than write.metadata.previous-versions-max commits are deleted)
+SELECT table_name, metadata_location FROM iceberg_tables
+WHERE catalog_name = 'hl' AND table_namespace = 'hypercore';
+-- 2. per table, with the location from step 1
+SET TimeZone = 'UTC';                      -- timestamptz columns then render as +00:00
+SELECT count(*) FROM iceberg_scan('<metadata_location>');
+-- 2'. scheme-independent form: the table root with the committed version pinned
+--     (<metadata_location> = <root>/metadata/<version>.metadata.json). Reads exactly
+--     the file the catalog points at and resolves data/manifest paths relative to the
+--     root, so it never depends on how DuckDB treats the absolute file:// locations
+--     stored inside the manifests.
+SELECT count(*) FROM iceberg_scan('<root>', version = '<version>', allow_moved_paths = true);
+```
+
+Which form the ETL host should use (the raw `file:///…` location, the stripped
+local path, or the pinned-version table root) is settled by the smoke test — run it
+from a throwaway venv as your login user (duckdb is deliberately not a dependency
+of the pipeline; never pip install into `/opt`; the smoke needs only `duckdb` and
+`sqlalchemy`, not pyiceberg):
+
+```bash
+python3 -m venv ~/duckdb-venv && ~/duckdb-venv/bin/pip install duckdb sqlalchemy psycopg2-binary
+cd ~/blueblocx-hyperliquid && HL_ENV_FILE=/etc/hypercore/reader.env ~/duckdb-venv/bin/python -m blueblocx_hyperliquid.duckdb_smoke
+```
+
+It reports the DuckDB / iceberg-extension versions, the scan form that worked (and
+prints it), row counts and the `max(updated_at)` rendering per table. The same
+command on the ETL host (through `hl_ro` and the read-only mount) is the ETL's
+acceptance test. Verified 2026-10-15 with DuckDB 1.5.6 (iceberg extension
+890b78a9c) against a development lake: DuckDB resolves standard three-slash
+`file:///…` locations (the form production writes), rejects the two-slash
+`file://C:/…` form the Windows dev catalog writes (pyiceberg on Windows cannot
+write the other form), and the pinned-version table-root form read every table in
+both cases; `SET TimeZone = 'UTC'` makes `max(updated_at)` render as `… +00`.
+`preflight --duckdb` runs the identical check when `duckdb` happens to be
+importable and FAILs otherwise; without the flag the online preflight runs it
+only when duckdb is importable, and `--offline` never runs it (the extension
+install needs egress to `extensions.duckdb.org` once per venv, and the smoke
+reads the catalog). `l3_token_price_usd_1m` is reported as
+*optional / absent* in production (development-only output). Concurrency is safe:
+every file pyiceberg writes is immutable and uniquely named, the catalog pointer
+moves at most once per table per lift, and snapshot expiry (7 days) deletes no
+data files — a scan that started before a commit keeps reading its snapshot.
+
+Hand-off notes for the ETL team (identifiers, Tier-A semantics, lift timing,
+per-table SQL) live in [`docs/ETL_HANDOFF_HYPERCORE.md`](ETL_HANDOFF_HYPERCORE.md).
+
+### Restatements and the ETL's full refresh
+
+The lake is append-only for facts (`l1_wallet_ledger` is insert-if-absent: a
+re-pulled row never changes its lake row) and replace-by-key for the dimension
+tables. Therefore:
+
+- A **correction** to already-landed ledger rows (a mapper fix, a hand re-pull
+  with `--days N`) does **not** reach the lake by itself; it needs an explicit
+  Iceberg delete of the affected keys followed by a re-lift. Treat that as a
+  *restatement*: tell the ETL team before it runs (they stop their hourly
+  schedule and run a full refresh afterwards), and run it as
+  `python -m blueblocx_hyperliquid.iceberg_load --from $HL_OUT_DIR/hypercore --full`
+  between timer ticks — that path records `status='restated'` in
+  `control.table_watermarks` for every touched table.
+- The ETL's own **full refresh** reads every table once while truncating its
+  destination; the ETL team announces it, and the only coordination needed on
+  this side is that the lift is already single-commit per table (a reader never
+  sees a half-replaced table). Nothing has to be paused.
+- Rows are stamped with the **run start** instant and committed at the end of the
+  run (≤ 50 min later under the hourly unit), inside the ETL's 2-hour re-pull
+  margin. The run logs a warning when that gap exceeds 60 minutes (a long hand
+  run): announce hand runs longer than 90 minutes to the ETL team.
 
 ### Hourly cadence
 
@@ -333,8 +425,16 @@ Rules for hourly operation:
   because that backfill can outlast the 50-min cap inside a scheduled run.
 - A killed or OOM-killed run can no longer block the next tick: the lock
   records the PID and is discarded when that process is gone (`HL_LOCK_STALE_HOURS=2`
-  is the age fallback), SIGTERM from the timeout unwinds cleanly, and a lock
-  that is genuinely held is itself summarised (exit 3).
+  is the age fallback for a holder that cannot be observed), SIGTERM from the
+  timeout unwinds cleanly, and a lock that is genuinely held is itself
+  summarised (exit 3). A lock whose PID is **a live pipeline process is never
+  stolen**, however old (identity from `/proc/<pid>/cmdline`; a PID recycled by an
+  unrelated process after a reboot is discarded at once): `extract`,
+  `iceberg_load`, `maintenance` and the scheduled run all take
+  the same `.daily.lock`, so while a hand-run backfill of a market-maker wallet
+  runs for hours, every hourly tick exits 3, the unit shows *failed* and the
+  monitor says `lock_held` — expected, not an outage. The hand run's rows are
+  still lifted by its own lift (the cut-off never passes the run's own stamp).
 - `l4x_perp_position_snapshot` keeps the **last snapshot per UTC day** per
   wallet (its key is `as_of_date`); hourly runs replace the day's rows, so the
   lake holds no intra-day position history, and the PnL oracle (needs a 20–28 h
@@ -484,9 +584,13 @@ cd ~/blueblocx-hyperliquid
 git add -A && git commit -m "..." && git push
 git tag -a v1.0.1 -m "..." && git push --tags            # CI runs on GitHub (tests + image)
 
-# 2) move production to the tag while no run is active
+# 2) move production to the tag while no run is active - scheduled OR hand-run: bootstrap
+#    checks both; by hand, also confirm nothing holds the lock
 sudo systemctl stop hypercore-hourly.timer hypercore-daily.timer 2>/dev/null
 while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done
+pgrep -af 'blueblocx_hyperliquid\.' ; sudo cat /var/lib/hypercore/hypercore/.daily.lock 2>/dev/null   # both must show nothing live
+# if the release notes list a state-file change (staged CSVs, _watermarks.json): tar HL_OUT_DIR first
+sudo tar -C /var/lib -czf ~/hypercore-state-$(date -u +%Y%m%dT%H%M).tgz hypercore
 cd /opt/blueblocx-hyperliquid && git fetch --tags && git checkout --detach v1.0.1
 .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
@@ -500,16 +604,26 @@ sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-dai
 sudo systemctl start hypercore-hourly.timer
 ```
 
-`RELEASE_TAG=v1.3.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
+`RELEASE_TAG=v1.4.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
 step 2 for you (checkout, pip, tests, units + web monitor restart + wrapper +
-daemon-reload, env keys new in the release, preflight), refuses to run while a timer or a run is active, and is
-the simpler choice whenever a release touches `deploy/` or the NAS is not at
-`/mnt/blueblocx` (the shipped units hard-code that path; bootstrap rewrites it);
-re-enable the timers afterwards. Rollback is
-`git checkout --detach <previous tag>` + the same pip/preflight steps. State files (`_watermarks.json`, `_lift_state.json`, staged CSVs) are
-forward- and backward-compatible across versions of this repo so far; a release
-note will say if that changes. Never run `git pull` or an editor inside `/opt`:
-the hourly timer executes whatever is on disk at minute 10.
+daemon-reload, env keys new in the release, preflight), refuses to run while a
+timer, a run or a hand-run pipeline process is active, and is the simpler
+choice whenever a release touches `deploy/` or the NAS is not at `/mnt/blueblocx`
+(the shipped units hard-code that path; bootstrap rewrites it); re-enable the
+timers afterwards. **Rollback** is the same bootstrap with the previous tag —
+use bootstrap rather than a manual checkout whenever the release changed
+`deploy/` (a unit file left behind by the newer release may pass flags the older
+code does not know). State files (`_watermarks.json`, `_lift_state.json`, staged
+CSVs) are forward- and backward-compatible across versions of this repo so far;
+the release notes below say when a release changes them or the lake schema (then
+the rollback order is given there too). Never run `git pull` or an editor inside
+`/opt`: the hourly timer executes whatever is on disk at minute 10.
+
+Release notes (state-file and lake-schema changes only):
+
+| release | state files | lake | rollback |
+|---|---|---|---|
+| v1.4.0 | none | replaced tables are rewritten in one commit per lift; `control.table_watermarks` rows gain the statuses `failed` / `restated` and `watermark_ts` becomes the max **write** stamp (was business time); lift order parents → facts → derived | `RELEASE_TAG=v1.3.0 bash deploy/bootstrap.sh` (v1.3.0 reports `kept_newer` on a few watermark rows for an hour — harmless) |
 
 ## 9. Backup / recovery
 

@@ -353,7 +353,8 @@ def _tcp_reachable(url: str, timeout: float = 3.0) -> bool:
 
 def _check_sql_catalog(required: bool) -> Check:
     """Standalone mode: HL_CATALOG_URI (PostgreSQL/SQLite) + WAREHOUSE (file:// or s3://)."""
-    from .iceberg_load import TABLE_PLAN, _redacted_uri, load_catalog_from_env, warehouse_local_path
+    from .iceberg_load import (TABLE_PLAN, _redacted_uri, dispose_catalog, load_catalog_from_env, missing_tables,
+                               warehouse_local_path)
     uri = os.environ.get("HL_CATALOG_URI", "")
     warehouse = os.environ.get("WAREHOUSE", "")
     notes, fails = [], []
@@ -400,17 +401,49 @@ def _check_sql_catalog(required: bool) -> Check:
         return _fail("iceberg", f"SQL catalog {_redacted_uri(uri)}: {type(e).__name__}: {str(e)[:140]}"
                                 f" - is PostgreSQL running and the driver (psycopg2-binary) installed?")
     finally:
-        engine = getattr(catalog, "engine", None)
-        if engine is not None:
-            engine.dispose()                     # release the connection (SQLite keeps the file open)
-    missing = [t for t in TABLE_PLAN if t not in have]
+        if catalog is not None:
+            dispose_catalog(catalog)             # release the connection (SQLite keeps the file open)
+    missing, optional_absent = missing_tables(have)
     detail = (f"SQL catalog {_redacted_uri(uri)}: {len(namespaces)} namespace(s), hypercore tables "
               f"{len(have)}/{len(TABLE_PLAN)}, warehouse {warehouse}")
+    if optional_absent:
+        detail += f", optional (development-only) not created: {optional_absent}"
     if missing:
         notes.append(f"missing {missing} - created from the DDL on the first lift")
     if notes:
         return _warn("iceberg", detail + "; " + "; ".join(notes))
     return _ok("iceberg", detail)
+
+
+def check_duckdb(required: bool, out_dir: Path | None = None) -> Check:
+    """The ETL reads this lake with DuckDB (pointer from the catalog's iceberg_tables,
+    then iceberg_scan). duckdb is NOT a dependency of the pipeline: SKIP when it is
+    not importable unless --duckdb demanded the smoke; otherwise run
+    blueblocx_hyperliquid.duckdb_smoke against the configured catalog. The smoke may
+    download the iceberg extension (egress) and only READS the catalog, so run_checks
+    calls it only on request or in online mode."""
+    from .duckdb_smoke import duckdb_available, run as smoke
+    if not duckdb_available():
+        msg = ("duckdb not installed in this venv; the ETL host runs "
+               "python -m blueblocx_hyperliquid.duckdb_smoke from its own venv")
+        return _fail("duckdb", msg) if required else _skip("duckdb", msg)
+    try:
+        rep = smoke(out_dir=out_dir)
+    except Exception as e:  # noqa: BLE001
+        return _fail("duckdb", f"{type(e).__name__}: {str(e)[:140]}")
+    tables = rep.get("tables", {})
+    failed = sorted(t for t, r in tables.items() if r.get("error"))
+    ok = sorted(t for t, r in tables.items() if r.get("rows") is not None)
+    absent = sorted(t for t, r in tables.items() if r.get("absent"))
+    detail = (f"duckdb {rep.get('duckdb_version')} (iceberg ext {rep.get('iceberg_extension') or '?'}): "
+              f"{len(ok)} table(s) readable via {rep.get('variant') or '?'}"
+              + (f", absent {absent}" if absent else ""))
+    if failed:
+        return _fail("duckdb", detail + f"; failed {failed}: " + "; ".join(
+            f"{t}: {tables[t]['error'][:100]}" for t in failed))
+    if not ok:
+        return _warn("duckdb", detail + " - no table readable yet (nothing lifted?)")
+    return _ok("duckdb", detail)
 
 
 def check_iceberg(required: bool) -> Check:
@@ -427,7 +460,7 @@ def check_iceberg(required: bool) -> Check:
     if not os.environ.get("WAREHOUSE"):
         notes.append("WAREHOUSE unset (defaults to s3://warehouse)")
     try:
-        from .iceberg_load import TABLE_PLAN, load_catalog_from_env
+        from .iceberg_load import TABLE_PLAN, load_catalog_from_env, missing_tables
         catalog, _ = load_catalog_from_env()
         namespaces = {".".join(n) if isinstance(n, tuple) else str(n) for n in catalog.list_namespaces()}
         have: set[str] = set()
@@ -453,7 +486,7 @@ def check_iceberg(required: bool) -> Check:
         except Exception:  # noqa: BLE001
             fails.append(f"effective py-io-impl is {io_impl} but s3fs is not installed - "
                          f"set HL_PY_IO_IMPL=pyiceberg.io.pyarrow.PyArrowFileIO or pip install s3fs")
-    missing = [t for t in TABLE_PLAN if t not in have]
+    missing, _optional_absent = missing_tables(have)
     detail = (f"REST {uri} branch {os.environ.get('NESSIE_BRANCH', 'main')}: {len(namespaces)} namespace(s), "
               f"hypercore tables {len(have)}/{len(TABLE_PLAN)}, s3 {s3_ep or '(none advertised)'}, "
               f"io {io_impl.rsplit('.', 1)[-1] or '?'}")
@@ -484,22 +517,31 @@ def check_evm() -> Check:
 # --- driver -------------------------------------------------------------------------------
 
 def run_checks(*, offline: bool = False, require_s3: bool = False, require_iceberg: bool = False,
-               wallets_file: Path | None = None, out_dir: Path | None = None,
+               require_duckdb: bool = False, wallets_file: Path | None = None, out_dir: Path | None = None,
                env_file: Path | None = None) -> list[Check]:
+    out_dir = out_dir or config.out_root()
     checks: list[Check] = [check_python(), check_imports(), check_tzdata(), check_ddl(),
-                           check_out_dir(out_dir or config.out_root())]
+                           check_out_dir(out_dir)]
     checks += check_env(env_file)
     checks.append(check_wallets(wallets_file))
-    checks.append(check_tracked(offline=offline, out_dir=out_dir or config.out_root()))
+    checks.append(check_tracked(offline=offline, out_dir=out_dir))
     if offline:
         checks += [_skip("hl_api", "offline"), _skip("s3", "offline"),
                    check_iceberg(require_iceberg) if not os.environ.get("NESSIE_URI") else _skip("iceberg", "offline"),
                    _skip("hyperevm", "offline")]
-        return checks
-    checks += check_hl_api()
-    checks.append(check_s3(require_s3))
-    checks.append(check_iceberg(require_iceberg))
-    checks.append(check_evm())
+    else:
+        checks += check_hl_api()
+        checks.append(check_s3(require_s3))
+        checks.append(check_iceberg(require_iceberg))
+        checks.append(check_evm())
+    # the DuckDB reader smoke installs an extension (egress) and reads the catalog: only on
+    # request (--duckdb) or in online mode against a real SQL catalog; offline stays offline
+    if require_duckdb or (not offline and os.environ.get("HL_CATALOG_URI") and not os.environ.get("NESSIE_URI")):
+        checks.append(check_duckdb(require_duckdb, out_dir=out_dir))
+    else:
+        checks.append(_skip("duckdb", "offline / no SQL catalog configured - pass --duckdb to require the reader smoke"
+                            if not os.environ.get("NESSIE_URI") else
+                            "REST catalog: DuckDB reads go through the lake's own engines"))
     return checks
 
 
@@ -510,11 +552,14 @@ def main(argv=None) -> int:
     ap.add_argument("--offline", action="store_true", help="no network (CI)")
     ap.add_argument("--s3", action="store_true", help="S3 node-data access is REQUIRED")
     ap.add_argument("--iceberg", action="store_true", help="an Iceberg REST catalog is REQUIRED")
+    ap.add_argument("--duckdb", action="store_true",
+                    help="the DuckDB reader smoke is REQUIRED (duckdb must be importable; see duckdb_smoke)")
     ap.add_argument("--wallets-file", default=config.env("HL_WALLETS_FILE") or None)
     ap.add_argument("--out", default=str(config.out_root()))
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     checks = run_checks(offline=args.offline, require_s3=args.s3, require_iceberg=args.iceberg,
+                        require_duckdb=args.duckdb,
                         wallets_file=Path(args.wallets_file) if args.wallets_file else None,
                         out_dir=Path(args.out), env_file=env_file)
     failed = [c for c in checks if c.status == "FAIL"]
