@@ -467,10 +467,43 @@ def require_warehouse_mount(wh_path: Path, mounts_text: str | None = None) -> No
         raise RuntimeError(f"{reason} (HL_WAREHOUSE_MOUNT={expected})")
 
 
+class SchemaDriftError(ValueError):
+    """The existing table's column types differ from the DDL. Writing anyway would let
+    conform() cast silently (pyarrow casts timestamptz -> string without complaint) and
+    the ETL would read the wrong type; `python -m blueblocx_hyperliquid.migrate --apply`
+    is the fix (deploy/bootstrap.sh runs it)."""
+
+
+_SQL_TYPE_OF_ICEBERG = {"LongType": "BIGINT", "IntegerType": "INT", "DoubleType": "DOUBLE", "StringType": "STRING",
+                        "DateType": "DATE", "BooleanType": "BOOLEAN", "TimestamptzType": "TIMESTAMP",
+                        "TimestampType": "TIMESTAMP"}
+
+
+def schema_drift(table, spec: dict) -> list[str]:
+    """Differences between an EXISTING table's schema and the DDL shape, as
+    'column: table TYPE vs ddl TYPE' strings (empty = no drift). Column order and
+    nullability are not drift (Iceberg cannot promote optional -> required); a DDL
+    column missing from the table, or a table column the DDL does not have, is."""
+    fields = {f.name: f for f in table.schema().fields}
+    ddl = {c[0]: c[1] for c in spec["columns"]}
+    out = []
+    for name, sql_type in ddl.items():
+        f = fields.get(name)
+        if f is None:
+            out.append(f"{name}: missing in the table (ddl {sql_type})")
+            continue
+        have = _SQL_TYPE_OF_ICEBERG.get(type(f.field_type).__name__, type(f.field_type).__name__)
+        if have != sql_type:
+            out.append(f"{name}: table {have} vs ddl {sql_type}")
+    out += [f"{name}: in the table but not in the ddl" for name in fields if name not in ddl]
+    return out
+
+
 def conform(arrow: pa.Table, table) -> pa.Table:
     """Cast the batch to the EXISTING table's Arrow schema (column order, types,
     nullability). Raises with a clear message on incompatible types so we never
-    write a type the production DDL does not have."""
+    write a type the production DDL does not have. Type DRIFT between the table and
+    the DDL is caught before this by schema_drift() (a cast can succeed silently)."""
     target = table.schema().as_arrow()
     missing = [f.name for f in target if f.name not in arrow.column_names]
     extra = [n for n in arrow.column_names if n not in target.names]
@@ -762,6 +795,10 @@ def _lift_directory(src_dir: Path, catalog, tables, namespace: str, since_iso: s
             rows = read_csv_rows(csv_path, since_iso, fallback_ts_col=_SINCE_FALLBACK_COL.get(name, stamp_col))
             arrow = rows_to_arrow(rows, spec["columns"], tz=True)
             table = ensure_table(catalog, namespace, name, spec, tz=True, required=REQUIRED_COLS.get(name, ()))
+            drift = schema_drift(table, spec)
+            if drift:                      # never write through a silent cast: the migration fixes the table
+                raise SchemaDriftError(f"{namespace}.{name}: schema drift {drift} - run "
+                                       f"`python -m blueblocx_hyperliquid.migrate --apply` before lifting")
             counts = load_table(table, arrow, key_cols, mode, scope_cols, required_cols=REQUIRED_COLS.get(name, ()))
             table.refresh()
         except Exception as e:

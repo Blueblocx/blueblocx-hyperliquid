@@ -55,13 +55,17 @@ sudo systemctl stop hypercore-hourly.timer hypercore-maintenance.timer
 while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done
 pgrep -af 'blueblocx_hyperliquid\.' ; sudo cat /var/lib/hypercore/hypercore/.daily.lock 2>/dev/null   # nothing live
 # when the release notes (docs/DEPLOY.md section 8) list a state-file change: tar HL_OUT_DIR first
-RELEASE_TAG=vX.Y.Z bash deploy/bootstrap.sh        # checkout, pip, tests, units, env keys, web monitor restart, preflight
+RELEASE_TAG=vX.Y.Z bash deploy/bootstrap.sh        # checkout, pip, tests, units, env keys, web monitor restart,
+                                                   # lake schema migrations (migrate --apply), preflight
 sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
 ```
 
 Rollback is the same with the previous tag (always via bootstrap when the release
-changed `deploy/`; a release that changed the lake schema says in its release note
-what must run before the tag moves back). `docs/DEPLOY.md` has the long form and
+changed `deploy/`). A release that changed the lake schema ships a migration in
+`blueblocx_hyperliquid/migrate.py` (the only way a production table's schema changes;
+the lift refuses a drifted table) and its release note in `docs/DEPLOY.md` §8 says what
+must run before the tag moves back: `migrate --revert --apply` from the new checkout,
+as the service user, timers stopped. `docs/DEPLOY.md` has the long form and
 the reasoning; `README.md` the module map; `docs/ETL_HANDOFF_HYPERCORE.md` is what
 the ETL team reads.
 

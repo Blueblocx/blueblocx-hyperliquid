@@ -391,12 +391,21 @@ def _check_sql_catalog(required: bool) -> Check:
     if fails:
         return _fail("iceberg", f"SQL catalog {_redacted_uri(uri)}: " + "; ".join(fails))
     catalog = None
+    drift: dict[str, list[str]] = {}
     try:
         catalog, _ = load_catalog_from_env()
         namespaces = {".".join(n) if isinstance(n, tuple) else str(n) for n in catalog.list_namespaces()}
         have: set[str] = set()
         if "hypercore" in namespaces:
             have = {t[-1] if isinstance(t, tuple) else str(t) for t in catalog.list_tables("hypercore")}
+        present = sorted(set(have) & set(TABLE_PLAN))
+        if present:                              # a table whose types differ from the DDL must not be lifted into
+            from .iceberg_load import parse_ddl, schema_drift
+            ddl = parse_ddl()
+            for t in present:
+                d = schema_drift(catalog.load_table(f"hypercore.{t}"), ddl[t])
+                if d:
+                    drift[t] = d
     except Exception as e:  # noqa: BLE001
         return _fail("iceberg", f"SQL catalog {_redacted_uri(uri)}: {type(e).__name__}: {str(e)[:140]}"
                                 f" - is PostgreSQL running and the driver (psycopg2-binary) installed?")
@@ -406,6 +415,9 @@ def _check_sql_catalog(required: bool) -> Check:
     missing, optional_absent = missing_tables(have)
     detail = (f"SQL catalog {_redacted_uri(uri)}: {len(namespaces)} namespace(s), hypercore tables "
               f"{len(have)}/{len(TABLE_PLAN)}, warehouse {warehouse}")
+    if drift:
+        return _fail("iceberg", detail + f"; schema drift {drift} - run `python -m blueblocx_hyperliquid.migrate "
+                                f"--apply` (deploy/bootstrap.sh does) before any lift")
     if optional_absent:
         detail += f", optional (development-only) not created: {optional_absent}"
     if missing:

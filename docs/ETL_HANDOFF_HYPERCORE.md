@@ -70,7 +70,7 @@ pointers in one statement at the start of your run; use `control.table_watermark
 | `l1_token_metadata` | `token_address` | `token_metadata` | parent of every `token_address`; `name == symbol` (HL tokens have no display name), both capped 100/200 code points *(v1.4.0)* |
 | `token_whitelist` | `token_address` | `token_whitelist` | `is_active` always true today (never de-listed, see section 7) |
 | `wallet_watchlist` | `wallet_address` | `wallet_watchlist` | one row per tracked wallet; same de-listing caveat |
-| `l4_wallet_metadata` | `wallet_address` | `wallet_metadata` | **see section 8**: until v1.5.0/v1.6.0 `first_tx`/`latest_tx` are tx-hash strings and the stats cover only the run window |
+| `l4_wallet_metadata` | `wallet_address` | `wallet_metadata` | `first_tx` / `latest_tx` are **TIMESTAMPTZ instants** of the wallet's first/latest ledger event *(v1.5.0; tx-hash strings before, see section 8)*; the stats cover only the run window until v1.6.0 |
 | `l1_wallet_ledger` | `(tx_hash, event_index, direction)` | source of `wallet_transactions` (your SQL, section 6) | immutable facts, insert-if-absent; `block_number`/`tx_index` NULL (no EVM block) |
 | `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — | development-only output, **not populated in production**; native 1h/1d tables arrive in v1.7.0 |
 | `l4x_perp_position_snapshot` | `(as_of_date, wallet_address, coin)` | — (extension) | daily perp positions / unrealized PnL; no `updated_at` (use `created_at`); replaced per `(as_of_date, wallet)` every hour |
@@ -180,14 +180,16 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
 | release | what the ETL gets |
 |---|---|
 | v1.4.0 | single-commit replaces (no half-replaced table), parents-before-facts lift order, NOT-NULL/duplicate guards before any commit, `name`/`symbol` caps, watermark statuses and write-stamp semantics, read-only catalog role + smoke test, this document |
-| v1.5.0 | `l4_wallet_metadata.first_tx` / `latest_tx` become **TIMESTAMPTZ instants** (the first/latest ledger event; today they are tx-hash strings that would fail your TIMESTAMPTZ COPY) via an in-place schema evolution and backfill |
+| v1.5.0 | `l4_wallet_metadata.first_tx` / `latest_tx` are **TIMESTAMPTZ instants** (the first/latest ledger event = `first_block_timestamp` / `latest_block_timestamp`; before, tx-hash strings that would fail your TIMESTAMPTZ COPY). Done by an in-place schema evolution + one backfill commit (`migrate --apply`, run by our deploy); the columns keep their names and position, the Iceberg field ids change (DuckDB resolves by current schema; irrelevant to you). Our lift refuses to write a table whose types differ from the DDL, so this cannot regress silently |
 | v1.6.0 | `l4_wallet_metadata` computed over the wallet's **accumulated history** (count_tx = distinct events, active_days, last_active in UTC days; funding excluded; `active_on_avg` NULL pending a definition); dimension rows re-stamped **only on content change**; `first_seen` stable |
 | v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows) for `token_price_usd_1h/1d` and USD valuation in `wallet_transactions`; onboarding gate: `prices.history_pending == 0` in our run summary |
 | v1.8.0 | nightly compaction of small files (reader planning time) |
 
-Until v1.5.0 is deployed, project `first_block_timestamp AS first_tx` and
-`latest_block_timestamp AS latest_tx` in your `wallet_metadata` SQL (or `CAST(NULL AS
-TIMESTAMPTZ)`); do not load the string columns as they are.
+Check the deployed version before onboarding (`/api/status` on the web monitor, or
+`hypercore-status --json`): while the host still runs v1.4.0, project
+`first_block_timestamp AS first_tx` and `latest_block_timestamp AS latest_tx` in your
+`wallet_metadata` SQL (or `CAST(NULL AS TIMESTAMPTZ)`); never load the string columns
+as they are. From v1.5.0 the columns are the instants themselves.
 
 ## 9. Open decisions (owner)
 

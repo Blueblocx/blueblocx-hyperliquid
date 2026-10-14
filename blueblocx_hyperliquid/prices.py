@@ -204,25 +204,25 @@ def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
 
 
 def wallet_metadata_row(l1_rows: list[dict], wallet: str, now_iso: str) -> list[dict]:
-    """l1 ledger -> one l4_wallet_metadata row (activity summary).
+    """l1 ledger -> one l4_wallet_metadata row (activity summary over the rows given).
 
-    HyperCore has no block_number, so first/latest are keyed on block_timestamp.
-    NOTE: bounded by the ingested window — wallet_age is truncated until S3
-    backfill provides full history.
+    HyperCore has no block_number, so first/latest are keyed on block_timestamp, and
+    `first_tx` / `latest_tx` are the INSTANTS of those events (the ETL contract's
+    TIMESTAMPTZ columns; before v1.5.0 they carried the tx hash, which the
+    destination could not load). NOTE: bounded by the rows passed in - the run
+    window - until v1.6.0 computes the wallet's accumulated history.
     """
     if not l1_rows:
         return []
     ts = sorted(r["block_timestamp"] for r in l1_rows)
     dates = {r["block_date"] for r in l1_rows}
-    hashes_first = min(l1_rows, key=lambda r: r["block_timestamp"])
-    hashes_last = max(l1_rows, key=lambda r: r["block_timestamp"])
     return [{
         "wallet_address": wallet.lower(),
         "first_block_timestamp": ts[0],
         "latest_block_timestamp": ts[-1],
         "count_tx": len(l1_rows),
-        "first_tx": hashes_first["tx_hash"],
-        "latest_tx": hashes_last["tx_hash"],
+        "first_tx": ts[0],
+        "latest_tx": ts[-1],
         "active_days": len(dates),
         "last_active": None,
         "active_on_avg": None,

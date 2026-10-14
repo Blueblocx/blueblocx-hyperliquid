@@ -97,7 +97,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.4.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.5.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -594,6 +594,8 @@ sudo tar -C /var/lib -czf ~/hypercore-state-$(date -u +%Y%m%dT%H%M).tgz hypercor
 cd /opt/blueblocx-hyperliquid && git fetch --tags && git checkout --detach v1.0.1
 .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
+# lake schema migrations shipped by the release (idempotent; the lift refuses a drifted table)
+sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.migrate --apply
 HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg
 # only when the release changed deploy/ (units, the web monitor, hypercore-status): refresh the
 # installed copies; the drop-in hypercore-daily.service.d/local.conf is kept
@@ -604,9 +606,10 @@ sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-dai
 sudo systemctl start hypercore-hourly.timer
 ```
 
-`RELEASE_TAG=v1.4.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
+`RELEASE_TAG=v1.5.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
 step 2 for you (checkout, pip, tests, units + web monitor restart + wrapper +
-daemon-reload, env keys new in the release, preflight), refuses to run while a
+daemon-reload, env keys new in the release, lake schema migrations via
+`migrate --apply`, preflight), refuses to run while a
 timer, a run or a hand-run pipeline process is active, and is the simpler
 choice whenever a release touches `deploy/` or the NAS is not at `/mnt/blueblocx`
 (the shipped units hard-code that path; bootstrap rewrites it); re-enable the
@@ -624,6 +627,7 @@ Release notes (state-file and lake-schema changes only):
 | release | state files | lake | rollback |
 |---|---|---|---|
 | v1.4.0 | none | replaced tables are rewritten in one commit per lift; `control.table_watermarks` rows gain the statuses `failed` / `restated` and `watermark_ts` becomes the max **write** stamp (was business time); lift order parents → facts → derived | `RELEASE_TAG=v1.3.0 bash deploy/bootstrap.sh` (v1.3.0 reports `kept_newer` on a few watermark rows for an hour — harmless) |
+| v1.5.0 | staged `l4_wallet_metadata.csv` rewritten by `migrate --apply` (tx-hash values in `first_tx` / `latest_tx` replaced by the block timestamps) — **tar HL_OUT_DIR first** | `hypercore.l4_wallet_metadata.first_tx` / `latest_tx`: STRING → TIMESTAMPTZ by in-place schema evolution (drop + re-add, DDL order, one backfill commit from `first_block_timestamp` / `latest_block_timestamp`); the lift raises `SchemaDriftError` and preflight FAILs on a table whose types differ from the DDL | **first** `cd /opt/blueblocx-hyperliquid && sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.migrate --revert --apply` (columns back to STRING, values NULL until the next run), **then** `RELEASE_TAG=v1.4.0 bash deploy/bootstrap.sh`; without the revert v1.4.0's lift of that table fails every hour (string → timestamptz cast) |
 
 ## 9. Backup / recovery
 

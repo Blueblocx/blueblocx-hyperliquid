@@ -21,6 +21,8 @@
 #   8. systemd units: service + hourly timer + nightly maintenance, with a drop-in
 #      that removes the S3 flags (no AWS key in this layout) and caps a run at 50 min;
 #      the web monitor (hypercore-web.service, port 8787) is enabled and started
+#   8b. lake schema migrations as the service user (python -m blueblocx_hyperliquid.migrate --apply:
+#      idempotent; the only way a production table's schema changes; fatal when it fails)
 #   9. preflight as the service user
 #   5b. (only with READER_CIDR=<etl host ip>/32) a READ-ONLY catalog role `hl_ro` for the
 #      ETL's DuckDB reader + /etc/hypercore/reader.env, PostgreSQL listening on the LAN
@@ -31,7 +33,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.4.0}"
+RELEASE_TAG="${RELEASE_TAG:-v1.5.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -337,6 +339,22 @@ sudo systemctl daemon-reload
 # the web monitor is read-only and safe to (re)start now; a restart picks up the new code
 sudo systemctl enable --now hypercore-web.service >/dev/null
 sudo systemctl restart hypercore-web.service
+
+# ----------------------------------------------------------------------------- 8b. lake schema migrations
+say "lake schema migrations (as ${SERVICE_USER})"
+# The only way a production table's schema changes (docs/DEPLOY.md section 8): idempotent,
+# under the shared .daily.lock, one schema commit + one backfill commit per migration, and
+# the staged CSV rewritten where a release changed a column type. The lift and preflight
+# refuse a drifted table, so a failure here is fatal: production must not run on it.
+# Rollback of such a release: `migrate --revert --apply` from the NEW checkout first, then
+# bootstrap with the previous tag.
+if ( cd "$PROD_DIR" && sudo -u "$SERVICE_USER" env HL_ENV_FILE="$ENV_FILE" "$PROD_DIR/.venv/bin/python" -m blueblocx_hyperliquid.migrate --apply ); then
+  echo "migrations: up to date"
+else
+  rc=$?
+  [ "$rc" -eq 3 ] && die "migrate: another run holds the state-dir lock (${STATE_DIR:-HL_OUT_DIR}/hypercore/.daily.lock) - stop it and re-run bootstrap"
+  die "migrate --apply failed (exit $rc) - see the output above; production must not run on a drifted schema"
+fi
 
 # ----------------------------------------------------------------------------- 9. preflight
 say "preflight (as ${SERVICE_USER})"

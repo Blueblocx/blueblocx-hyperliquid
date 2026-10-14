@@ -16,7 +16,8 @@ CREATE NAMESPACE IF NOT EXISTS nessie.hyperevm;
 --                              the HL coin symbol lives in l1_token_metadata.symbol)
 --   l1_token_metadata         (symbol/decimals/is_stablecoin for spot + USDC)
 --   l3_token_price_usd_1m     (native 1m candles, keyed by the ledger token_address)
---   l4_wallet_metadata        (activity summary; first/latest by block_timestamp)
+--   l4_wallet_metadata        (activity summary; first/latest by block_timestamp;
+--                              first_tx/latest_tx are those INSTANTS, not hashes - v1.5.0)
 --   token_whitelist           (consumer gate — seed is_active=true for HL tokens)
 --   wallet_watchlist          (consumer gate — seed is_active=true for HL wallets)
 -- L4 balance/FIFO/networth then run unchanged on the SPOT legs. Perp realized PnL
@@ -159,8 +160,8 @@ CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_metadata (
     first_block_timestamp   TIMESTAMP,
     latest_block_timestamp  TIMESTAMP,
     count_tx                INT,
-    first_tx                STRING,
-    latest_tx               STRING,
+    first_tx                TIMESTAMP, -- instant of the wallet's first ledger event (= first_block_timestamp); TIMESTAMPTZ since v1.5.0, was the tx hash (STRING)
+    latest_tx               TIMESTAMP, -- instant of the wallet's latest ledger event (= latest_block_timestamp); TIMESTAMPTZ since v1.5.0, was the tx hash (STRING)
     active_days             INT,
     last_active             INT,
     active_on_avg           DOUBLE,
