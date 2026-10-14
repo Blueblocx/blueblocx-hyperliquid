@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import schema as S
-from . import analytics, config, mappers, ops, prices
+from . import analytics, config, mappers, ops, prices, wallet_meta
 from .info_client import InfoClient
 from .ops import atomic_write_text
 from .spot_meta import SpotMetaResolver, empty as empty_resolver
@@ -73,15 +73,60 @@ def _s(v) -> str:
     return "" if v is None else str(v)
 
 
+def _earlier(a, b):
+    """The earlier of two ISO instants (strings or None); an unparseable pair falls back
+    to the lexicographic minimum, a missing side yields the other."""
+    sa, sb = _s(a), _s(b)
+    if not sa:
+        return b
+    if not sb:
+        return a
+    try:
+        da, db = datetime.fromisoformat(sa), datetime.fromisoformat(sb)
+        da = da if da.tzinfo else da.replace(tzinfo=timezone.utc)
+        db = db if db.tzinfo else db.replace(tzinfo=timezone.utc)
+        return a if da <= db else b
+    except ValueError:
+        return a if sa <= sb else b
+
+
+def content_merge(columns: list[str], *, stamp_col: str = "updated_at",
+                  preserve=("created_at",), min_cols=()):
+    """merge_fn for upsert_csv (dimension tables): a row's write stamp advances only
+    when its CONTENT changed - the ETL's Tier-A cursor re-reads exactly the changed
+    rows and a dimension re-emitted every hour with the same values is not re-pulled.
+    Compared: every column except `stamp_col`, `preserve` (taken from the existing row
+    when it has a value: created_at = first ingestion) and `min_cols` (the earlier
+    instant wins: first_seen never moves later). Returns the EXISTING row untouched
+    when nothing changed, else the new row with preserve/min applied."""
+    preserve = tuple(c for c in preserve if c in columns)
+    min_cols = tuple(c for c in min_cols if c in columns)
+    compare = [c for c in columns if c != stamp_col and c not in preserve and c not in min_cols]
+
+    def merge(old: dict, new: dict) -> dict:
+        out = dict(new)
+        for c in preserve:
+            if _s(old.get(c)):
+                out[c] = old[c]
+        for c in min_cols:
+            out[c] = _earlier(old.get(c), new.get(c))
+        if all(_s(old.get(c)) == _s(out.get(c)) for c in compare + list(min_cols)):
+            return old
+        return out
+    return merge
+
+
 def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
-               sort_fn=None, replace_scope_fn=None) -> int:
+               sort_fn=None, replace_scope_fn=None, merge_fn=None) -> int:
     """Merge `rows` into the CSV at `path` by natural key (new rows win).
 
     Existing rows are read back as strings; keys are compared as str tuples so
     typed new rows and string old rows match. If `replace_scope_fn` is given,
     existing rows for which it returns True are DROPPED before merging — this
     gives replace-partition semantics (e.g. l4x: a later run on the same day for
-    the same wallet must not leave stale rows for positions that closed).
+    the same wallet must not leave stale rows for positions that closed). If
+    `merge_fn(old, new)` is given it decides the row for a key present on both
+    sides (content_merge: keep the old row - and its stamp - when nothing changed).
     Returns the total row count.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,8 +137,16 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
                 if replace_scope_fn is not None and replace_scope_fn(r):
                     continue
                 merged[key_fn(r)] = r
+    unchanged = 0
     for r in rows:
-        merged[key_fn(r)] = r
+        k = key_fn(r)
+        old = merged.get(k)
+        if merge_fn is not None and old is not None:
+            kept = merge_fn(old, r)
+            unchanged += kept is old
+            merged[k] = kept
+        else:
+            merged[k] = r
     out = list(merged.values())
     if sort_fn is not None:
         out.sort(key=sort_fn)
@@ -105,7 +158,8 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
         for r in out:
             w.writerow({c: ("" if r.get(c) in (None, "") else r[c]) for c in columns})
     os.replace(tmp, path)
-    log.info("upserted %-34s +%6d -> %6d rows", path.name, len(rows), len(out))
+    log.info("upserted %-34s +%6d -> %6d rows%s", path.name, len(rows), len(out),
+             f" ({unchanged} unchanged, stamps kept)" if unchanged else "")
     return len(out)
 
 
@@ -783,13 +837,19 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         prior_through = prior_wm.get("through_ms")
         repaired = (not fills_saturated) and (prior_through is None or w_start_ms <= int(prior_through))
         sticky = fills_saturated or (bool(prior_wm.get("fills_truncated")) and not repaired)
+        advance = (not fills_saturated) or accept_hole
+        # l4_wallet_metadata is a running aggregate carried next to the watermark and advanced
+        # under the SAME rule (wallet_meta): disjoint windows, exact counts, a capped window
+        # that will be re-pulled is never counted early
+        meta_state = wallet_meta.advance_state(prior_wm.get("meta"), analysis_rows, prior_through, now_ms, advance)
         watermarks[wallet] = {
-            "through_ms": (now_ms if (not fills_saturated or accept_hole) else prior_through),
+            "through_ms": (now_ms if advance else prior_through),
             "coverage_start_ms": coverage_start_ms,
             "fills_truncated": sticky,
             "lending_by_token": (lending_by_token if lending_known
                                  else (prior_wm.get("lending_by_token") or {})),
             "lending_through_ms": (now_ms if lending_known else prior_wm.get("lending_through_ms")),
+            "meta": meta_state,
             "updated_at": now_iso,
         }
         if accept_hole:
@@ -808,7 +868,9 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
         all_l1 += l1_rows
         all_snap += snap_rows
-        wallet_meta_rows += prices.wallet_metadata_row(l1_rows, wallet, now_iso)
+        meta_row = wallet_meta.row(wallet, meta_state, now_ms, now_iso)
+        if meta_row is not None:                  # no non-funding activity covered yet: no row
+            wallet_meta_rows.append(meta_row)
         watchlist_rows.append({
             "wallet_address": wallet, "wallet_group": S.addr_group(wallet),
             "is_active": True, "whitelist_reason": "hypercore_ingest",
@@ -897,8 +959,11 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     upsert_csv(ns_dir / "l1_wallet_ledger.csv", S.L1_WALLET_LEDGER_COLUMNS, all_l1,
                key_fn=lambda r: (s(r["tx_hash"]), s(r["event_index"]), s(r["direction"])),
                sort_fn=lambda r: (s(r["block_timestamp"]), s(r["tx_hash"]), int(r["event_index"])))
+    # dimension rows: the stamp advances only on a content change (ETL Tier-A), created_at
+    # is the first ingestion, first_seen never moves later
     upsert_csv(ns_dir / "l1_token_metadata.csv", S.L1_TOKEN_METADATA_COLUMNS, meta_rows,
-               key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]))
+               key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]),
+               merge_fn=content_merge(S.L1_TOKEN_METADATA_COLUMNS, min_cols=("first_seen",)))
     # l4x: replace-partition semantics per (as_of_date, wallet) so a position that
     # closed between two same-day runs does not survive as a stale row.
     upsert_csv(ns_dir / "l4x_perp_position_snapshot.csv", S.L4X_PERP_POSITION_SNAPSHOT_COLUMNS,
@@ -907,11 +972,14 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                sort_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"]), s(r["coin"])),
                replace_scope_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"])) in l4x_scope)
     upsert_csv(ns_dir / "l4_wallet_metadata.csv", S.L4_WALLET_METADATA_COLUMNS, wallet_meta_rows,
-               key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]))
+               key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]),
+               merge_fn=content_merge(S.L4_WALLET_METADATA_COLUMNS))
     upsert_csv(ns_dir / "wallet_watchlist.csv", S.WALLET_WATCHLIST_COLUMNS, watchlist_rows,
-               key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]))
+               key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]),
+               merge_fn=content_merge(S.WALLET_WATCHLIST_COLUMNS))
     upsert_csv(ns_dir / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS, whitelist_rows,
-               key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]))
+               key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]),
+               merge_fn=content_merge(S.TOKEN_WHITELIST_COLUMNS))
 
     price_report = None
     if with_prices:

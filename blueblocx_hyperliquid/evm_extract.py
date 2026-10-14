@@ -29,7 +29,7 @@ from pathlib import Path
 from . import schema as S
 from .evm_client import EvmClient
 from . import evm_mapper, evm_tokens
-from .extract import upsert_csv
+from .extract import content_merge, upsert_csv
 from .prices import token_metadata_rows
 
 log = logging.getLogger("blueblocx_hyperliquid.evm_extract")
@@ -87,16 +87,20 @@ def run(wallets: list[str], blocks: int, out_dir: Path, rpc_url: str | None = No
     meta_rows = token_metadata_rows(registry, now_iso)
     for m in meta_rows:
         m["source"] = "hyperevm:eth_call"
+    # dimension rows: re-stamped only on a content change (same rule as the HyperCore extract)
     upsert_csv(ns_dir / "l1_token_metadata.csv", S.L1_TOKEN_METADATA_COLUMNS, meta_rows,
-               key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]))
+               key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]),
+               merge_fn=content_merge(S.L1_TOKEN_METADATA_COLUMNS, min_cols=("first_seen",)))
     upsert_csv(ns_dir / "wallet_watchlist.csv", S.WALLET_WATCHLIST_COLUMNS, [{
         "wallet_address": w, "wallet_group": S.addr_group(w), "is_active": True,
         "whitelist_reason": "hyperevm_ingest", "created_at": now_iso, "updated_at": now_iso,
-    } for w in wallets], key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]))
+    } for w in wallets], key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]),
+               merge_fn=content_merge(S.WALLET_WATCHLIST_COLUMNS))
     upsert_csv(ns_dir / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS, [{
         "token_address": a, "token_group": S.addr_group(a), "is_active": True,
         "whitelist_reason": "hyperevm_token", "created_at": now_iso, "updated_at": now_iso,
-    } for a in registry], key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]))
+    } for a in registry], key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]),
+               merge_fn=content_merge(S.TOKEN_WHITELIST_COLUMNS))
     return {"head_block": head, "from_block": from_block, "by_wallet": report}
 
 

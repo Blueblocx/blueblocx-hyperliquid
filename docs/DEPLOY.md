@@ -97,7 +97,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.5.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.6.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -606,7 +606,7 @@ sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-dai
 sudo systemctl start hypercore-hourly.timer
 ```
 
-`RELEASE_TAG=v1.5.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
+`RELEASE_TAG=v1.6.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
 step 2 for you (checkout, pip, tests, units + web monitor restart + wrapper +
 daemon-reload, env keys new in the release, lake schema migrations via
 `migrate --apply`, preflight), refuses to run while a
@@ -628,6 +628,7 @@ Release notes (state-file and lake-schema changes only):
 |---|---|---|---|
 | v1.4.0 | none | replaced tables are rewritten in one commit per lift; `control.table_watermarks` rows gain the statuses `failed` / `restated` and `watermark_ts` becomes the max **write** stamp (was business time); lift order parents → facts → derived | `RELEASE_TAG=v1.3.0 bash deploy/bootstrap.sh` (v1.3.0 reports `kept_newer` on a few watermark rows for an hour — harmless) |
 | v1.5.0 | staged `l4_wallet_metadata.csv` rewritten by `migrate --apply` (tx-hash values in `first_tx` / `latest_tx` replaced by the block timestamps) — **tar HL_OUT_DIR first** | `hypercore.l4_wallet_metadata.first_tx` / `latest_tx`: STRING → TIMESTAMPTZ by in-place schema evolution (drop + re-add, DDL order, one backfill commit from `first_block_timestamp` / `latest_block_timestamp`); the lift raises `SchemaDriftError` and preflight FAILs on a table whose types differ from the DDL | **first** `cd /opt/blueblocx-hyperliquid && sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.migrate --revert --apply` (columns back to STRING, values NULL until the next run), **then** `RELEASE_TAG=v1.4.0 bash deploy/bootstrap.sh`; without the revert v1.4.0's lift of that table fails every hour (string → timestamptz cast) |
+| v1.6.0 | `_watermarks.json[wallet].meta` added (the running `l4_wallet_metadata` aggregate; deleting a wallet's key re-seeds it from staging on the next run); staged dimension CSVs keep their stamps when content is unchanged; **one-time** `cd /opt/blueblocx-hyperliquid && sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.maintenance --fix-first-seen` between ticks after the deploy and **before 2026-11-26** (while staging still holds the full history since go-live) — tar HL_OUT_DIR first | none (same schema); the first lift after the deploy re-stamps every wallet's `l4_wallet_metadata` row once and the repaired token rows once | `RELEASE_TAG=v1.5.0 bash deploy/bootstrap.sh` (older code ignores the `meta` key and recomputes window-based rows; dimension rows go back to being re-stamped every run) |
 
 ## 9. Backup / recovery
 

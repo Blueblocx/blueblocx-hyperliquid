@@ -70,7 +70,7 @@ pointers in one statement at the start of your run; use `control.table_watermark
 | `l1_token_metadata` | `token_address` | `token_metadata` | parent of every `token_address`; `name == symbol` (HL tokens have no display name), both capped 100/200 code points *(v1.4.0)* |
 | `token_whitelist` | `token_address` | `token_whitelist` | `is_active` always true today (never de-listed, see section 7) |
 | `wallet_watchlist` | `wallet_address` | `wallet_watchlist` | one row per tracked wallet; same de-listing caveat |
-| `l4_wallet_metadata` | `wallet_address` | `wallet_metadata` | `first_tx` / `latest_tx` are **TIMESTAMPTZ instants** of the wallet's first/latest ledger event *(v1.5.0; tx-hash strings before, see section 8)*; the stats cover only the run window until v1.6.0 |
+| `l4_wallet_metadata` | `wallet_address` | `wallet_metadata` | `first_tx` / `latest_tx` are **TIMESTAMPTZ instants** of the wallet's first/latest ledger event *(v1.5.0; tx-hash strings before)*; from v1.6.0 the row is a **running aggregate over the wallet's accumulated history** since go-live (funding excluded: `count_tx` = non-funding ledger rows, `active_days` = distinct UTC days with activity, `last_active` = whole UTC days since the latest event, `active_on_avg` NULL); a wallet with no non-funding activity has no row |
 | `l1_wallet_ledger` | `(tx_hash, event_index, direction)` | source of `wallet_transactions` (your SQL, section 6) | immutable facts, insert-if-absent; `block_number`/`tx_index` NULL (no EVM block) |
 | `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — | development-only output, **not populated in production**; native 1h/1d tables arrive in v1.7.0 |
 | `l4x_perp_position_snapshot` | `(as_of_date, wallet_address, coin)` | — (extension) | daily perp positions / unrealized PnL; no `updated_at` (use `created_at`); replaced per `(as_of_date, wallet)` every hour |
@@ -109,10 +109,13 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
   All pending rows of a table land in one commit, so an older-stamped row never
   lands after a newer-stamped one.
 - **Dimension tables** (`l1_token_metadata`, `token_whitelist`, `wallet_watchlist`,
-  `l4_wallet_metadata`): until v1.6.0 every row touched by a run is re-stamped with
-  that run's start instant whether or not its content changed (tables are small:
-  ~150 wallets, a few hundred tokens — the contract's tolerated case). From v1.6.0
-  the stamp advances only when the row's content changes (section 8).
+  `l4_wallet_metadata`): from v1.6.0 a row is re-stamped **only when its content
+  changed** (`created_at` = first ingestion, `first_seen` never moves later); a row
+  re-emitted with identical values keeps its stamp, so a Tier-A pull sees exactly
+  the changed rows. `l4_wallet_metadata.last_active` is a day counter, so every
+  wallet's row changes once per UTC day (a real content change). Before v1.6.0
+  every row touched by a run was re-stamped with the run's start instant (tables
+  are small: ~150 wallets, a few hundred tokens — the contract's tolerated case).
 - **`control.table_watermarks`** (namespace `hypercore`, naive UTC `timestamp(6)`
   columns like python-ingestion): one row per table **that received rows in the
   lift**, written in one commit after all data commits of that run, with the same
@@ -167,8 +170,10 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
   a wallet that leaves the tracked set keeps its row (never deleted, never flipped
   to false). De-listing semantics are an open owner decision.
 - `l1_token_metadata.first_seen` = earliest ledger event of the token among tracked
-  wallets *(stable from v1.6.0; before that it moves to the last run that saw the
-  token)*; `token_created_at` stays NULL; `total_supply*` stay NULL.
+  wallets, stable from v1.6.0 (before that it moved to the last run that saw the
+  token; a one-time repair after the v1.6.0 deploy moves those values back and
+  re-stamps the affected token rows once — expect one burst of re-stamped
+  `token_metadata` rows); `token_created_at` stays NULL; `total_supply*` stay NULL.
 - Perp activity is booked as **USDC (or HIP-3 collateral) cashflow rows**
   (`perp_realized_pnl`, `fee`, `funding`); open positions live only in
   `l4x_perp_position_snapshot`. `net_flow` must sum only `deposit`/`withdraw`/
@@ -181,7 +186,7 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
 |---|---|
 | v1.4.0 | single-commit replaces (no half-replaced table), parents-before-facts lift order, NOT-NULL/duplicate guards before any commit, `name`/`symbol` caps, watermark statuses and write-stamp semantics, read-only catalog role + smoke test, this document |
 | v1.5.0 | `l4_wallet_metadata.first_tx` / `latest_tx` are **TIMESTAMPTZ instants** (the first/latest ledger event = `first_block_timestamp` / `latest_block_timestamp`; before, tx-hash strings that would fail your TIMESTAMPTZ COPY). Done by an in-place schema evolution + one backfill commit (`migrate --apply`, run by our deploy); the columns keep their names and position, the Iceberg field ids change (DuckDB resolves by current schema; irrelevant to you). Our lift refuses to write a table whose types differ from the DDL, so this cannot regress silently |
-| v1.6.0 | `l4_wallet_metadata` computed over the wallet's **accumulated history** (count_tx = distinct events, active_days, last_active in UTC days; funding excluded; `active_on_avg` NULL pending a definition); dimension rows re-stamped **only on content change**; `first_seen` stable |
+| v1.6.0 | `l4_wallet_metadata` is a running aggregate over the wallet's **accumulated history** (count_tx = non-funding ledger rows, active_days = distinct UTC days, last_active = UTC days since the latest event, first/latest instants; funding excluded; `active_on_avg` NULL pending a definition), carried next to our per-wallet watermark and advanced only over complete windows; dimension rows re-stamped **only on content change** (`created_at` = first ingestion); `first_seen` stable, with a one-time repair that re-stamps drifted token rows once |
 | v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows) for `token_price_usd_1h/1d` and USD valuation in `wallet_transactions`; onboarding gate: `prices.history_pending == 0` in our run summary |
 | v1.8.0 | nightly compaction of small files (reader planning time) |
 
@@ -195,5 +200,5 @@ as they are. From v1.5.0 the columns are the instants themselves.
 
 - `native_symbol` / `native_decimals` for the `chains` row; explorer templates.
 - De-listing (`is_active = false` + fresh stamp) for wallets/tokens that leave the set.
-- `active_on_avg` definition; whether `count_tx` should exclude funding (recommended, default in v1.6.0).
+- `active_on_avg` definition (NULL until then). Decided: funding is excluded from `count_tx` / `active_days` / first and latest instants.
 - Whether a hypercore L4 layer (balances, networth, PnL, sharpe) is built at all, and by whom; the contract's L4 labels stay excluded until then.

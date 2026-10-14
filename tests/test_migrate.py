@@ -13,7 +13,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from blueblocx_hyperliquid import iceberg_load as il, migrate, ops, preflight, prices
+from blueblocx_hyperliquid import iceberg_load as il, migrate, ops, preflight, wallet_meta
 from blueblocx_hyperliquid import schema as S
 
 W1 = "0x" + "a" * 40
@@ -166,9 +166,10 @@ class FirstTxMigrationTests(_LakeCase):
         self._old_table([])
         src = self.root / "staging"
         src.mkdir()
-        rows = prices.wallet_metadata_row(
-            [{"block_timestamp": "2026-10-10T05:00:00+00:00", "block_date": "2026-10-10", "tx_hash": "a"},
-             {"block_timestamp": "2026-10-11T06:00:00+00:00", "block_date": "2026-10-11", "tx_hash": "b"}], W1, NOW)
+        l1 = [{"block_timestamp": "2026-10-10T05:00:00+00:00", "block_date": "2026-10-10", "event_type": "spot_fill"},
+              {"block_timestamp": "2026-10-11T06:00:00+00:00", "block_date": "2026-10-11", "event_type": "spot_fill"}]
+        now_ms = wallet_meta._ms(NOW)
+        rows = [wallet_meta.row(W1, wallet_meta.seed(l1, now_ms), now_ms, NOW)]
         _write_csv(src / "l4_wallet_metadata.csv", rows)
         with self.assertRaises(il.SchemaDriftError) as cm:
             il.lift_directory(src, catalog=self.catalog)
@@ -241,19 +242,18 @@ class FirstTxMigrationTests(_LakeCase):
 
 
 class WalletMetadataRowTests(unittest.TestCase):
-    def test_first_and_latest_tx_are_block_timestamp_instants(self):
-        l1 = [{"block_timestamp": "2026-10-11T06:00:00+00:00", "block_date": "2026-10-11", "tx_hash": "h2"},
-              {"block_timestamp": "2026-10-10T05:00:00+00:00", "block_date": "2026-10-10", "tx_hash": "h1"},
-              {"block_timestamp": "2026-10-10T07:00:00+00:00", "block_date": "2026-10-10", "tx_hash": "h3"}]
-        row = prices.wallet_metadata_row(l1, W1.upper(), NOW)[0]
+    def test_first_and_latest_tx_are_block_timestamp_instants_the_lift_parses(self):
+        l1 = [{"block_timestamp": "2026-10-11T06:00:00+00:00", "block_date": "2026-10-11", "event_type": "spot_fill"},
+              {"block_timestamp": "2026-10-10T05:00:00+00:00", "block_date": "2026-10-10", "event_type": "spot_fill"},
+              {"block_timestamp": "2026-10-10T07:00:00+00:00", "block_date": "2026-10-10", "event_type": "fee"}]
+        now_ms = wallet_meta._ms(NOW)
+        row = wallet_meta.row(W1.upper(), wallet_meta.seed(l1, now_ms), now_ms, NOW)
         self.assertEqual(row["wallet_address"], W1)
         self.assertEqual(row["first_tx"], "2026-10-10T05:00:00+00:00")
         self.assertEqual(row["latest_tx"], "2026-10-11T06:00:00+00:00")
         self.assertEqual(row["first_tx"], row["first_block_timestamp"])
         self.assertEqual(row["latest_tx"], row["latest_block_timestamp"])
         self.assertEqual((row["count_tx"], row["active_days"]), (3, 2))
-        self.assertIsNone(row["last_active"])
-        self.assertEqual(prices.wallet_metadata_row([], W1, NOW), [])
         # the lift parses the row as TIMESTAMP (no hash reaches a timestamptz column)
         spec = il.parse_ddl()["l4_wallet_metadata"]
         arrow = il.rows_to_arrow([row], spec["columns"])

@@ -172,9 +172,13 @@ def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
     ledger. is_stablecoin lets stable_coin_pct compute downstream. name == symbol
     (Hyperliquid tokens have no separate display name); both are capped at the
     ETL's btree limits (symbol 100, name 200 code points) and NUL-stripped.
+    first_seen = the earliest ledger event that referenced the token in this run
+    (registry first_seen_ms), else the run stamp; the staged-CSV merge keeps the
+    earliest value across runs, so it never moves later (v1.6.0).
     """
     rows = []
     for addr, meta in registry_items.items():
+        seen_ms = meta.get("first_seen_ms")
         rows.append({
             "token_address": addr,
             "token_group": S.addr_group(addr),
@@ -183,7 +187,7 @@ def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
             "name": _clip_text(meta.get("symbol"), NAME_MAX_CP, "name"),
             # NULL when unresolved (nullable INT in the DDL) — never a fake 0
             "decimals": (int(meta["decimals"]) if meta.get("decimals") is not None else None),
-            "first_seen": now_iso,
+            "first_seen": _iso(int(seen_ms)) if seen_ms is not None else now_iso,
             "source": "hypercore:spotMeta",
             "logo_url": None,
             "total_supply_raw": None,
@@ -201,33 +205,6 @@ def token_metadata_rows(registry_items: dict, now_iso: str) -> list[dict]:
             "updated_at": now_iso,
         })
     return rows
-
-
-def wallet_metadata_row(l1_rows: list[dict], wallet: str, now_iso: str) -> list[dict]:
-    """l1 ledger -> one l4_wallet_metadata row (activity summary over the rows given).
-
-    HyperCore has no block_number, so first/latest are keyed on block_timestamp, and
-    `first_tx` / `latest_tx` are the INSTANTS of those events (the ETL contract's
-    TIMESTAMPTZ columns; before v1.5.0 they carried the tx hash, which the
-    destination could not load). NOTE: bounded by the rows passed in - the run
-    window - until v1.6.0 computes the wallet's accumulated history.
-    """
-    if not l1_rows:
-        return []
-    ts = sorted(r["block_timestamp"] for r in l1_rows)
-    dates = {r["block_date"] for r in l1_rows}
-    return [{
-        "wallet_address": wallet.lower(),
-        "first_block_timestamp": ts[0],
-        "latest_block_timestamp": ts[-1],
-        "count_tx": len(l1_rows),
-        "first_tx": ts[0],
-        "latest_tx": ts[-1],
-        "active_days": len(dates),
-        "last_active": None,
-        "active_on_avg": None,
-        "updated_at": now_iso,
-    }]
 
 
 def spot_symbol_prices(resolver, spot_meta: dict, ctxs: list[dict],

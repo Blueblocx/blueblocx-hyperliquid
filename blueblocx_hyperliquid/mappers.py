@@ -57,26 +57,32 @@ def _is_spot(coin: str) -> bool:
 
 class TokenRegistry:
     """Accumulates token identity/metadata seen while mapping, so extract.py can
-    emit l1_token_metadata. Keyed by token_address."""
+    emit l1_token_metadata. Keyed by token_address. `first_seen_ms` = the earliest
+    ledger event (block timestamp) that referenced the token in this run - None for a
+    token known only from spot metadata; l1_token_metadata.first_seen is kept at the
+    earliest value across runs by the staged-CSV merge (extract.content_merge)."""
 
     def __init__(self) -> None:
         self._by_addr: dict[str, dict] = {}
 
     def note(self, token_address: str, symbol: str, decimals: int,
-             is_stablecoin: bool) -> None:
+             is_stablecoin: bool, seen_ms: int | None = None) -> None:
         cur = self._by_addr.get(token_address)
         if cur is None or (decimals and not cur.get("decimals")):
-            self._by_addr[token_address] = {
+            self._by_addr[token_address] = cur = {
                 "symbol": symbol,
                 "decimals": int(decimals or 0),
                 "is_stablecoin": bool(is_stablecoin),
+                "first_seen_ms": cur.get("first_seen_ms") if cur else None,
             }
+        if seen_ms is not None and (cur.get("first_seen_ms") is None or int(seen_ms) < int(cur["first_seen_ms"])):
+            cur["first_seen_ms"] = int(seen_ms)
 
     def note_token(self, t: TokenInfo) -> None:
         self.note(t.token_address, t.symbol, t.decimals, t.is_stablecoin)
 
     def items(self) -> dict[str, dict]:
-        return dict(self._by_addr)
+        return {k: dict(v) for k, v in self._by_addr.items()}
 
 
 def _ledger_row(*, block_timestamp_ms, tx_hash, event_index, event_type,
@@ -86,7 +92,7 @@ def _ledger_row(*, block_timestamp_ms, tx_hash, event_index, event_type,
     """Build one l1_wallet_ledger row. `standard` is ALWAYS "ERC20"."""
     signed = amount if direction == S.DIRECTION_IN else -amount
     if registry is not None:
-        registry.note(token_address, token_symbol, decimals, is_stablecoin)
+        registry.note(token_address, token_symbol, decimals, is_stablecoin, seen_ms=int(block_timestamp_ms))
     wl = wallet.lower()
     return {
         "block_number": None,                 # HyperCore has no EVM block number
