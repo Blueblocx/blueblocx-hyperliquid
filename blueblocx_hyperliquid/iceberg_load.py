@@ -423,10 +423,14 @@ def _partition_spec(schema, cols: list[str]):
 
 # Metadata retention: without these every commit keeps the previous metadata.json
 # forever (hourly cadence = 24 new files a day per table) and the metadata log grows
-# unbounded. pyiceberg honours both properties.
+# unbounded. pyiceberg honours both properties. previous-versions-max is 100 (v1.8.0,
+# was 20): a DuckDB reader resolves a table's metadata_location from the catalog and
+# reads that file later; at one lift commit per hour plus the nightly compaction and
+# migration commits, 20 versions could be deleted within a few hours of bursty
+# commits, 100 keeps a fetched pointer readable for well over a day.
 TABLE_PROPERTIES = {
     "write.metadata.delete-after-commit.enabled": "true",
-    "write.metadata.previous-versions-max": "20",
+    "write.metadata.previous-versions-max": "100",
 }
 
 

@@ -6,9 +6,12 @@
 > on the ETL side because this chain is read **with DuckDB from a pyiceberg SQL
 > catalog**, not through Trino (owner decision, 2026-10-14).
 >
-> **Status.** This document is updated with every release of `blueblocx-hyperliquid`;
-> the "Release status" table says which guarantees are live. Sections marked
-> *(from vX.Y.Z)* describe behaviour that lands in that release.
+> **Status.** Every producer-side change this document relies on is implemented in
+> `blueblocx-hyperliquid` v1.4.0 … v1.8.0 (section 8 says what each release adds).
+> Which release the host actually runs is shown by the web monitor (`/api/status`,
+> field `version`) and by `hypercore-status --json`; sections marked *(vX.Y.Z)*
+> describe behaviour that exists from that release on. Use the onboarding checklist
+> at the end of section 8 before the first load.
 
 ---
 
@@ -57,9 +60,10 @@ three-slash form production writes; the smoke on your host is the final word). P
 form B if both work: it never depends on path resolution inside manifests.
 
 Concurrency: our lift advances a table's pointer at most **once per hourly run**
-(delete + append of a replaced table are one commit since v1.4.0), files are
-immutable and uniquely named, and nightly snapshot expiry (7 days) deletes no data
-files — a scan that started before a commit keeps reading its snapshot. Fetch all
+(delete + append of a replaced table are one commit since v1.4.0), the nightly
+compaction (v1.8.0, ~00:05 UTC) once more per table, files are immutable and
+uniquely named, and nightly snapshot expiry (7 days) deletes no data files — a scan
+that started before a commit keeps reading its snapshot. Fetch all
 pointers in one statement at the start of your run; use `control.table_watermarks`
 (section 5) as the batch-complete marker if you need one.
 
@@ -192,13 +196,27 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
 | v1.5.0 | `l4_wallet_metadata.first_tx` / `latest_tx` are **TIMESTAMPTZ instants** (the first/latest ledger event = `first_block_timestamp` / `latest_block_timestamp`; before, tx-hash strings that would fail your TIMESTAMPTZ COPY). Done by an in-place schema evolution + one backfill commit (`migrate --apply`, run by our deploy); the columns keep their names and position, the Iceberg field ids change (DuckDB resolves by current schema; irrelevant to you). Our lift refuses to write a table whose types differ from the DDL, so this cannot regress silently |
 | v1.6.0 | `l4_wallet_metadata` is a running aggregate over the wallet's **accumulated history** (count_tx = non-funding ledger rows, active_days = distinct UTC days, last_active = UTC days since the latest event, first/latest instants; funding excluded; `active_on_avg` NULL pending a definition), carried next to our per-wallet watermark and advanced only over complete windows; dimension rows re-stamped **only on content change** (`created_at` = first ingestion); `first_seen` stable, with a one-time repair that re-stamps drifted token rows once |
 | v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows), written FIRST in every hourly run under a 3-minute budget (tokens with recent ledger activity every run, the rest rotated most-stale first) and lifted before the wallet phase, so they are present even when a run defers wallets. **Onboarding gate:** `prices.history_pending == 0` in `_run_summary.json` (every priceable token carries its 32-day history; after the deploy this takes a few hours of rotation). `prices_deferred=N` in a summary means the budget was reached that hour - the next run continues |
-| v1.8.0 | nightly compaction of small files (reader planning time) |
+| v1.8.0 | nightly **compaction** of closed, fragmented partitions (≥ 8 files; a partition is closed 2 UTC days after its date, 1 for `l4x`) into one file each - one commit per table per night just after 00:05 UTC, so your scans of yesterday-and-older partitions open one file instead of 24; `write.metadata.previous-versions-max` raised to 100, so a `metadata_location` you fetched stays readable for well over a day even through commit bursts (fetch it once per run anyway) |
 
 Check the deployed version before onboarding (`/api/status` on the web monitor, or
 `hypercore-status --json`): while the host still runs v1.4.0, project
 `first_block_timestamp AS first_tx` and `latest_block_timestamp AS latest_tx` in your
 `wallet_metadata` SQL (or `CAST(NULL AS TIMESTAMPTZ)`); never load the string columns
 as they are. From v1.5.0 the columns are the instants themselves.
+
+**Onboarding checklist** (all green before the first `hypercore` load):
+
+1. The host runs v1.7.0 or later (`version` in `/api/status`), and its last run has
+   `ok: true`.
+2. `python -m blueblocx_hyperliquid.duckdb_smoke` from **your** host (reader role +
+   read-only mount) reads every table and prints the `iceberg_scan` form to use.
+3. `prices.history_pending == 0` in `/api/status` (or `_run_summary.json`): every
+   priceable token has its 32-day candle history.
+4. `control.table_watermarks` shows `status = 'completed'` for `l1_wallet_ledger`,
+   `l1_token_metadata`, `wallet_watchlist`, `token_whitelist`, `l4_wallet_metadata`,
+   `l3_token_price_usd_1h`, `l3_token_price_usd_1d` with `watermark_ts` from the
+   last hour.
+5. The `chains` row for `hypercore` exists in every destination (section 6, item 3).
 
 ## 9. Open decisions (owner)
 

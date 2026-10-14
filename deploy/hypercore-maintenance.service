@@ -1,10 +1,11 @@
 # /etc/systemd/system/hypercore-maintenance.service
-# Nightly: expire Iceberg snapshots older than 7 days on the pipeline's tables and
-# make sure the metadata-retention properties are set. Shares the run lock with the
+# Nightly: compact closed, fragmented partitions (one commit per table, bounded by the
+# next hourly tick minus a minute - v1.8.0), expire Iceberg snapshots older than 7 days
+# and make sure the metadata-retention properties are set. Shares the run lock with the
 # scheduled extract and is skipped by a running lift (exit 3 = SuccessExitStatus, not
-# a failure); genuine expire/property errors exit 1 and show as a failed unit.
+# a failure); genuine compaction/expire/property errors exit 1 and show as a failed unit.
 [Unit]
-Description=HyperCore lake maintenance (expire snapshots)
+Description=HyperCore lake maintenance (compact closed partitions, expire snapshots)
 After=network-online.target
 RequiresMountsFor=/mnt/blueblocx
 # a boot catch-up (both Persistent= timers fire together) or a hand start must not
@@ -19,7 +20,7 @@ User=hypercore
 Group=hypercore
 WorkingDirectory=/opt/blueblocx-hyperliquid
 EnvironmentFile=/etc/hypercore/hypercore.env
-ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.maintenance --expire-days 7
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.maintenance --expire-days 7 --compact
 TimeoutStartSec=30min
 Nice=10
 NoNewPrivileges=true

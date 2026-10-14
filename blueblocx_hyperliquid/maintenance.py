@@ -2,7 +2,7 @@
 Table maintenance for the lake this pipeline writes (run nightly, under the same
 lock as the scheduled run):
 
-    python -m blueblocx_hyperliquid.maintenance --expire-days 7 [--namespace hypercore]
+    python -m blueblocx_hyperliquid.maintenance --expire-days 7 --compact [--namespace hypercore]
     python -m blueblocx_hyperliquid.maintenance --fix-first-seen      # one-time, v1.6.0 (see below)
 
 What it does per table (every hypercore table in iceberg_load.TABLE_PLAN + control.table_watermarks):
@@ -13,10 +13,18 @@ What it does per table (every hypercore table in iceberg_load.TABLE_PLAN + contr
     deletes files unreferenced by any live snapshot is a documented follow-up.
   * ensure the metadata-retention table properties (TABLE_PROPERTIES) are set.
 
-pyiceberg has no rewrite_data_files; hourly lifts leave one small Parquet per
-(partition, event_type) per hour. Compaction = re-write a closed partition with
-`table.overwrite(df, overwrite_filter=EqualTo(partition_col, day))`; not done
-here yet (the files are tens of KB to a few MB; readers on this host are fine).
+--compact (v1.8.0, nightly with the expiry): pyiceberg has no rewrite_data_files and
+hourly lifts leave one small Parquet per (partition[, event_type]) per hour, which a
+DuckDB reader has to open one by one. Compaction rewrites every CLOSED partition that
+has >= COMPACT_MIN_FILES data files (closed = its UTC day is at least 2 days old; 1 day
+for l4x, which is replaced hourly only on its current day) into one file:
+`tx.delete(partition predicate); tx.append(rows)` per partition inside ONE
+transaction per table, so the catalog pointer moves once per table per night and a
+reader never sees a partition missing. Bounded by an absolute deadline - the next
+hourly data tick (HH:10 UTC) minus a minute - because maintenance holds the shared run
+lock and a tick that finds it held exits 3 (an hour skipped); what the deadline cuts
+off is done the next night. Partitions above COMPACT_MAX_ROWS are skipped (reported).
+Old snapshots keep the pre-compaction files alive for readers until the 7-day expiry.
 
 --fix-first-seen (one-time repair after deploying v1.6.0, between ticks): before
 v1.6.0 l1_token_metadata.first_seen moved to the last run that saw the token. Set it
@@ -34,12 +42,120 @@ import json
 import logging
 import os
 import sys
+import time as _time
 from pathlib import Path
 
 from . import config, ops
 from . import schema as S
 
 log = logging.getLogger("blueblocx_hyperliquid.maintenance")
+
+COMPACT_MIN_FILES = 8            # fewer data files in a partition: left alone
+COMPACT_MAX_ROWS = 3_000_000     # a partition this large is skipped (memory, time) and reported
+COMPACT_CLOSED_DAYS = {"l4x_perp_position_snapshot": 1}   # default 2: UTC days before a partition is closed
+_DEFAULT_CLOSED_DAYS = 2
+TICK_MINUTE = 10                 # the hourly data timer fires at HH:10 UTC
+
+
+def next_tick_deadline(now: dt.datetime, tick_minute: int = TICK_MINUTE, margin_s: float = 60.0) -> float:
+    """Epoch seconds of the next hourly data tick minus a margin: compaction must have
+    released the shared run lock by then, or the tick exits 3 and an hour is skipped."""
+    base = now.replace(minute=tick_minute, second=0, microsecond=0)
+    if base <= now:
+        base += dt.timedelta(hours=1)
+    return base.timestamp() - margin_s
+
+
+def partition_date(partition: dict, date_col: str) -> dt.date | None:
+    v = (partition or {}).get(date_col)
+    if isinstance(v, dt.datetime):
+        return v.date()
+    if isinstance(v, dt.date):
+        return v
+    if isinstance(v, str):
+        try:
+            return dt.date.fromisoformat(v[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def compact(namespace: str, catalog, *, now: dt.datetime | None = None, deadline_ts: float | None = None,
+            clock=_time, min_files: int = COMPACT_MIN_FILES, max_rows: int = COMPACT_MAX_ROWS) -> dict:
+    """Rewrite closed, fragmented partitions of every partitioned table in TABLE_PLAN into
+    one file each: one transaction (one catalog commit) per table per call, bounded by
+    `deadline_ts` (default: the next hourly tick minus a minute). Never raises for a
+    table: an error aborts that table's transaction (nothing committed) and is reported."""
+    from pyiceberg.expressions import EqualTo
+    from .iceberg_load import TABLE_PLAN, _and, parse_ddl
+    now = now or dt.datetime.fromtimestamp(clock.time(), tz=dt.timezone.utc)
+    deadline = next_tick_deadline(now) if deadline_ts is None else float(deadline_ts)
+    ddl = parse_ddl()
+    report: dict = {"deadline": dt.datetime.fromtimestamp(deadline, tz=dt.timezone.utc).isoformat(),
+                    "min_files": min_files, "tables": {}}
+    for name in TABLE_PLAN:
+        part_cols = (ddl.get(name) or {}).get("partition") or []
+        if not part_cols:
+            continue                                        # dimension tables are rewritten whole by their lifts
+        try:
+            table = catalog.load_table(f"{namespace}.{name}")
+        except Exception:  # noqa: BLE001 - not created yet
+            continue
+        date_col = part_cols[0]
+        closed_before = now.date() - dt.timedelta(days=COMPACT_CLOSED_DAYS.get(name, _DEFAULT_CLOSED_DAYS))
+        entry: dict = {"candidates": 0, "compacted": [], "skipped_large": [], "deadline_hit": False,
+                       "files_before": 0, "files_after": 0, "rows": 0, "commits": 0}
+        report["tables"][f"{namespace}.{name}"] = entry
+        try:
+            parts = table.inspect.partitions().to_pylist()
+        except Exception as e:  # noqa: BLE001
+            entry["error"] = f"inspect: {type(e).__name__}: {str(e)[:120]}"
+            continue
+        cands = [p for p in parts
+                 if int(p.get("file_count") or 0) >= min_files
+                 and (partition_date(p.get("partition"), date_col) or now.date()) <= closed_before]
+        cands.sort(key=lambda p: (partition_date(p["partition"], date_col), str(p["partition"])))
+        entry["candidates"] = len(cands)
+        if not cands:
+            continue
+        done: list[dict] = []
+        try:
+            with table.transaction() as tx:
+                for p in cands:
+                    if clock.time() >= deadline:
+                        entry["deadline_hit"] = True
+                        break
+                    if int(p.get("record_count") or 0) > max_rows:
+                        entry["skipped_large"].append({"partition": p["partition"], "rows": p["record_count"]})
+                        continue
+                    pred = _and(*[EqualTo(c, p["partition"][c]) for c in part_cols])
+                    df = table.scan(row_filter=pred).to_arrow()
+                    if df.num_rows != int(p.get("record_count") or 0):
+                        entry.setdefault("mismatch", []).append({"partition": p["partition"], "metadata_rows": p["record_count"],
+                                                                 "scanned_rows": df.num_rows})
+                        continue                            # metadata and data disagree: never rewrite blind
+                    tx.delete(pred)
+                    tx.append(df)
+                    done.append({"partition": {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                                               for k, v in p["partition"].items()},
+                                 "files": int(p["file_count"]), "rows": df.num_rows})
+        except Exception as e:  # noqa: BLE001 - the transaction is abandoned: nothing was committed
+            entry["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+            log.warning("compact %s.%s failed, nothing committed: %s", namespace, name, entry["error"])
+            continue
+        if done:
+            table.refresh()
+            entry["commits"] = 1
+            entry["compacted"] = done
+            entry["files_before"] = sum(d["files"] for d in done)
+            entry["rows"] = sum(d["rows"] for d in done)
+            after = {str(p["partition"]): int(p["file_count"]) for p in table.inspect.partitions().to_pylist()}
+            keys = {str({k: p["partition"][k] for k in part_cols}) for p in cands
+                    if any(d["rows"] == p["record_count"] for d in done)}
+            entry["files_after"] = sum(n for k, n in after.items() if k in keys) or len(done)
+            log.info("compact %-34s %d partition(s), %d -> %d file(s), %d rows, one commit", f"{namespace}.{name}",
+                     len(done), entry["files_before"], entry["files_after"], entry["rows"])
+    return report
 
 
 def fix_first_seen(ns_dir: Path, now_iso: str) -> dict:
@@ -98,9 +214,21 @@ def expire_snapshots(table, older_than: dt.datetime) -> dict:
 
 
 def run(namespace: str, expire_days: float, catalog=None) -> dict:
-    from .iceberg_load import CONTROL_NS, OPTIONAL_TABLES, TABLE_PLAN, TABLE_PROPERTIES, load_catalog_from_env
-    if catalog is None:
+    """Expire old snapshots and set the retention properties on every table; a catalog
+    this function opens itself is released afterwards (SQLite keeps the file open)."""
+    from .iceberg_load import dispose_catalog, load_catalog_from_env
+    own = catalog is None
+    if own:
         catalog, _ = load_catalog_from_env()
+    try:
+        return _run(namespace, expire_days, catalog)
+    finally:
+        if own:
+            dispose_catalog(catalog)
+
+
+def _run(namespace: str, expire_days: float, catalog) -> dict:
+    from .iceberg_load import CONTROL_NS, OPTIONAL_TABLES, TABLE_PLAN, TABLE_PROPERTIES
     cutoff = dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(days=expire_days)
     targets = [(namespace, t) for t in TABLE_PLAN] + [(CONTROL_NS, "table_watermarks")]
     report: dict = {"cutoff": cutoff.isoformat(), "tables": {}}
@@ -141,6 +269,9 @@ def main(argv=None) -> int:
     ap.add_argument("--fix-first-seen", action="store_true",
                     help="one-time (v1.6.0): move l1_token_metadata.first_seen to the earliest staged ledger "
                          "event of each token and re-stamp the changed rows; no snapshot expiry in this mode")
+    ap.add_argument("--compact", action="store_true",
+                    help="rewrite closed, fragmented partitions into one file each (one commit per table), "
+                         "bounded by the next hourly tick minus a minute; runs before the snapshot expiry")
     args = ap.parse_args(argv)
     ns_dir = Path(args.out) / S.NS_HYPERCORE
     try:
@@ -149,7 +280,18 @@ def main(argv=None) -> int:
                 report = {"fix_first_seen": fix_first_seen(ns_dir, dt.datetime.now(tz=dt.timezone.utc).isoformat()),
                           "tables": {}}
             else:
+                compact_report = None
+                catalog = None
+                if args.compact:
+                    from .iceberg_load import dispose_catalog, load_catalog_from_env
+                    catalog, _ = load_catalog_from_env()
+                    try:
+                        compact_report = compact(args.namespace, catalog)
+                    finally:
+                        dispose_catalog(catalog)
                 report = run(args.namespace, args.expire_days)
+                if compact_report is not None:
+                    report["compact"] = compact_report
     except ops.LockHeld as e:
         # a data run holds the lock: yield (exit 3 = SuccessExitStatus in the unit, not a
         # failure); the next nightly tick will do the work
@@ -157,6 +299,7 @@ def main(argv=None) -> int:
         return 3
     print(json.dumps(report, indent=2, default=str))
     errors = [t for t, e in report["tables"].items() if "expire_error" in e or "properties_error" in e]
+    errors += [t for t, e in (report.get("compact") or {}).get("tables", {}).items() if "error" in e]
     return 1 if errors else 0
 
 

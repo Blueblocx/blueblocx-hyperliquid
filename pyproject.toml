@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blueblocx-hyperliquid"
-version = "1.7.0"
+version = "1.8.0"
 description = "Hyperliquid HyperCore -> BlueBlocx lakehouse pipeline (Info API + S3 node data -> Iceberg)"
 readme = "README.md"
 requires-python = ">=3.10"

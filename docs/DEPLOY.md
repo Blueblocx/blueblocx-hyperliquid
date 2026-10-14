@@ -97,7 +97,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.7.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.8.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -274,12 +274,16 @@ Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
   still warns, as pyiceberg labels SQLite development-only).
 - **Backup** = `pg_dump hl_catalog` **first**, then the warehouse directory
   (NAS snapshot); the dump then only references files that already exist.
-- **Maintenance.** `python -m blueblocx_hyperliquid.maintenance --expire-days 7` nightly
-  (`deploy/hypercore-maintenance.{service,timer}`) expires old snapshots so
-  `metadata.json` stays small; tables carry
-  `write.metadata.delete-after-commit.enabled=true`. pyiceberg deletes no data
-  files on expiry (small orphans remain; sweeper is a follow-up) and has no
-  compaction (hourly lifts leave one small Parquet per partition per hour).
+- **Maintenance.** `python -m blueblocx_hyperliquid.maintenance --expire-days 7 --compact`
+  nightly (`deploy/hypercore-maintenance.{service,timer}`, 00:05 UTC): first
+  **compaction** (v1.8.0) — every closed partition with ≥ 8 data files (closed =
+  its UTC day is ≥ 2 days old, 1 day for l4x) is rewritten into one file, one
+  transaction per table so the pointer moves once, bounded by the next hourly tick
+  minus a minute because maintenance holds the shared run lock — then snapshot
+  expiry so `metadata.json` stays small; tables carry
+  `write.metadata.delete-after-commit.enabled=true` and
+  `write.metadata.previous-versions-max=100`. pyiceberg deletes no data files on
+  expiry (the pre-compaction files become small orphans; a sweeper is a follow-up).
 
 ### Serving the lake to DuckDB readers
 
@@ -618,7 +622,7 @@ sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-dai
 sudo systemctl start hypercore-hourly.timer
 ```
 
-`RELEASE_TAG=v1.7.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
+`RELEASE_TAG=v1.8.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
 step 2 for you (checkout, pip, tests, units + web monitor restart + wrapper +
 daemon-reload, env keys new in the release, lake schema migrations via
 `migrate --apply`, preflight), refuses to run while a
@@ -640,6 +644,7 @@ Release notes (state-file and lake-schema changes only):
 |---|---|---|---|
 | v1.4.0 | none | replaced tables are rewritten in one commit per lift; `control.table_watermarks` rows gain the statuses `failed` / `restated` and `watermark_ts` becomes the max **write** stamp (was business time); lift order parents → facts → derived | `RELEASE_TAG=v1.3.0 bash deploy/bootstrap.sh` (v1.3.0 reports `kept_newer` on a few watermark rows for an hour — harmless) |
 | v1.5.0 | staged `l4_wallet_metadata.csv` rewritten by `migrate --apply` (tx-hash values in `first_tx` / `latest_tx` replaced by the block timestamps) — **tar HL_OUT_DIR first** | `hypercore.l4_wallet_metadata.first_tx` / `latest_tx`: STRING → TIMESTAMPTZ by in-place schema evolution (drop + re-add, DDL order, one backfill commit from `first_block_timestamp` / `latest_block_timestamp`); the lift raises `SchemaDriftError` and preflight FAILs on a table whose types differ from the DDL | **first** `cd /opt/blueblocx-hyperliquid && sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.migrate --revert --apply` (columns back to STRING, values NULL until the next run), **then** `RELEASE_TAG=v1.4.0 bash deploy/bootstrap.sh`; without the revert v1.4.0's lift of that table fails every hour (string → timestamptz cast) |
+| v1.8.0 | none | nightly **compaction** (`maintenance --compact`, in `deploy/hypercore-maintenance.service`): closed, fragmented partitions (≥ 8 files; a partition is closed 2 UTC days after its date, 1 day for l4x) are rewritten into one file each, one commit per table per night, bounded by the next hourly tick minus a minute; `write.metadata.previous-versions-max` 20 → 100 on every table (set by the nightly run) so a pointer the ETL fetched stays readable through commit bursts | `RELEASE_TAG=v1.7.0 bash deploy/bootstrap.sh` (bootstrap rewrites the maintenance unit without `--compact`; compacted partitions stay compacted — they are ordinary data files) |
 | v1.7.0 | `_price_state.json` added (per-token candle cursors + ledger-seen stamps; delete it to re-fetch 32 days for every token); new staged `l3_token_price_usd_1h.csv` / `_1d.csv` (pruned by retention like the ledger); two new env keys `HL_PRICE_TIME_BUDGET_MIN=3` / `HL_PRICE_HISTORY_DAYS=32` (bootstrap appends them) | two new tables `hypercore.l3_token_price_usd_1h` / `_1d`, created from the DDL on the first lift (same shape as the 1m table), lifted FIRST in every run | `RELEASE_TAG=v1.6.0 bash deploy/bootstrap.sh` — the new tables, CSVs and state file are ignored by older code; v1.6.0's preflight only WARNs `env_unknown` about the two HL_PRICE_* keys (remove them from the env file or ignore) |
 | v1.6.0 | `_watermarks.json[wallet].meta` added (the running `l4_wallet_metadata` aggregate; deleting a wallet's key re-seeds it from staging on the next run); staged dimension CSVs keep their stamps when content is unchanged; **one-time** `cd /opt/blueblocx-hyperliquid && sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.maintenance --fix-first-seen` between ticks after the deploy and **before 2026-11-26** (while staging still holds the full history since go-live) — tar HL_OUT_DIR first | none (same schema); the first lift after the deploy re-stamps every wallet's `l4_wallet_metadata` row once and the repaired token rows once | `RELEASE_TAG=v1.5.0 bash deploy/bootstrap.sh` (older code ignores the `meta` key and recomputes window-based rows; dimension rows go back to being re-stamped every run) |
 
