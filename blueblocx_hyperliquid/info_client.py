@@ -384,16 +384,19 @@ class InfoClient:
         return out
 
     def candle_snapshot(self, coin: str, interval: str,
-                        start_ms: int, end_ms: int) -> list[dict]:
+                        start_ms: int, end_ms: int, est_items: int | None = None) -> list[dict]:
         """OHLCV candles for a coin. The API returns only the ~5000 most recent
         candles in range and backward paging yields nothing, so this is a single
         request; callers choose `interval` via interval_for_range() and should
-        treat a first-candle time later than start_ms as a coverage hole."""
+        treat a first-candle time later than start_ms as a coverage hole.
+        `est_items` = the expected candle count, which sizes the weight reserved up
+        front (20 + items/20): a one-hour gap fetch must not reserve the 5000-candle
+        maximum or the budget throttles to a few calls per minute."""
         batch = self._post({
             "type": "candleSnapshot",
             "req": {"coin": coin, "interval": interval,
                     "startTime": start_ms, "endTime": end_ms},
-        }, est_items=_CANDLE_CAP)
+        }, est_items=_CANDLE_CAP if est_items is None else max(0, min(int(est_items), _CANDLE_CAP)))
         if not isinstance(batch, list):
             return []
         if batch and batch[0]["t"] > start_ms + 60_000:

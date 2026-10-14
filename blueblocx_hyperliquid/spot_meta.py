@@ -110,6 +110,15 @@ class SpotMetaResolver:
                 return p
         return None
 
+    def usdc_pairs(self) -> dict[str, SpotPair]:
+        """base token_address -> its USDC-quoted spot pair, for every token that has
+        one (the price step's universe of priceable tokens)."""
+        out: dict[str, SpotPair] = {}
+        for p in self._pairs.values():
+            if p.quote.index == 0 and p.base.index != 0:
+                out.setdefault(p.base.token_address, p)
+        return out
+
 
 def empty() -> "SpotMetaResolver":
     """A resolver with no data (used when spotMeta fetch fails; callers then

@@ -65,6 +65,15 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                  "are deferred to the next run (rotating order) instead of the service "
                                  "timeout killing the whole run. Hourly cadence: 35 (TimeoutStartSec=50min). "
                                  "0 = off"),
+    # --- native candle prices (price_step.py: the ETL's token_price_usd_1h / 1d) --------
+    "HL_PRICE_TIME_BUDGET_MIN": ("3", False,
+                                 "minutes at the START of every run spent fetching native 1h/1d candles for "
+                                 "l3_token_price_usd_1h/_1d (tokens with recent ledger activity every run, the "
+                                 "rest rotated most-stale first; closed candles only); the tables are lifted "
+                                 "before any wallet is pulled. 0 = off (the price tables stay empty)"),
+    "HL_PRICE_HISTORY_DAYS": ("32", False,
+                              "candle history fetched on a token's first visit (the ETL loads 32 days); "
+                              "max 200 (5000 hourly candles per request)"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock whose holder cannot be observed (another host, no /proc) is treated as "

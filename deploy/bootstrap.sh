@@ -33,7 +33,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.6.0}"
+RELEASE_TAG="${RELEASE_TAG:-v1.7.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -283,6 +283,8 @@ ensure_env HL_SMART_TOP_N 50 "v1.1: tracked smart money, top N by 30d pnl"
 ensure_env HL_RUN_SOFT_DEADLINE_MIN 35 "v1.1: hourly cadence - start no new wallet after 35 min (service timeout 50), defer the rest"
 ensure_env HL_WEB_BIND 0.0.0.0 "v1.3: web monitor address (no authentication: LAN/VPN only)"
 ensure_env HL_WEB_PORT 8787 "v1.3: web monitor port"
+ensure_env HL_PRICE_TIME_BUDGET_MIN 3 "v1.7: minutes per run (first) for native 1h/1d candles -> l3_token_price_usd_1h/_1d (ETL token_price_usd_1h/1d); 0 = off"
+ensure_env HL_PRICE_HISTORY_DAYS 32 "v1.7: candle history fetched on a token's first visit (the ETL loads 32 days)"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then

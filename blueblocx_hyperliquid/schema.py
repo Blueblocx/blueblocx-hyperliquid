@@ -137,6 +137,11 @@ L3_TOKEN_PRICE_USD_1M_COLUMNS = [
     "created_at",
     "updated_at",
 ]
+# ETL contract labels token_price_usd_1h / token_price_usd_1d: the SAME shape (bucket_minute =
+# the candle open, bucket_date = its UTC day), one row per CLOSED native 1h / 1d candle.
+# Keys: (token_address, bucket_minute) for 1h, (token_address, bucket_date) for 1d.
+L3_TOKEN_PRICE_USD_1H_COLUMNS = list(L3_TOKEN_PRICE_USD_1M_COLUMNS)
+L3_TOKEN_PRICE_USD_1D_COLUMNS = list(L3_TOKEN_PRICE_USD_1M_COLUMNS)
 
 # ICEBERG_SCHEMA.sql:143-165  nessie.<chain>.l1_token_metadata
 # We emit the minimal subset needed for: symbol resolution (moved off `standard`),

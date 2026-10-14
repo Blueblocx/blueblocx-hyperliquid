@@ -188,6 +188,23 @@ def check_env(env_file: Path | None) -> list[Check]:
             out.append(_ok("soft_deadline", f"{dl:g} min, then the rest of the list is deferred to the next run"))
     except ValueError as e:
         out.append(_fail("soft_deadline", str(e)))
+    try:
+        pb = config.env_float("HL_PRICE_TIME_BUDGET_MIN")
+        hd = config.env_int("HL_PRICE_HISTORY_DAYS")
+        if pb < 0 or pb > 20:
+            out.append(_fail("prices", f"HL_PRICE_TIME_BUDGET_MIN={pb:g} - must be 0..20 minutes"))
+        elif hd < 1 or hd > 200:
+            out.append(_fail("prices", f"HL_PRICE_HISTORY_DAYS={hd} - must be 1..200 (5000 hourly candles = ~208 days)"))
+        elif pb == 0:
+            out.append(_warn("prices", "HL_PRICE_TIME_BUDGET_MIN=0 - native price tables off; the ETL's "
+                                       "token_price_usd_1h/1d stay empty"))
+        elif pb > 10:
+            out.append(_warn("prices", f"{pb:g} min of every run on candles, FIRST - the wallet phase keeps only "
+                                       f"{35 - pb:g} min under the 35-min soft deadline"))
+        else:
+            out.append(_ok("prices", f"{pb:g} min per run for native 1h/1d candles, {hd} days on a token's first visit"))
+    except ValueError as e:
+        out.append(_fail("prices", str(e)))
     desc = config.describe_env()
     secrets_set = sorted(k for k in config.SECRET_VARS if desc[k]["set"])
     out.append(_ok("secrets", "set: " + (", ".join(secrets_set) if secrets_set else "none") + " (values not shown)"))

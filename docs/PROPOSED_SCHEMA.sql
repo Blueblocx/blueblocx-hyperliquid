@@ -15,7 +15,9 @@ CREATE NAMESPACE IF NOT EXISTS nessie.hyperevm;
 --   l1_wallet_ledger          (standard is ALWAYS "ERC20" so consumer gates pass;
 --                              the HL coin symbol lives in l1_token_metadata.symbol)
 --   l1_token_metadata         (symbol/decimals/is_stablecoin for spot + USDC)
---   l3_token_price_usd_1m     (native 1m candles, keyed by the ledger token_address)
+--   l3_token_price_usd_1m     (native 1m candles, keyed by the ledger token_address;
+--                              development-only output in production)
+--   l3_token_price_usd_1h/_1d (native 1h / 1d candles for the ETL's token_price_usd_1h/1d - v1.7.0)
 --   l4_wallet_metadata        (activity summary; first/latest by block_timestamp;
 --                              first_tx/latest_tx are those INSTANTS, not hashes - v1.5.0)
 --   token_whitelist           (consumer gate — seed is_active=true for HL tokens)
@@ -154,6 +156,62 @@ TBLPROPERTIES (
 );
 
 ALTER TABLE nessie.hypercore.l3_token_price_usd_1m WRITE ORDERED BY token_address ASC NULLS LAST, bucket_minute ASC NULLS LAST;
+
+-- ----------------------------------------------------------------------------
+-- Native 1h / 1d candles for the ETL's token_price_usd_1h / token_price_usd_1d
+-- (v1.7.0): the SAME shape as the 1m table (bucket_minute = the candle open,
+-- bucket_date = its UTC day), one row per CLOSED candle, stables pinned at 1.0 on
+-- the same grid, no perp reference rows. Natural keys: (token_address,
+-- bucket_minute) for 1h, (token_address, bucket_date) for 1d. Written FIRST in
+-- every hourly run under its own time budget (blueblocx_hyperliquid.price_step).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l3_token_price_usd_1h (
+    token_address       STRING,
+    token_group         INT,
+    bucket_minute       TIMESTAMP, -- candle open (hour)
+    bucket_date         DATE,
+    open_price_usd      DOUBLE,
+    high_price_usd      DOUBLE,
+    low_price_usd       DOUBLE,
+    close_price_usd     DOUBLE,
+    vwap_price_usd      DOUBLE,
+    volume_token        DOUBLE,
+    volume_usd          DOUBLE,
+    num_trades          INT,
+    created_at          TIMESTAMP,
+    updated_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (bucket_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+ALTER TABLE nessie.hypercore.l3_token_price_usd_1h WRITE ORDERED BY token_address ASC NULLS LAST, bucket_minute ASC NULLS LAST;
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l3_token_price_usd_1d (
+    token_address       STRING,
+    token_group         INT,
+    bucket_minute       TIMESTAMP, -- candle open (00:00 UTC of bucket_date)
+    bucket_date         DATE,
+    open_price_usd      DOUBLE,
+    high_price_usd      DOUBLE,
+    low_price_usd       DOUBLE,
+    close_price_usd     DOUBLE,
+    vwap_price_usd      DOUBLE,
+    volume_token        DOUBLE,
+    volume_usd          DOUBLE,
+    num_trades          INT,
+    created_at          TIMESTAMP,
+    updated_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (bucket_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+ALTER TABLE nessie.hypercore.l3_token_price_usd_1d WRITE ORDERED BY token_address ASC NULLS LAST, bucket_date ASC NULLS LAST;
 
 CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_metadata (
     wallet_address          STRING,

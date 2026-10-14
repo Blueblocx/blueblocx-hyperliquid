@@ -5,7 +5,7 @@ lock as the scheduled run):
     python -m blueblocx_hyperliquid.maintenance --expire-days 7 [--namespace hypercore]
     python -m blueblocx_hyperliquid.maintenance --fix-first-seen      # one-time, v1.6.0 (see below)
 
-What it does per table (the 7 hypercore tables + control.table_watermarks):
+What it does per table (every hypercore table in iceberg_load.TABLE_PLAN + control.table_watermarks):
   * expire_snapshots older than --expire-days: pyiceberg 0.12 removes the
     snapshot entries from metadata.json (the thing that grows on every commit and
     is re-read on every commit) — it does NOT delete the data/manifest files those

@@ -56,8 +56,10 @@ class ProgressTests(unittest.TestCase):
             extract.run([W1, W2], 2, Path(d), hip3=False, deadline_ts=time.time() - 1,
                         progress=lambda **kw: calls.append(kw))
         phases = [c["phase"] for c in calls if "phase" in c]
-        self.assertEqual(phases, ["pull", "analyse", "write", "finalise"])
-        self.assertEqual(calls[0], {"phase": "pull", "wallets_total": 2, "wallets_done": 0, "current": None})
+        # v1.7.0: the native price step runs first, under its own budget, before any wallet
+        self.assertEqual(phases, ["prices", "pull", "analyse", "write", "finalise"])
+        pull = next(c for c in calls if c.get("phase") == "pull")
+        self.assertEqual(pull, {"phase": "pull", "wallets_total": 2, "wallets_done": 0, "current": None})
         after_pull = next(c for c in calls if "wallets_deferred" in c)
         self.assertEqual((after_pull["wallets_done"], after_pull["wallets_deferred"]), (0, 2))
 

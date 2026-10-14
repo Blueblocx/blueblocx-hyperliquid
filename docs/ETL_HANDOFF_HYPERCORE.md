@@ -72,7 +72,9 @@ pointers in one statement at the start of your run; use `control.table_watermark
 | `wallet_watchlist` | `wallet_address` | `wallet_watchlist` | one row per tracked wallet; same de-listing caveat |
 | `l4_wallet_metadata` | `wallet_address` | `wallet_metadata` | `first_tx` / `latest_tx` are **TIMESTAMPTZ instants** of the wallet's first/latest ledger event *(v1.5.0; tx-hash strings before)*; from v1.6.0 the row is a **running aggregate over the wallet's accumulated history** since go-live (funding excluded: `count_tx` = non-funding ledger rows, `active_days` = distinct UTC days with activity, `last_active` = whole UTC days since the latest event, `active_on_avg` NULL); a wallet with no non-funding activity has no row |
 | `l1_wallet_ledger` | `(tx_hash, event_index, direction)` | source of `wallet_transactions` (your SQL, section 6) | immutable facts, insert-if-absent; `block_number`/`tx_index` NULL (no EVM block) |
-| `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — | development-only output, **not populated in production**; native 1h/1d tables arrive in v1.7.0 |
+| `l3_token_price_usd_1h` | `(token_address, bucket_minute)` | `token_price_usd_1h` | one row per **closed** native 1h candle (`bucket_minute` = the candle open) for every token the ledger referenced that has a USDC spot market, plus stables pinned at 1.0 on the same grid; 32 days back on a token's first visit; no perp rows *(v1.7.0)* |
+| `l3_token_price_usd_1d` | `(token_address, bucket_date)` | `token_price_usd_1d` | same per closed UTC day (`bucket_minute` = 00:00Z of `bucket_date`) *(v1.7.0)* |
+| `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — | development-only output, **not populated in production** |
 | `l4x_perp_position_snapshot` | `(as_of_date, wallet_address, coin)` | — (extension) | daily perp positions / unrealized PnL; no `updated_at` (use `created_at`); replaced per `(as_of_date, wallet)` every hour |
 | `control.table_watermarks` | `(namespace, table_name)` | — | one row per table per lift, section 5 |
 
@@ -144,10 +146,12 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
    `token_metadata`, `token_whitelist`, `wallet_watchlist`, `wallet_metadata`,
    `wallet_transactions` (your SQL over `l1_wallet_ledger` joined to
    `l1_token_metadata` for `token_symbol`; `log_index := event_index`;
-   `row_key` as in section 4; `transfer_price_usd` / `transfer_value_usd` NULL until
-   the price tables exist — stables may be valued at 1.0 via `is_stablecoin`),
-   and from v1.7.0 `token_price_usd_1h` / `token_price_usd_1d` (plain SELECTs on
-   native-candle tables). Every other label (balances, networth, PnL, sharpe,
+   `row_key` as in section 4; `transfer_price_usd` / `transfer_value_usd` from an
+   ASOF join on `l3_token_price_usd_1h.bucket_minute` once the onboarding gate below
+   is green, stables at 1.0 via `is_stablecoin`), `token_price_usd_1h` /
+   `token_price_usd_1d` (plain SELECTs on `l3_token_price_usd_1h` / `_1d`: same
+   column names as your spec; `num_trades` is INT here, cast to BIGINT if you
+   reconcile sums). Every other label (balances, networth, PnL, sharpe,
    token stats/signals/quality, DEX pair volume, market cap / fear index /
    exchange flow, `wallet_performance_30d`) has **no HyperCore source**: leave it
    out of the hypercore bundle — the fixed 34-label clone would fail at export and
@@ -187,7 +191,7 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
 | v1.4.0 | single-commit replaces (no half-replaced table), parents-before-facts lift order, NOT-NULL/duplicate guards before any commit, `name`/`symbol` caps, watermark statuses and write-stamp semantics, read-only catalog role + smoke test, this document |
 | v1.5.0 | `l4_wallet_metadata.first_tx` / `latest_tx` are **TIMESTAMPTZ instants** (the first/latest ledger event = `first_block_timestamp` / `latest_block_timestamp`; before, tx-hash strings that would fail your TIMESTAMPTZ COPY). Done by an in-place schema evolution + one backfill commit (`migrate --apply`, run by our deploy); the columns keep their names and position, the Iceberg field ids change (DuckDB resolves by current schema; irrelevant to you). Our lift refuses to write a table whose types differ from the DDL, so this cannot regress silently |
 | v1.6.0 | `l4_wallet_metadata` is a running aggregate over the wallet's **accumulated history** (count_tx = non-funding ledger rows, active_days = distinct UTC days, last_active = UTC days since the latest event, first/latest instants; funding excluded; `active_on_avg` NULL pending a definition), carried next to our per-wallet watermark and advanced only over complete windows; dimension rows re-stamped **only on content change** (`created_at` = first ingestion); `first_seen` stable, with a one-time repair that re-stamps drifted token rows once |
-| v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows) for `token_price_usd_1h/1d` and USD valuation in `wallet_transactions`; onboarding gate: `prices.history_pending == 0` in our run summary |
+| v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows), written FIRST in every hourly run under a 3-minute budget (tokens with recent ledger activity every run, the rest rotated most-stale first) and lifted before the wallet phase, so they are present even when a run defers wallets. **Onboarding gate:** `prices.history_pending == 0` in `_run_summary.json` (every priceable token carries its 32-day history; after the deploy this takes a few hours of rotation). `prices_deferred=N` in a summary means the budget was reached that hour - the next run continues |
 | v1.8.0 | nightly compaction of small files (reader planning time) |
 
 Check the deployed version before onboarding (`/api/status` on the web monitor, or

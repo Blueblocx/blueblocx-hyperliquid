@@ -92,6 +92,8 @@ TABLE_PLAN = {
     "wallet_watchlist": (["wallet_address"], "replace_keys", []),
     "l1_wallet_ledger": (["tx_hash", "event_index", "direction"], "insert_if_absent", ["block_date"]),
     "l3_token_price_usd_1m": (["token_address", "bucket_minute"], "insert_if_absent", ["bucket_date"]),
+    "l3_token_price_usd_1h": (["token_address", "bucket_minute"], "insert_if_absent", ["bucket_date"]),
+    "l3_token_price_usd_1d": (["token_address", "bucket_date"], "insert_if_absent", ["bucket_date"]),
     "l4_wallet_metadata": (["wallet_address"], "replace_keys", []),
     "l4x_perp_position_snapshot": (["as_of_date", "wallet_address", "coin"], "replace_scope", ["as_of_date", "wallet_address"]),
 }
@@ -107,6 +109,7 @@ OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"})
 _STAMP_COL = {name: "updated_at" for name in TABLE_PLAN}
 _STAMP_COL["l4x_perp_position_snapshot"] = "created_at"
 _BUSINESS_DATE_COL = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m": "bucket_date",
+                      "l3_token_price_usd_1h": "bucket_date", "l3_token_price_usd_1d": "bucket_date",
                       "l4x_perp_position_snapshot": "as_of_date"}
 _SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts"}
 
@@ -119,6 +122,8 @@ REQUIRED_COLS = {
     "l1_wallet_ledger": ["tx_hash", "event_index", "direction", "block_timestamp", "block_date", "event_type",
                          "wallet_address", "token_address", "created_at", "updated_at"],
     "l3_token_price_usd_1m": ["token_address", "bucket_minute", "bucket_date", "created_at", "updated_at"],
+    "l3_token_price_usd_1h": ["token_address", "bucket_minute", "bucket_date", "created_at", "updated_at"],
+    "l3_token_price_usd_1d": ["token_address", "bucket_minute", "bucket_date", "created_at", "updated_at"],
     "l4x_perp_position_snapshot": ["as_of_ts", "as_of_date", "wallet_address", "coin"],
     "l1_token_metadata": ["token_address", "standard", "is_stablecoin", "created_at", "updated_at"],
     "l4_wallet_metadata": ["wallet_address", "updated_at"],

@@ -27,7 +27,9 @@ Output (nessie.hypercore.*):
     out/hypercore/l4_wallet_metadata.csv          upsert wallet_address
     out/hypercore/wallet_watchlist.csv            upsert wallet_address  (consumer gate)
     out/hypercore/token_whitelist.csv             upsert token_address   (consumer gate)
-    out/hypercore/l3_token_price_usd_1m.csv       (only with --with-prices)
+    out/hypercore/l3_token_price_usd_1m.csv       (only with --with-prices; development)
+    out/hypercore/l3_token_price_usd_1h.csv       native closed 1h candles (price_step, FIRST in the
+    out/hypercore/l3_token_price_usd_1d.csv       run under HL_PRICE_TIME_BUDGET_MIN; state _price_state.json)
     out/hypercore/wallet_analytics_contrib.json   per-wallet contribution; the Rust
                                                   wallet-analytics crate OWNS the table
     out/hypercore/_reconciliation.json            asserts + portfolio-oracle checks
@@ -46,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import schema as S
-from . import analytics, config, mappers, ops, prices, wallet_meta
+from . import analytics, config, mappers, ops, price_step, prices, wallet_meta
 from .info_client import InfoClient
 from .ops import atomic_write_text
 from .spot_meta import SpotMetaResolver, empty as empty_resolver
@@ -496,7 +498,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         max_workers: int = 4, max_perp_price_coins: int = 30,
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
         hip3: bool = True, retention_days: int = 0, deadline_ts: float | None = None,
-        soft_wallets: set[str] | None = None, progress=None) -> dict:
+        soft_wallets: set[str] | None = None, progress=None,
+        price_budget_min: float | None = None) -> dict:
     """Pull, map, snapshot, analyse and write every wallet in `wallets` (in order).
 
     deadline_ts (epoch seconds): after it, no further wallet is STARTED and the
@@ -516,6 +519,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
     progress: optional callable taking keyword fields (phase, wallets_done, current,
     ...) - ops.Progress.update - called at every phase change and before every wallet.
+
+    price_budget_min: minutes the native candle step (price_step, FIRST in the run) may
+    spend; None = HL_PRICE_TIME_BUDGET_MIN, 0 = off. Its two tables are lifted right
+    after the step when `iceberg` is set, so they land even if the wallet phase fails.
     """
     wallets = list(dict.fromkeys(w.lower() for w in wallets))   # dedupe: one pull and one dimension row per wallet
     soft = {w.lower() for w in (soft_wallets or ())}
@@ -567,6 +574,34 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             collateral_report[dx] = ti.symbol
         else:
             collateral_report[dx] = "USDC(assumed)"
+
+    # ---- phase 0: native 1h/1d candles for the ETL's price tables (price_step) ----------
+    # FIRST, under its own absolute budget, so the wallet phase keeps its slot; the two
+    # tables are lifted at once (their watermarks come with the main lift) so they land
+    # even when the wallet phase defers or fails. Never fatal for the run.
+    native_price_report = None
+    budget_min = config.env_float("HL_PRICE_TIME_BUDGET_MIN") if price_budget_min is None else price_budget_min
+    if budget_min > 0:
+        progress(phase="prices")
+        try:
+            native_price_report = price_step.run(client, resolver, ns_dir, now_ms, now_iso, budget_s=budget_min * 60,
+                                                 history_days=config.env_int("HL_PRICE_HISTORY_DAYS"), clock=time)
+        except Exception as e:  # noqa: BLE001 - prices never block the wallet phase
+            log.warning("price step failed: %s: %s", type(e).__name__, e)
+            native_price_report = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+        if iceberg and not native_price_report.get("error") and (native_price_report.get("rows_1h")
+                                                                 or native_price_report.get("rows_1d")):
+            from .iceberg_load import lift_directory, lift_since, read_lift_state
+            config.load_env()
+            prev_lift = read_lift_state(ns_dir).get("last_success_run_iso") if incremental else None
+            try:
+                early = lift_directory(ns_dir, tables=[price_step.TABLE_1H, price_step.TABLE_1D],
+                                       since_iso=lift_since(prev_lift, now_iso), watermarks=False)
+                native_price_report["early_lift"] = {t: early.get(t) for t in (price_step.TABLE_1H, price_step.TABLE_1D)}
+            except Exception as e:  # noqa: BLE001 - the main lift retries these tables at the end of the run
+                log.warning("early lift of the price tables failed (the main lift retries): %s: %s",
+                            type(e).__name__, e)
+                native_price_report["early_lift"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
 
     registry = mappers.TokenRegistry()
     all_l1: list[dict] = []
@@ -980,6 +1015,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     upsert_csv(ns_dir / "token_whitelist.csv", S.TOKEN_WHITELIST_COLUMNS, whitelist_rows,
                key_fn=lambda r: (s(r["token_address"]),), sort_fn=lambda r: s(r["token_address"]),
                merge_fn=content_merge(S.TOKEN_WHITELIST_COLUMNS))
+    # tokens the ledger referenced this run form the hot tier of the next run's price step
+    price_step.record_seen(ns_dir, {r["token_address"] for r in all_l1}, now_ms)
 
     price_report = None
     if with_prices:
@@ -1033,6 +1070,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                     "cutoff": datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).isoformat(),
                     "l1_wallet_ledger": prune_csv(ns_dir / "l1_wallet_ledger.csv", "block_timestamp", cutoff_ms),
                     "l3_token_price_usd_1m": prune_csv(ns_dir / "l3_token_price_usd_1m.csv", "bucket_minute", cutoff_ms),
+                    "l3_token_price_usd_1h": prune_csv(ns_dir / "l3_token_price_usd_1h.csv", "bucket_minute", cutoff_ms),
+                    "l3_token_price_usd_1d": prune_csv(ns_dir / "l3_token_price_usd_1d.csv", "bucket_minute", cutoff_ms),
                     "l4x_perp_position_snapshot": prune_csv(ns_dir / "l4x_perp_position_snapshot.csv", "as_of_ts", cutoff_ms),
                 }
                 extra_state["last_prune_iso"] = now_iso
@@ -1083,6 +1122,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "stamp_age_min": round(stamp_age_min, 2),
         "unmapped_ledger_types": unknown_types_all,
         "price_job": price_report,
+        "prices": native_price_report,
         "iceberg": iceberg_report,
         "retention": retention_report,
         "hip3_dexes_checked": dexes,

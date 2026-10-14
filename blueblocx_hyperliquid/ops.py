@@ -350,6 +350,20 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
 
     if deferred_set:
         warnings.append(f"deferred={len(deferred_set)}")
+    # the native price step (v1.7.0) never fails a run: what it could not do is a warning,
+    # and prices.history_pending == 0 is the ETL's onboarding gate
+    prices = (recon or {}).get("prices")
+    if prices:
+        if prices.get("error"):
+            warnings.append("prices:skipped")
+        if prices.get("deferred"):
+            warnings.append(f"prices_deferred={prices['deferred']}")
+        if prices.get("history_pending"):
+            warnings.append(f"prices_history_pending={prices['history_pending']}")
+        if prices.get("errors"):
+            warnings.append(f"prices_errors={len(prices['errors'])}")
+        if (prices.get("early_lift") or {}).get("error"):
+            warnings.append("prices:early_lift_failed")
     statuses = [e["status"] for e in per_wallet.values()]
     ok = recon is not None and not problems
     return {
@@ -370,6 +384,7 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         "natural_key_ok": (recon or {}).get("natural_key_ok"),
         "iceberg": (recon or {}).get("iceberg"),
         "retention": (recon or {}).get("retention"),
+        "prices": prices or None,
         "hip3_dexes": (recon or {}).get("hip3_dexes_checked"),
         "unmapped_ledger_types": (recon or {}).get("unmapped_ledger_types") or {},
         "options": options or {},
