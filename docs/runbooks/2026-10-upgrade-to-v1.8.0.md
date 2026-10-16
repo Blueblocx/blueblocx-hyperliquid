@@ -9,6 +9,12 @@ improvising.
 The steps are idempotent: a step that already happened (a key already in the env
 file, a migration already applied, a timer already stopped) is harmless to repeat.
 
+> **2026-10-16:** the first attempt stopped in step 7: the v1.8.0 test suite fails inside
+> `/opt/blueblocx-hyperliquid` (4 `RunLock` tests; the lock's recycled-PID check mistook the test
+> process for an unrelated one) and `bootstrap.sh` refused. v1.8.1 fixes the lock check and
+> changes nothing else about the upgrade: read every `v1.8.0` below as **`v1.8.1`**
+> (`RELEASE_TAG=v1.8.1`, log `~/bootstrap-v1.8.1-$STAMP.log`, monitor shows `version 1.8.1`).
+
 ## 0. Rules that override everything below (from CLAUDE.md)
 
 - Never edit, `git pull`, or run `pip` inside `/opt/blueblocx-hyperliquid`. It moves

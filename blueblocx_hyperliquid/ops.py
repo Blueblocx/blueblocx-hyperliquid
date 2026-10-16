@@ -173,7 +173,11 @@ class RunLock:
     drop the backfill's rows from its own lift. A live PID that belongs to an
     unrelated process (PID recycled after a crash or reboot) is discarded. The age
     rule (HL_LOCK_STALE_HOURS) applies only when liveness or identity cannot be told
-    (another host, no /proc, unreadable cmdline). Liveness is never probed with
+    (another host, no /proc, unreadable cmdline). A lock recorded by THIS process is
+    never discarded, whatever its cmdline says: the identity check exists to catch a
+    recycled PID, and our own PID cannot be one (before v1.8.1 the test suite, run as
+    `python -m unittest` from a directory not named blueblocx_hyperliquid, stole its
+    own lock here). Liveness is never probed with
     os.kill(pid, 0), which terminates the target on Windows. systemd timers never
     overlap a running service anyway; cron and hand runs do, hence the lock.
     """
@@ -198,6 +202,8 @@ class RunLock:
         holder = self._holder()
         if holder.get("host") in (None, socket.gethostname()):
             pid = holder.get("pid")
+            if pid == os.getpid():
+                return None                  # held by this very process: never discarded (v1.8.1)
             alive = pid_alive(pid) if holder else None
             if alive is False:
                 return f"pid {pid} is not running"

@@ -97,7 +97,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.8.0 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.8.1 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -679,7 +679,7 @@ sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-dai
 sudo systemctl start hypercore-hourly.timer
 ```
 
-`RELEASE_TAG=v1.8.0 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
+`RELEASE_TAG=v1.8.1 bash ~/blueblocx-hyperliquid/deploy/bootstrap.sh` does all of
 step 2 for you (checkout, pip, tests, units + web monitor restart + wrapper +
 daemon-reload, env keys new in the release, lake schema migrations via
 `migrate --apply`, preflight), refuses to run while a
@@ -704,6 +704,7 @@ Release notes (state-file and lake-schema changes only):
 | v1.6.0 | `_watermarks.json[wallet].meta` added (the running `l4_wallet_metadata` aggregate; deleting a wallet's key re-seeds it from staging on the next run); staged dimension CSVs keep their stamps when content is unchanged; **one-time** `cd /opt/blueblocx-hyperliquid && sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.maintenance --fix-first-seen` between ticks after the deploy and **before 2026-11-26** (while staging still holds the full history since go-live) — tar HL_OUT_DIR first | none (same schema); the first lift after the deploy re-stamps every wallet's `l4_wallet_metadata` row once and the repaired token rows once | `RELEASE_TAG=v1.5.0 bash deploy/bootstrap.sh` (older code ignores the `meta` key and recomputes window-based rows; dimension rows go back to being re-stamped every run) |
 | v1.7.0 | `_price_state.json` added (per-token candle cursors + ledger-seen stamps; delete it to re-fetch 32 days for every token); new staged `l3_token_price_usd_1h.csv` / `_1d.csv` (pruned by retention like the ledger); two new env keys `HL_PRICE_TIME_BUDGET_MIN=3` / `HL_PRICE_HISTORY_DAYS=32` (bootstrap appends them) | two new tables `hypercore.l3_token_price_usd_1h` / `_1d`, created from the DDL on the first lift (same shape as the 1m table), lifted FIRST in every run | `RELEASE_TAG=v1.6.0 bash deploy/bootstrap.sh` — the new tables, CSVs and state file are ignored by older code; v1.6.0's preflight only WARNs `env_unknown` about the two HL_PRICE_* keys (remove them from the env file or ignore) |
 | v1.8.0 | none | nightly **compaction** (`maintenance --compact`, in `deploy/hypercore-maintenance.service`): closed, fragmented partitions (≥ 8 files; a partition is closed 2 UTC days after its date, 1 day for l4x) are rewritten into one file each, one commit per table per night, bounded by the next hourly tick minus a minute; `write.metadata.previous-versions-max` 20 → 100 on every table (set by the nightly run) so a pointer the ETL fetched stays readable through commit bursts | `RELEASE_TAG=v1.7.0 bash deploy/bootstrap.sh` (bootstrap rewrites the maintenance unit without `--compact`; compacted partitions stay compacted — they are ordinary data files) |
+| v1.8.1 | none | none. Fix: `ops.RunLock` never discards a lock recorded by the current process (the recycled-PID check read the holder's cmdline; the test suite run as `python -m unittest` from a directory not named `blueblocx_hyperliquid` stole its own lock, so `bootstrap.sh` refused v1.8.0 in `/opt/blueblocx-hyperliquid` with 4 `test_ops` / `test_lift` failures). Also ships `hypercore-sql` (read-only SQL over the lake, §7) and the `duckdb` pin | `RELEASE_TAG=v1.8.0 bash deploy/bootstrap.sh` (its test suite fails in `/opt`, so v1.7.0 is the practical fallback) |
 
 Several releases at once (e.g. v1.3.0 → v1.8.0 in one bootstrap) is supported: every
 step is cumulative and idempotent (env keys are appended for all releases, `migrate
