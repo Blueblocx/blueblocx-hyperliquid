@@ -342,25 +342,47 @@ def _s3_props() -> dict:
     return props
 
 
-def _sql_props(sql_uri: str, local_dir: Path | None = None) -> dict:
+def _sql_props(sql_uri: str, local_dir: Path | None = None, read_only: bool = False) -> dict:
     """pyiceberg SQL-catalog properties: the catalog rows live in the database
     named by HL_CATALOG_URI (PostgreSQL in production — SQLite is single-writer,
     development only); the DATA lives wherever WAREHOUSE points. A file://
     warehouse (e.g. an NFS mount) needs no object store at all; an s3://
-    warehouse takes the usual S3_* variables."""
+    warehouse takes the usual S3_* variables. `read_only` (readers such as
+    blueblocx_hyperliquid.query): never create the catalog tables — a mistyped
+    URI must fail, not quietly start a new empty catalog — and create no directory."""
     warehouse = os.environ.get("WAREHOUSE") or ""
     if not warehouse:
         local = Path(local_dir or (config.out_root() / "iceberg")).resolve()
-        local.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            local.mkdir(parents=True, exist_ok=True)
         warehouse = f"file://{local.as_posix()}/warehouse"
     props = {"type": "sql", "uri": sql_uri, "warehouse": warehouse,
              "py-io-impl": os.environ.get("HL_PY_IO_IMPL") or DEFAULT_PY_IO_IMPL}
+    if read_only:
+        props["init_catalog_tables"] = "false"
     if warehouse.startswith(("s3://", "s3a://", "s3n://")):
         props.update(_s3_props())
     return props
 
 
-def load_catalog_from_env(local_dir: Path | None = None):
+def _sqlite_file(uri: str) -> Path | None:
+    """Filesystem path of a SQLite SQLAlchemy URL (any sqlite dialect spelling), else
+    None (other backends, :memory:)."""
+    try:
+        from sqlalchemy.engine import make_url
+        url = make_url(uri)
+    except Exception:  # noqa: BLE001 — not a SQLAlchemy URL: let the catalog report it
+        return None
+    if url.get_backend_name() != "sqlite" or not url.database or url.database == ":memory:":
+        return None
+    return Path(url.database)
+
+
+def load_catalog_from_env(local_dir: Path | None = None, read_only: bool = False):
+    """The catalog the environment selects, as (catalog, mode). `read_only` is for
+    readers (blueblocx_hyperliquid.query): catalog tables are never created, no
+    directory is created, and a missing SQLite catalog is an error instead of a
+    new empty one. Reading itself is always safe: Iceberg readers take no locks."""
     from pyiceberg.catalog import load_catalog
     mode = catalog_mode()
     if mode == "rest":
@@ -370,15 +392,24 @@ def load_catalog_from_env(local_dir: Path | None = None):
                  props["py-io-impl"].rsplit(".", 1)[-1])
         return load_catalog("nessie", **props), "rest"
     if mode == "sql":
-        props = _sql_props(os.environ["HL_CATALOG_URI"], local_dir)
+        props = _sql_props(os.environ["HL_CATALOG_URI"], local_dir, read_only=read_only)
+        if read_only:
+            db = _sqlite_file(props["uri"])
+            if db is not None and not db.is_file():
+                raise FileNotFoundError(f"no Iceberg catalog at {db} (HL_CATALOG_URI)")
         wh_path = warehouse_local_path(props["warehouse"])
         if wh_path is not None:
             require_warehouse_mount(wh_path)
-            wh_path.mkdir(parents=True, exist_ok=True)
+            if not read_only:
+                wh_path.mkdir(parents=True, exist_ok=True)
         log.info("iceberg catalog: SQL %s, warehouse %s", _redacted_uri(props["uri"]), props["warehouse"])
         return load_catalog("hl", **props), "sql"
     local = Path(local_dir or (config.out_root() / "iceberg")).resolve()
-    local.mkdir(parents=True, exist_ok=True)
+    if read_only:
+        if not (local / "catalog.db").is_file():
+            raise FileNotFoundError(f"no local Iceberg catalog at {local / 'catalog.db'} (nothing lifted yet?)")
+    else:
+        local.mkdir(parents=True, exist_ok=True)
     wh = local.as_posix()
     warehouse = os.environ.get("WAREHOUSE") or ""
     if not warehouse.startswith("file://"):
@@ -388,12 +419,14 @@ def load_catalog_from_env(local_dir: Path | None = None):
         warehouse = f"file://{wh}/warehouse"
     else:
         p = warehouse_local_path(warehouse)
-        if p is not None:
+        if p is not None and not read_only:
             p.mkdir(parents=True, exist_ok=True)
     log.info("iceberg catalog: LOCAL sqlite at %s, warehouse %s", wh, warehouse)
-    return load_catalog("local", **{"type": "sql", "uri": f"sqlite:///{wh}/catalog.db",
-                                   "warehouse": warehouse,
-                                   "py-io-impl": os.environ.get("HL_PY_IO_IMPL") or DEFAULT_PY_IO_IMPL}), "local"
+    props = {"type": "sql", "uri": f"sqlite:///{wh}/catalog.db", "warehouse": warehouse,
+             "py-io-impl": os.environ.get("HL_PY_IO_IMPL") or DEFAULT_PY_IO_IMPL}
+    if read_only:
+        props["init_catalog_tables"] = "false"
+    return load_catalog("local", **props), "local"
 
 
 def _iceberg_schema(cols: list[tuple], tz: bool = True):

@@ -20,6 +20,14 @@ the distinction is the whole safety model:
 - CLI with the same verdict: `hypercore-status` (`--json`; exit 0 = healthy).
 - Logs: `sudo journalctl -u hypercore-daily -f`; units/timers: `systemctl list-timers --all 'hypercore-*'`.
 - Last verdict: `sudo jq '{ok,wallets_ok,wallets_deferred,tracked,problems,warnings}' /var/lib/hypercore/hypercore/_run_summary.json`.
+- SQL over the lake, read-only: `hypercore-sql --list`, `hypercore-sql "select …"` (pyiceberg resolves the
+  committed snapshot through the catalog, DuckDB runs the SQL in memory; last 30 days of the fact tables
+  unless `--days N`/`--days 0`). From the working copy the same module is
+  `HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.query …` — the one
+  module that may be pointed at the production env from here (it opens the catalog with
+  `init_catalog_tables=false`, creates nothing in the catalog, state dir or warehouse, runs DuckDB
+  with file access disabled, scrubs secrets from errors). `docs/DEPLOY.md` §7 has the
+  ledger semantics (amounts are per token, not USD).
 
 ## Developing here (never against production state)
 
@@ -28,8 +36,9 @@ the distinction is the whole safety model:
   local SQLite catalog: create `.env` here (gitignored) with at least
   `HL_OUT_DIR=/home/hatsadin/hc-dev`, `HL_TRACKED_SOURCE=` (empty, or a small wallets
   file via `--wallets-file`), and **no** `HL_CATALOG_URI` / `WAREHOUSE` / `HL_WAREHOUSE_MOUNT`.
-  Never run `daily` or `extract --iceberg` with `HL_ENV_FILE=/etc/hypercore/hypercore.env`
-  from here: it would write into the production state dir and catalog.
+  Never run `daily`, `extract --iceberg`, `iceberg_load` or `maintenance` with
+  `HL_ENV_FILE=/etc/hypercore/hypercore.env` from here: they would write into the production
+  state dir and catalog. `query` is the read-only exception (see above).
 - Tests: `.venv/bin/python -m unittest discover -s tests -t .` (must pass; no network,
   no systemd). Offline health check: `.venv/bin/python -m blueblocx_hyperliquid.preflight --offline`.
 - `blueblocx_hyperliquid/config.py::ENV_VARS` is the authoritative env list; preflight

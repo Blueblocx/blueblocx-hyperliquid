@@ -20,7 +20,8 @@
 #   7. NAS warehouse directory, written as the service user (catches uid squash)
 #   8. systemd units: service + hourly timer + nightly maintenance, with a drop-in
 #      that removes the S3 flags (no AWS key in this layout) and caps a run at 50 min;
-#      the web monitor (hypercore-web.service, port 8787) is enabled and started
+#      the web monitor (hypercore-web.service, port 8787) is enabled and started;
+#      /usr/local/bin/hypercore-status and hypercore-sql (read-only SQL over the lake)
 #   8b. lake schema migrations as the service user (python -m blueblocx_hyperliquid.migrate --apply:
 #      idempotent; the only way a production table's schema changes; fatal when it fails)
 #   9. preflight as the service user
@@ -323,8 +324,10 @@ for unit in hypercore-daily.service hypercore-hourly.timer hypercore-maintenance
 done
 # removed in v1.3 (the OnFailure notifier): make sure no stale copy is left behind
 sudo rm -f /etc/systemd/system/hypercore-failure@.service
-# `hypercore-status` for everyone in the hypercore group: running / stuck / last verdict
+# `hypercore-status` for everyone in the hypercore group: running / stuck / last verdict;
+# `hypercore-sql`: read-only SQL over the lake (pyiceberg -> DuckDB, writes nothing)
 sudo install -m 0755 "$PROD_DIR/deploy/hypercore-status" /usr/local/bin/hypercore-status
+sudo install -m 0755 "$PROD_DIR/deploy/hypercore-sql" /usr/local/bin/hypercore-sql
 sudo mkdir -p /etc/systemd/system/hypercore-daily.service.d
 sudo tee /etc/systemd/system/hypercore-daily.service.d/local.conf >/dev/null <<EOF
 # written by deploy/bootstrap.sh - standalone layout: no S3 backfill (no AWS key),
@@ -387,7 +390,8 @@ Web monitor:               http://${HOST_IP:-<this-host>}:${WEB_PORT:-8787}/    
    then:                   sudo jq '{ok,wallets_ok,wallets_deferred,tracked,problems,warnings}' ${STATE_DIR}/hypercore/_run_summary.json
 3. Enable the schedule:    sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
 4. Any time:               the web monitor, or hypercore-status (exit 0 = healthy; --json for scripts)
-5. ETL / DuckDB readers:   READER_CIDR=<etl host ip>/32 bash deploy/bootstrap.sh creates the read-only role and
+5. Query the lake (SQL):   hypercore-sql --list;  hypercore-sql "select event_type, count(*) from l1_wallet_ledger group by 1"
+6. ETL / DuckDB readers:   READER_CIDR=<etl host ip>/32 bash deploy/bootstrap.sh creates the read-only role and
                            ${READER_ENV}; smoke test: HL_ENV_FILE=${READER_ENV} <venv with duckdb>/bin/python -m blueblocx_hyperliquid.duckdb_smoke
-Note: your group membership (${SERVICE_USER}) applies after you log in again (hypercore-status needs it).
+Note: your group membership (${SERVICE_USER}) applies after you log in again (hypercore-status and hypercore-sql need it).
 EOF

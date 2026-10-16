@@ -261,7 +261,9 @@ Verified against pyiceberg 0.12 source and the Linux NFS client (2026-10-12):
   warehouse directory as a separate nfs4 mount below `/mnt/blueblocx`; the guard
   accepts a nested mount of the same filesystem type and rejects a bind mount of
   the root disk (what you get when the NAS is not mounted).
-- **Readers.** pyiceberg or DuckDB on this host, and the ETL's DuckDB from the
+- **Readers.** `hypercore-sql` on this host (§7: pyiceberg resolves the committed
+  snapshot through this catalog, DuckDB runs the SQL; ships with the pipeline, writes
+  nothing), any pyiceberg or DuckDB on this host, and the ETL's DuckDB from the
   ETL host — see "Serving the lake to DuckDB readers" below. Alternatives that
   were considered and not chosen: iceberg-rust `iceberg-catalog-sql` + an fs
   storage factory (the atlas crates hard-code REST + S3), Trino ≥ 471 with
@@ -506,7 +508,7 @@ python-ingestion's exact schema, so the atlas watermark readers see them.
 `hypercore-daily.service` with a drop-in (no S3 flags, 50-minute cap),
 `hypercore-hourly.timer`, `hypercore-maintenance.timer` (00:05 UTC, before the
 00:10 tick), the web monitor `hypercore-web.service` (already running on port 8787)
-and `/usr/local/bin/hypercore-status`; after the first run by hand (§5) enable the timers:
+and `/usr/local/bin/hypercore-status` + `hypercore-sql`; after the first run by hand (§5) enable the timers:
 
 ```bash
 sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
@@ -518,7 +520,7 @@ then the daily run; timers never overlap a running service:
 
 ```bash
 sudo cp deploy/hypercore-daily.service deploy/hypercore-daily.timer deploy/hypercore-web.service /etc/systemd/system/
-sudo install -m 0755 deploy/hypercore-status /usr/local/bin/   # §7's status command
+sudo install -m 0755 deploy/hypercore-status deploy/hypercore-sql /usr/local/bin/   # §7's status + SQL commands
 sudo systemctl daemon-reload
 sudo systemctl enable --now hypercore-web.service hypercore-daily.timer
 sudo systemctl start --no-block hypercore-daily.service   # run once now (without --no-block, start waits for the whole run)
@@ -554,7 +556,62 @@ you look at the page, or point any uptime checker you already have at `/healthz`
 |---|---|---|
 | **web monitor** `hypercore-web.service` → `http://<host>:8787/` | the whole picture, refreshed every 30 s: **running?** phase, wallet i/N, progress bar, the wallet in flight, minutes since the last progress — `STUCK?` after `HL_STUCK_MINUTES` quiet minutes while the process is alive, "died without a summary" when the pid is gone; **last run** verdict, problems, warnings; **recent runs** table; **per-wallet** table (problems first); **timers**. `/api/status` (JSON verdict), `/api/summary`, `/api/progress`, `/api/history`, `/healthz` (200 / 503) | `python -m blueblocx_hyperliquid.web`, bound to `HL_WEB_BIND:HL_WEB_PORT`; read-only, no authentication — LAN/VPN only |
 | `hypercore-status` (`python -m blueblocx_hyperliquid.status`, `--json` for scripts) | **running?** phase, wallet i/N, minutes since the last progress — `STUCK?` after `HL_STUCK_MINUTES` (15) quiet minutes while the process is alive (the clock also spans one first-time full-ledger lookup, ~9 min on an old whale); a progress file whose pid is gone = "died without a summary"; **last run** ok? how long ago — `STALE` after 2 h on the hourly timer, 26 h when only `hypercore-daily.timer` is active, or `HL_STATUS_MAX_AGE_HOURS` (set it for cron/Docker schedules); **timers** active? exit 0 healthy / 1 attention | reads `_run_progress.json`, `_run_summary.json`, `_run_history.jsonl` + `systemctl show` |
+| `hypercore-sql` (`python -m blueblocx_hyperliquid.query`) | **what is in the lake**: `--list` (rows, partitioning, last commit per table), then any SQL over `l1_wallet_ledger`, `l4x_perp_position_snapshot`, `l1_token_metadata`, `l4_wallet_metadata`, `wallet_watchlist`, `token_whitelist`, `table_watermarks` — see "Query the lake" below | pyiceberg → DuckDB in memory; read-only; any user in the `hypercore` group |
 | journald | the detail: one line per wallet while pulling (`[12/149] 0xeadc152a pulled in 61.3s: 6159 fills …`), per-table lift lines, tracebacks | `journalctl -u hypercore-daily -f` |
+
+### Query the lake (SQL)
+
+```bash
+hypercore-sql --list                                   # tables, rows, partitioning, last commit, this session's bound
+hypercore-sql "select block_date, event_type, count(*) n, sum(amount_signed) usdc
+               from l1_wallet_ledger where token_address = 'hlcore:usdc' group by 1, 2 order by 1, 2"
+hypercore-sql --days 90 --format csv -f report.sql > report.csv
+hypercore-sql                                          # interactive: end statements with ';', .tables / .schema NAME / .load NAME / .rows N / .quit
+```
+
+`hypercore-sql` is `deploy/hypercore-sql`: the production checkout's venv with the
+production env file, running `blueblocx_hyperliquid.query`. pyiceberg opens the
+catalog **read-only** (`init_catalog_tables=false`, no directory created) and
+resolves the committed snapshot of each table a statement names; the rows are
+scanned once and registered in an in-memory DuckDB, which runs the SQL. Reading
+never blocks or breaks the hourly lift (no reader locks; the lift commits with one
+optimistic pointer `UPDATE`), and nothing is written anywhere: DuckDB runs with
+file access disabled (no `COPY … TO` a file, `read_csv`, `ATTACH`, `INSTALL` — export
+with `--format csv > file`), and an oversized query spills under the system temp dir,
+never into the checkout. Error messages are scrubbed of secret values; never `echo`
+the env file yourself. A relative `-f FILE` is resolved from where you run the command.
+
+- **Bounded by default.** The fact / snapshot tables are read for the last 30 days
+  (`block_date`, `as_of_date`, `bucket_date` — identity partitions, so the scan reads
+  only those files); `--days N`, `--since` / `--until` (`--until` alone ends the N-day
+  window there), or `--days 0` for everything.
+  The whole filtered table sits in memory (~250 bytes per ledger row), so bound a
+  year of market-maker rows before you `select *` it. Dimension tables and
+  `control.table_watermarks` are read whole.
+- **Names.** Bare (`l1_wallet_ledger`) or qualified (`hypercore.l1_wallet_ledger`,
+  `control.table_watermarks`). `l3_token_price_usd_1m` appears only once the price
+  job has run. `--namespace hyperevm` for the EVM namespace.
+- **Semantics** (`docs/HYPERCORE_LEDGER_SPEC.md` §3, `docs/PROPOSED_SCHEMA.sql` rollup
+  note): `amount_signed` is in the row's token, not USD — sum stablecoin rows (`join
+  l1_token_metadata … where is_stablecoin`) directly and price the rest (spot-buy fee
+  legs are in the base token; HIP-3 PnL/funding/fee rows are in that dex's collateral
+  token). Realized PnL, lake part = Σ usd over `event_type in ('perp_realized_pnl',
+  'funding','fee','interest','staking_reward')` (the last is reserved, not emitted yet;
+  spot FIFO realized PnL is not in the lake); `net_flow` = Σ usd over
+  `('deposit','withdraw','transfer')` only, and `transfer` includes net-zero internal
+  legs. One spot fill is several rows sharing `tx_hash` (`count(distinct tx_hash)`).
+  `l4x_perp_position_snapshot` holds the last snapshot per UTC day per wallet;
+  `account_value_usd` is the margin account of one `(wallet, dex)` repeated on each of
+  its position rows: `max()` per `(as_of_date, wallet_address, dex)`, then `sum()` across
+  dexes for the wallet's perp equity (spec §3: main + Σ dex). Timestamps are UTC
+  (`timestamptz`; `table_watermarks` naive UTC).
+- **From the working copy** (development): `.venv/bin/python -m blueblocx_hyperliquid.query`
+  reads whatever catalog the env selects — the local SQLite catalog under `HL_OUT_DIR`
+  by default, or production with `HL_ENV_FILE=/etc/hypercore/hypercore.env` (read-only,
+  the one module that may be pointed at the production env from there).
+- **Heavier engines** (Spark SQL, Trino ≥ 471 with `iceberg.catalog.type=jdbc` on the
+  same PostgreSQL, catalog name `hl`) are possible but are new JVM daemons on this
+  host: an owner decision, not part of this repo.
 
 Every run writes `$HL_OUT_DIR/hypercore/_run_summary.json` (full detail) and
 appends one line to `_run_history.jsonl`. Exit code and summary agree:
@@ -613,10 +670,10 @@ cd /opt/blueblocx-hyperliquid && git fetch --tags && git checkout --detach v1.0.
 # lake schema migrations shipped by the release (idempotent; the lift refuses a drifted table)
 sudo -u hypercore env HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.migrate --apply
 HL_ENV_FILE=/etc/hypercore/hypercore.env .venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg
-# only when the release changed deploy/ (units, the web monitor, hypercore-status): refresh the
+# only when the release changed deploy/ (units, the web monitor, hypercore-status, hypercore-sql): refresh the
 # installed copies; the drop-in hypercore-daily.service.d/local.conf is kept
 sudo cp deploy/hypercore-daily.service deploy/hypercore-maintenance.service deploy/hypercore-web.service /etc/systemd/system/ \
-  && sudo install -m 0755 deploy/hypercore-status /usr/local/bin/ && sudo systemctl daemon-reload \
+  && sudo install -m 0755 deploy/hypercore-status deploy/hypercore-sql /usr/local/bin/ && sudo systemctl daemon-reload \
   && sudo systemctl restart hypercore-web.service
 sudo systemctl start hypercore-daily.service && sudo journalctl -u hypercore-daily -n 50   # one real run (start waits for it)
 sudo systemctl start hypercore-hourly.timer

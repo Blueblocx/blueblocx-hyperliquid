@@ -66,15 +66,19 @@ def check_python() -> Check:
 
 def check_imports() -> Check:
     want = ["requests", "xxhash", "pyarrow", "pyiceberg", "boto3", "lz4"]
-    have, missing = [], []
-    for mod in want:
+    optional = ["duckdb"]            # blueblocx_hyperliquid.query / hypercore-sql only; the runs never import it
+    have, missing, notes = [], [], []
+    for mod in want + optional:
         try:
             m = __import__(mod)
             have.append(f"{mod} {getattr(m, '__version__', getattr(m, 'VERSION', '?'))}")
         except Exception as e:  # noqa: BLE001
-            missing.append(f"{mod} ({type(e).__name__})")
+            (notes if mod in optional else missing).append(f"{mod} ({type(e).__name__})")
     if missing:
         return _fail("deps", "missing: " + ", ".join(missing) + " - pip install -r requirements.txt -c constraints.txt")
+    if notes:
+        return _warn("deps", ", ".join(have) + "; optional missing: " + ", ".join(notes)
+                     + " (hypercore-sql unavailable until pip install -r requirements.txt -c constraints.txt)")
     return _ok("deps", ", ".join(have))
 
 

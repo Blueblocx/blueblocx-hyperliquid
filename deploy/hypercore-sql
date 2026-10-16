@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# `hypercore-sql [SQL | -f FILE | --list]` - read-only SQL over the lake: pyiceberg resolves
+# each table's committed snapshot through the catalog, DuckDB runs the SQL in memory.
+# Installed to /usr/local/bin by deploy/bootstrap.sh; works for any user in the hypercore
+# group (the env file is group-readable, the NAS warehouse is readable). Writes nothing.
+# No argument on a terminal = interactive prompt. `--days N` bounds the fact tables (30).
+# Deliberately no `cd`: a relative `-f FILE` is resolved from where you run it; the package
+# is imported from the production checkout via PYTHONPATH (it is not installed into the venv).
+PROD=/opt/blueblocx-hyperliquid
+[ -x "$PROD/.venv/bin/python" ] || { echo "hypercore-sql: $PROD/.venv is missing (deploy/bootstrap.sh)" >&2; exit 2; }
+exec env HL_ENV_FILE=/etc/hypercore/hypercore.env PYTHONPATH="$PROD" "$PROD/.venv/bin/python" -m blueblocx_hyperliquid.query "$@"

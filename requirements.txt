@@ -8,4 +8,6 @@ boto3==1.43.108
 lz4==4.4.5
 pyarrow==25.0.1
 pyiceberg[sql-sqlite,sql-postgres]==0.12.0
+# read-only SQL over the lake (blueblocx_hyperliquid.query / hypercore-sql); not used by the runs
+duckdb==1.5.6
 tzdata==2026.5
