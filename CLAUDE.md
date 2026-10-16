@@ -60,6 +60,10 @@ RELEASE_TAG=vX.Y.Z bash deploy/bootstrap.sh        # checkout, pip, tests, units
 sudo systemctl enable --now hypercore-hourly.timer hypercore-maintenance.timer
 ```
 
+Step-by-step runbooks for specific upgrades, written for an operator (human or AI)
+on the host, live in `docs/runbooks/` (currently: the move to v1.8.0). Follow the one
+the owner names; its STOP lines mean report and wait.
+
 Rollback is the same with the previous tag (always via bootstrap when the release
 changed `deploy/`). A release that changed the lake schema ships a migration in
 `blueblocx_hyperliquid/migrate.py` (the only way a production table's schema changes;
