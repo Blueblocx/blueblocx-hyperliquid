@@ -36,7 +36,10 @@ TimeoutStopSec=3min
 # S3 hour files are parsed one at a time (<= ~330 MB decompressed, ~1.5 GB RSS); the
 # staged l1 CSV is merged in memory on every upsert (~1 KB per row: 45 days of a
 # market-maker wallet is several GB) and the lift keeps the touched partitions' keys.
-MemoryMax=8G
+# v1.9.1: the hourly lift of the multi-million-row ledger under Python 3.14 / pyiceberg 0.12
+# peaks at 14-18 GB (it was OOM-killed every hour at 8G on 2026-10-20); 32G leaves
+# headroom for the rollup step that follows the lift.
+MemoryMax=32G
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
