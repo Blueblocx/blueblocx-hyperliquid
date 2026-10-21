@@ -45,15 +45,22 @@ def running_balances(rows: list[dict], anchor: tuple[dt.datetime, float] | None 
         cum_at_anchor = sum(signed for r, signed in ordered if utc(r["block_timestamp"]) <= as_of_ts)
         offset = float(total) - cum_at_anchor
     out: list[dict] = []
+    # Without an anchor the ledger is taken as complete and the STATE is clamped at
+    # zero like the atlas (a debt the ledger cannot explain is discarded). With an
+    # anchor the pinned series is authoritative and only the shown value is clamped:
+    # a negative offset (pre-history the ledger never saw - sells before go-live, perp
+    # legs booked as USDC) would otherwise reset the state to zero on the first row
+    # and every later inflow would stack on top of it, ending far above the exchange
+    # balance the anchor was meant to pin (v1.9.3: 21 of 126 pairs on 2026-10-21).
     running = offset
     for r, signed in ordered:
-        running = max(0.0, running + signed)
+        running = running + signed if anchor is not None else max(0.0, running + signed)
         out.append({
             "wallet_address": r["wallet_address"], "token_address": r["token_address"],
             "block_timestamp": utc(r["block_timestamp"]), "block_date": as_date(r["block_date"]) or utc(r["block_timestamp"]).date(),
             "tx_hash": r["tx_hash"], "event_index": int(r["event_index"] or 0), "direction": r["direction"],
             "amount_raw": float(r["amount_raw"] or 0.0), "amount": float(r["amount"] or 0.0),
-            "amount_signed": signed, "balance_amount": running,
+            "amount_signed": signed, "balance_amount": max(0.0, running),
         })
     return out, offset
 

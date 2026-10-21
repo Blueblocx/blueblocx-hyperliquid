@@ -54,6 +54,24 @@ class BalanceTests(unittest.TestCase):
         self.assertAlmostEqual(offset, -5.0)
         self.assertEqual([r["balance_amount"] for r in out], [5.0, 1.0, 3.0])
 
+    def test_anchor_survives_a_dip_below_zero(self):
+        # pre-history the lake never saw (a negative offset): +100 and -100 before the
+        # snapshot, the exchange says 10 at the snapshot, +100 after it. The series must
+        # end at 110 = exchange balance + later movements; clamping the STATE at the dip
+        # (v1.9.2 and before) ended at 200, the symptom of 2026-10-21 (21 of 126 pairs
+        # above the exchange balance)
+        rows = [row(1, 1, 100.0), row(1, 1, -100.0, idx=1), row(3, 0, 100.0)]
+        out, offset = balances.running_balances(rows, anchor=(ts(2), 10.0))
+        self.assertAlmostEqual(offset, 10.0)
+        self.assertEqual([r["balance_amount"] for r in out], [110.0, 10.0, 110.0])
+        rows = [row(1, 1, 100.0), row(1, 2, -150.0), row(3, 0, 100.0)]
+        out, offset = balances.running_balances(rows, anchor=(ts(2), 10.0))
+        self.assertAlmostEqual(offset, 60.0)
+        self.assertEqual([r["balance_amount"] for r in out], [160.0, 10.0, 110.0])
+        # the shown value is still never negative (a borrowed USDC balance pins below zero)
+        out, offset = balances.running_balances(rows, anchor=(ts(2), -40.0))
+        self.assertEqual([r["balance_amount"] for r in out], [110.0, 0.0, 60.0])
+
     def test_dense_quiet_holding_from_snapshot(self):
         dense = balances.dense_days([], dt.date(2026, 10, 4), quiet_pair=(W, T, dt.date(2026, 10, 2), 7.0))
         self.assertEqual([r["snapshot_date"] for r in dense], [dt.date(2026, 10, d) for d in (2, 3, 4)])
