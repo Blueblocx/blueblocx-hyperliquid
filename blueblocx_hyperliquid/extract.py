@@ -63,6 +63,12 @@ _STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD"}
 # ETL contract 4.4(c): a row must be readable within 2 h of its updated_at. Rows are
 # stamped at run START and committed at the end; warn when the gap grows past this.
 _STAMP_AGE_WARN_MIN = 60.0
+# The lazy full-history ledger pull (lending resolution, phase 2) is the one unbounded
+# call of a run: 541 s on an old whale when it was written, 17 min on 2026-10-21, which
+# carried the run past the 50-min unit timeout and lost the hour. It is started only
+# while at least this many seconds remain before the soft deadline; otherwise it is
+# deferred (lending_deferred, retried next run) exactly as if the deadline had passed.
+_LAZY_PULL_RESERVE_S = 12 * 60.0
 
 
 def _now_iso() -> str:
@@ -840,7 +846,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         lending_lazy_pull = lending_deferred = lending_pulled_ok = False
         lending_mismatch = ((not lending_resolved) and bool(oracle.get("checked"))
                             and oracle.get("networth_matches") is False)
-        if lending_mismatch and deadline_ts is not None and time.time() >= deadline_ts:
+        if lending_mismatch and deadline_ts is not None and time.time() >= deadline_ts - _LAZY_PULL_RESERVE_S:
             # the full-history pull is the one unbounded call of phase 2 (541 s on an
             # old whale): past the deadline it waits for the next run, uncached
             lending_deferred = True
