@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.8.1}"
+RELEASE_TAG="${RELEASE_TAG:-v1.9.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -57,12 +57,30 @@ WORKDIR="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_LOG="/tmp/hypercore-bootstrap-tests.log"
 
 say()  { printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
+# A venv is bound to the interpreter it was created with (bin/python -> /usr/bin/python3,
+# site-packages under lib/python3.X). When the OS replaces python3 (release upgrade:
+# 3.12 -> 3.14 on 2026-10-20 took the hourly run down at preflight with
+# "No module named xxhash"), the venv silently loses every package. Recreate it then.
+ensure_venv() {
+  local dir="$1" sys_ver venv_ver
+  sys_ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  if [ -x "$dir/bin/python" ]; then
+    venv_ver="$(sed -n 's/^version = \([0-9]*\.[0-9]*\).*/\1/p' "$dir/pyvenv.cfg" 2>/dev/null)"
+    if [ "$venv_ver" = "$sys_ver" ] && "$dir/bin/python" -c 'import pip' >/dev/null 2>&1; then
+      return 0
+    fi
+    warn "venv ${dir} was built for python ${venv_ver:-?} but python3 is ${sys_ver} (or pip is missing) - recreating it"
+    rm -rf "$dir"
+  fi
+  python3 -m venv "$dir"
+}
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mxx %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ----------------------------------------------------------------------------- preconditions
 [ "$ME" != "root" ] || die "run as your login user (with sudo), not as root"
-sudo -v
+# sudo-rs (Ubuntu 26.04) refuses `sudo -v` without a terminal even when no password is needed: only prompt when needed
+sudo -n true 2>/dev/null || sudo -v
 mountpoint -q "$NAS_MOUNT" || die "$NAS_MOUNT is not a mount point - mount the NAS first (fstab: vers=4.1,hard,rsize=1048576,wsize=1048576,noatime,_netdev)"
 # this script rewrites $PROD_DIR: refuse while anything could execute it
 for unit in hypercore-daily.service hypercore-maintenance.service hypercore-hourly.timer hypercore-daily.timer hypercore-maintenance.timer; do
@@ -116,7 +134,7 @@ else
   git -C "$PROD_DIR" fetch --tags --quiet
   git -C "$PROD_DIR" checkout --detach --quiet "$RELEASE_TAG"
 fi
-[ -x "$PROD_DIR/.venv/bin/python" ] || python3 -m venv "$PROD_DIR/.venv"
+ensure_venv "$PROD_DIR/.venv"
 echo "installing pinned dependencies (a few minutes the first time)"
 "$PROD_DIR/.venv/bin/pip" install -q --disable-pip-version-check -r "$PROD_DIR/requirements.txt" -c "$PROD_DIR/constraints.txt"
 ( cd "$PROD_DIR" && .venv/bin/python -m unittest discover -s tests -t . >"$TEST_LOG" 2>&1 ) \
@@ -129,7 +147,7 @@ chmod -R g+rX,o-rwx "$PROD_DIR"
 
 # ----------------------------------------------------------------------------- 4. working copy venv
 say "working copy ${WORKDIR}"
-[ -x "$WORKDIR/.venv/bin/python" ] || python3 -m venv "$WORKDIR/.venv"
+ensure_venv "$WORKDIR/.venv"
 "$WORKDIR/.venv/bin/pip" install -q --disable-pip-version-check -r "$WORKDIR/requirements.txt" -c "$WORKDIR/constraints.txt"
 
 # ----------------------------------------------------------------------------- 5. PostgreSQL catalog
@@ -203,8 +221,10 @@ HL_CATALOG_URI=postgresql+psycopg2://${PG_RO_ROLE}:${RO_PASS}@${HOST_LAN_IP}:543
 WAREHOUSE=file://${WAREHOUSE_DIR}
 EOF
   # PostgreSQL: listen on the LAN address too, accept ONLY the reader role from the ETL CIDR
-  PG_MAIN="$(ls -d /etc/postgresql/*/main 2>/dev/null | head -1)"
-  [ -n "$PG_MAIN" ] || die "no /etc/postgresql/<version>/main found"
+  # the cluster that actually serves the catalog (a host may carry an older, stopped
+  # cluster too: /etc/postgresql/16 next to the live 18 - the first directory is not it)
+  PG_MAIN="$(dirname "$(cd / && sudo -u postgres psql -Atc 'SHOW config_file')")"
+  [ -n "$PG_MAIN" ] && [ -d "$PG_MAIN" ] || die "could not locate the running PostgreSQL cluster's config directory"
   sudo mkdir -p "$PG_MAIN/conf.d"
   printf "# written by deploy/bootstrap.sh (READER_CIDR): the ETL's DuckDB reader connects from the LAN\nlisten_addresses = 'localhost,%s'\n" "$HOST_LAN_IP" \
     | sudo tee "$PG_MAIN/conf.d/hypercore-reader.conf" >/dev/null
@@ -286,6 +306,8 @@ ensure_env HL_WEB_BIND 0.0.0.0 "v1.3: web monitor address (no authentication: LA
 ensure_env HL_WEB_PORT 8787 "v1.3: web monitor port"
 ensure_env HL_PRICE_TIME_BUDGET_MIN 3 "v1.7: minutes per run (first) for native 1h/1d candles -> l3_token_price_usd_1h/_1d (ETL token_price_usd_1h/1d); 0 = off"
 ensure_env HL_PRICE_HISTORY_DAYS 32 "v1.7: candle history fetched on a token's first visit (the ETL loads 32 days)"
+ensure_env HL_ROLLUPS 1 "v1.9: after every lift, recompute the wallet-level L4 rollup tables of the ETL contract (0 = off)"
+ensure_env HL_ROLLUP_TIME_BUDGET_MIN 8 "v1.9: minutes per run for the rollup step; later tables are skipped + reported and caught up next run"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then

@@ -52,7 +52,7 @@ log = logging.getLogger("blueblocx_hyperliquid.maintenance")
 
 COMPACT_MIN_FILES = 8            # fewer data files in a partition: left alone
 COMPACT_MAX_ROWS = 3_000_000     # a partition this large is skipped (memory, time) and reported
-COMPACT_CLOSED_DAYS = {"l4x_perp_position_snapshot": 1}   # default 2: UTC days before a partition is closed
+COMPACT_CLOSED_DAYS = {"l4x_perp_position_snapshot": 1, "l4x_spot_balance_snapshot": 1}   # default 2: UTC days before a partition is closed
 _DEFAULT_CLOSED_DAYS = 2
 TICK_MINUTE = 10                 # the hourly data timer fires at HH:10 UTC
 

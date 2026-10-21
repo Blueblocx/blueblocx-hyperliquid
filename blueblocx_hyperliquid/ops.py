@@ -370,6 +370,16 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
             warnings.append(f"prices_errors={len(prices['errors'])}")
         if (prices.get("early_lift") or {}).get("error"):
             warnings.append("prices:early_lift_failed")
+    # the rollup step (v1.9.0) never fails a run either: errors and skipped tables are
+    # warnings the web monitor shows (and the ETL sees as 'failed' watermark rows)
+    rollups = (recon or {}).get("rollups")
+    if rollups:
+        if rollups.get("error"):
+            warnings.append("rollups:failed")
+        for group, _err in sorted((rollups.get("errors") or {}).items()):
+            warnings.append(f"rollups_error={group}")
+        if rollups.get("skipped"):
+            warnings.append(f"rollups_skipped={len(rollups['skipped'])}")
     statuses = [e["status"] for e in per_wallet.values()]
     ok = recon is not None and not problems
     return {
@@ -391,6 +401,7 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         "iceberg": (recon or {}).get("iceberg"),
         "retention": (recon or {}).get("retention"),
         "prices": prices or None,
+        "rollups": ({k: v for k, v in rollups.items() if k != "watermarks"} if rollups else None),
         "hip3_dexes": (recon or {}).get("hip3_dexes_checked"),
         "unmapped_ledger_types": (recon or {}).get("unmapped_ledger_types") or {},
         "options": options or {},

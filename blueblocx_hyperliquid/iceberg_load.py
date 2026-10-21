@@ -96,7 +96,29 @@ TABLE_PLAN = {
     "l3_token_price_usd_1d": (["token_address", "bucket_date"], "insert_if_absent", ["bucket_date"]),
     "l4_wallet_metadata": (["wallet_address"], "replace_keys", []),
     "l4x_perp_position_snapshot": (["as_of_date", "wallet_address", "coin"], "replace_scope", ["as_of_date", "wallet_address"]),
+    # v1.9.0: the exchange's spot balances (the anchor of the balance rollups)
+    "l4x_spot_balance_snapshot": (["as_of_date", "wallet_address", "token_address"], "replace_scope", ["as_of_date", "wallet_address"]),
+    # v1.9.0 rollups (blueblocx_hyperliquid.rollups writes these directly from the lake,
+    # not from staged CSVs; listed so readers / preflight / query know them)
+    "l1_token_categories": (["token_address", "token_group", "category"], "replace_keys", []),
+    "l4_wallet_balance_per_tx": (["wallet_address", "token_address", "tx_hash", "event_index", "direction"], "replace_scope", ["wallet_address"]),
+    "l4_wallet_balance_1d_dense": (["wallet_address", "token_address", "snapshot_date"], "replace_scope", ["wallet_address"]),
+    "l4_wallet_networth_1d_dense": (["wallet_address", "snapshot_date"], "replace_scope", ["wallet_address"]),
+    "l4_wallet_pnl_state_fifo": (["wallet_address", "token_address"], "replace_scope", ["wallet_address"]),
+    "l4_wallet_pnl_realized_1d": (["wallet_address", "snapshot_date"], "replace_scope", ["wallet_address"]),
+    "wallet_token_stats": (["wallet_address", "token_address"], "replace_scope", ["wallet_address"]),
+    "wallet_trade_summary": (["wallet_address", "token_address"], "replace_scope", ["wallet_address"]),
+    "wallet_whale_moves_24h": (["wallet_address", "token_address", "direction"], "replace_scope", ["wallet_address"]),
+    "token_netflow_24h": (["token_address"], "replace_keys", []),
+    "wallet_overview_pnl_percentile_1d": (["wallet_address", "computed_date"], "replace_scope", ["computed_date"]),
+    "l4_token_wallet_sharpe_1d": (["token_address", "wallet_address", "snapshot_date"], "replace_scope", ["snapshot_date"]),
+    "wallet_performance_30d": (["wallet_address", "as_of_date"], "replace_scope", ["as_of_date"]),
 }
+ROLLUP_TABLES = frozenset({   # written by blueblocx_hyperliquid.rollups, never staged as CSV
+    "l1_token_categories", "l4_wallet_balance_per_tx", "l4_wallet_balance_1d_dense", "l4_wallet_networth_1d_dense",
+    "l4_wallet_pnl_state_fifo", "l4_wallet_pnl_realized_1d", "wallet_token_stats", "wallet_trade_summary",
+    "wallet_whale_moves_24h", "token_netflow_24h", "wallet_overview_pnl_percentile_1d", "l4_token_wallet_sharpe_1d",
+    "wallet_performance_30d"})
 
 # Tables that production is not expected to populate: l3_token_price_usd_1m is the
 # development-only output of `--with-prices` (the production unit never passes it),
@@ -108,10 +130,16 @@ OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"})
 # column the bounded lift falls back to when a CSV has no updated_at.
 _STAMP_COL = {name: "updated_at" for name in TABLE_PLAN}
 _STAMP_COL["l4x_perp_position_snapshot"] = "created_at"
+_STAMP_COL["l4x_spot_balance_snapshot"] = "created_at"
 _BUSINESS_DATE_COL = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m": "bucket_date",
                       "l3_token_price_usd_1h": "bucket_date", "l3_token_price_usd_1d": "bucket_date",
-                      "l4x_perp_position_snapshot": "as_of_date"}
-_SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts"}
+                      "l4x_perp_position_snapshot": "as_of_date", "l4x_spot_balance_snapshot": "as_of_date",
+                      "l4_wallet_balance_per_tx": "block_date", "l4_wallet_balance_1d_dense": "snapshot_date",
+                      "l4_wallet_networth_1d_dense": "snapshot_date", "l4_wallet_pnl_realized_1d": "snapshot_date",
+                      "wallet_trade_summary": "last_activity_date",
+                      "wallet_overview_pnl_percentile_1d": "computed_date",
+                      "l4_token_wallet_sharpe_1d": "snapshot_date", "wallet_performance_30d": "as_of_date"}
+_SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts", "l4x_spot_balance_snapshot": "as_of_ts"}
 
 # Columns that are NOT NULL by construction (natural keys, business dates, stamps,
 # the gates' is_active). The Iceberg schema of the tables created before v1.4.0
@@ -125,6 +153,7 @@ REQUIRED_COLS = {
     "l3_token_price_usd_1h": ["token_address", "bucket_minute", "bucket_date", "created_at", "updated_at"],
     "l3_token_price_usd_1d": ["token_address", "bucket_minute", "bucket_date", "created_at", "updated_at"],
     "l4x_perp_position_snapshot": ["as_of_ts", "as_of_date", "wallet_address", "coin"],
+    "l4x_spot_balance_snapshot": ["as_of_ts", "as_of_date", "wallet_address", "token_address", "created_at"],
     "l1_token_metadata": ["token_address", "standard", "is_stablecoin", "created_at", "updated_at"],
     "l4_wallet_metadata": ["wallet_address", "updated_at"],
     "wallet_watchlist": ["wallet_address", "is_active", "created_at", "updated_at"],
@@ -826,6 +855,8 @@ def _lift_directory(src_dir: Path, catalog, tables, namespace: str, since_iso: s
     pending_wm: list[tuple] = []
     for name, (key_cols, mode, scope_cols) in TABLE_PLAN.items():
         if tables and name not in tables:
+            continue
+        if name in ROLLUP_TABLES:                 # written by blueblocx_hyperliquid.rollups, never staged
             continue
         csv_path = src_dir / f"{name}.csv"
         if not csv_path.exists():

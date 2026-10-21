@@ -287,3 +287,282 @@ ALTER TABLE nessie.hypercore.wallet_watchlist WRITE ORDERED BY wallet_group ASC 
 -- flow). Internal perp<->spot moves (accountClassTransfer) are emitted as two
 -- opposite legs so they net to zero.
 -- ============================================================================
+
+-- ============================================================================
+-- v1.9.0 ROLLUPS (phase A): the wallet-level L4 layer of the ETL contract, built
+-- from l1_wallet_ledger + l3_token_price_usd_1d/_1h + l4x_perp_position_snapshot
+-- by blueblocx_hyperliquid.rollups after every lift (docs/HYPERCORE_FULL_CONTRACT_PLAN.md).
+-- Column names and types follow the atlas definitions the ETL already reads for
+-- ethereum (docs/ATLAS_WALLET_TABLE_FORMULAS.md), so the ETL spec is a pass-through.
+-- Every row carries updated_at = the WRITE stamp of the rollup run that (re)wrote it
+-- (the ETL's Tier-A cursor); tables recomputed per wallet are partitioned by
+-- wallet_address so a wallet's rows are replaced in one partition.
+-- SCOPE: wallet-derived aggregates cover the TRACKED wallet set only (section 2 of
+-- the plan); candle-derived numbers are market-wide.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l1_token_categories (
+    token_address       STRING,
+    token_group         INT,
+    category            STRING,
+    source              STRING,
+    created_at          TIMESTAMP,
+    updated_at          TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_balance_per_tx (
+    wallet_address      STRING,
+    token_address       STRING,
+    block_timestamp     TIMESTAMP,
+    block_date          DATE,
+    tx_hash             STRING,
+    event_index         INT,
+    direction           STRING,
+    amount_raw          DOUBLE,
+    amount              DOUBLE,
+    amount_signed       DOUBLE,
+    balance_amount      DOUBLE,
+    created_at          TIMESTAMP,
+    updated_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (wallet_address)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_balance_1d_dense (
+    wallet_address          STRING,
+    token_address           STRING,
+    snapshot_date           DATE,
+    opening_balance_amount  DOUBLE,
+    closing_balance_amount  DOUBLE,
+    net_flow_amount         DOUBLE,
+    in_amount               DOUBLE,
+    out_amount              DOUBLE,
+    closing_block_timestamp TIMESTAMP,
+    created_at              TIMESTAMP,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (wallet_address)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_networth_1d_dense (
+    wallet_address              STRING,
+    snapshot_date               DATE,
+    opening_networth_usd        DOUBLE,
+    closing_networth_usd        DOUBLE,
+    net_flow_usd                DOUBLE,
+    in_usd                      DOUBLE,
+    out_usd                     DOUBLE,
+    priced_token_count          INT,
+    missing_price_token_count   INT,
+    latest_price_bucket_minute  TIMESTAMP,
+    closing_block_timestamp     TIMESTAMP,
+    created_at                  TIMESTAMP,
+    updated_at                  TIMESTAMP
+) USING iceberg
+PARTITIONED BY (wallet_address)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_pnl_state_fifo (
+    wallet_address          STRING,
+    token_address           STRING,
+    open_qty                DOUBLE,
+    open_cost_usd           DOUBLE,
+    last_block_timestamp    TIMESTAMP,
+    last_tx_hash            STRING,
+    last_event_index        INT,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_wallet_pnl_realized_1d (
+    wallet_address      STRING,
+    snapshot_date       DATE,
+    realized_pnl_usd    DOUBLE,
+    proceeds_usd        DOUBLE,
+    cost_usd            DOUBLE,
+    num_sells           INT,
+    updated_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (wallet_address)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.wallet_token_stats (
+    wallet_address          STRING,
+    token_address           STRING,
+    token_symbol            STRING,
+    token_name              STRING,
+    position_qty            DOUBLE,
+    position_cost_usd       DOUBLE,
+    avg_cost_usd            DOUBLE,
+    price_usd               DOUBLE,
+    position_value_usd      DOUBLE,
+    realized_pnl_usd        DOUBLE,
+    unrealized_pnl_usd      DOUBLE,
+    total_pnl_usd           DOUBLE,
+    total_return_pct        DOUBLE,
+    last_block_timestamp    TIMESTAMP,
+    last_block_date         DATE,
+    last_tx_hash            STRING,
+    last_event_index        INT,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.wallet_trade_summary (
+    wallet_address          STRING,
+    token_address           STRING,
+    token_symbol            STRING,
+    token_buy_qty           DOUBLE,
+    token_buy_value_usd     DOUBLE,
+    avg_buy_price_usd       DOUBLE,
+    token_sell_qty          DOUBLE,
+    token_sell_value_usd    DOUBLE,
+    avg_sell_price_usd      DOUBLE,
+    net_profit_usd          DOUBLE,
+    net_gain_pct            DOUBLE,
+    last_activity_date      DATE,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.wallet_whale_moves_24h (
+    wallet_address              STRING,
+    token_address               STRING,
+    direction                   STRING,
+    vol_24h                     DOUBLE,
+    wallet_volume_usd_24h       DOUBLE,
+    max_block_timestamp         TIMESTAMP,
+    total_supply                DOUBLE,
+    total_market_cap            DOUBLE,
+    total_volume_token          DOUBLE,
+    brenchmark_supply           DOUBLE,
+    brenchmark_volume_token     DOUBLE,
+    create_at                   TIMESTAMP,
+    updated_at                  TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_netflow_24h (
+    token_address           STRING,
+    inflow_usd_24h          DOUBLE,
+    outflow_usd_24h         DOUBLE,
+    netflow_usd_24h         DOUBLE,
+    tx_in_count_24h         BIGINT,
+    tx_out_count_24h        BIGINT,
+    latest_vwap_price_usd   DOUBLE,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.wallet_overview_pnl_percentile_1d (
+    wallet_address      STRING,
+    computed_date       DATE,
+    pnl_1d_usd          DOUBLE,
+    pnl_7d_usd          DOUBLE,
+    pnl_30d_usd         DOUBLE,
+    pnl_percentile_1d   DOUBLE,
+    pnl_percentile_7d   DOUBLE,
+    pnl_percentile_30d  DOUBLE,
+    updated_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (computed_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4_token_wallet_sharpe_1d (
+    token_address           STRING,
+    wallet_address          STRING,
+    snapshot_date           DATE,
+    balance_amount          DOUBLE,
+    ownership_pct           DOUBLE,
+    position_value_usd      DOUBLE,
+    value_change_pct_7d     DOUBLE,
+    value_change_pct_30d    DOUBLE,
+    first_in_timestamp      TIMESTAMP,
+    sharpe_ratio            DOUBLE,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (snapshot_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+CREATE TABLE IF NOT EXISTS nessie.hypercore.wallet_performance_30d (
+    wallet_address                  STRING,
+    as_of_date                      DATE,
+    start_date                      DATE,
+    end_date                        DATE,
+    nw_start                        DOUBLE,
+    nw_end                          DOUBLE,
+    wallet_return_30d               DOUBLE,
+    avg_annualized_return_30d       DOUBLE,
+    volatility_daily_30d            DOUBLE,
+    volatility_annualized_30d       DOUBLE,
+    sharpe_ratio_annualized_30d     DOUBLE,
+    correlation_with_eth_30d        DOUBLE,
+    eth_return_30d                  DOUBLE,
+    outperform_market_30d           BOOLEAN,
+    alpha_vs_eth_30d                DOUBLE,
+    num_return_points_used          INT,
+    updated_at                      TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- v1.9.0: the exchange's own spot balances per wallet (spotClearinghouseState), the
+-- anchor the rollups pin the ledger running balances to (blueblocx_hyperliquid.schema
+-- L4X_SPOT_BALANCE_SNAPSHOT_COLUMNS). Replaced per (as_of_date, wallet) every run.
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4x_spot_balance_snapshot (
+    as_of_ts            TIMESTAMP,
+    as_of_date          DATE,
+    wallet_address      STRING,
+    wallet_group        INT,
+    token_address       STRING,
+    coin                STRING,
+    total               DOUBLE,
+    hold                DOUBLE,
+    entry_ntl           DOUBLE,
+    created_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);

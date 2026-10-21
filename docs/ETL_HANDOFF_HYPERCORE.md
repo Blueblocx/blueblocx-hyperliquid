@@ -7,7 +7,9 @@
 > catalog**, not through Trino (owner decision, 2026-10-14).
 >
 > **Status.** Every producer-side change this document relies on is implemented in
-> `blueblocx-hyperliquid` v1.4.0 … v1.8.0 (section 8 says what each release adds).
+> `blueblocx-hyperliquid` v1.4.0 … v1.9.0 (section 8 says what each release adds;
+> v1.9.0 adds the 13 wallet-level L4 tables, so the hypercore spec grows from 7 to
+> 20 labels).
 > Which release the host actually runs is shown by the web monitor (`/api/status`,
 > field `version`) and by `hypercore-status --json`; sections marked *(vX.Y.Z)*
 > describe behaviour that exists from that release on. Use the onboarding checklist
@@ -80,6 +82,15 @@ pointers in one statement at the start of your run; use `control.table_watermark
 | `l3_token_price_usd_1d` | `(token_address, bucket_date)` | `token_price_usd_1d` | same per closed UTC day (`bucket_minute` = 00:00Z of `bucket_date`) *(v1.7.0)* |
 | `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — | development-only output, **not populated in production** |
 | `l4x_perp_position_snapshot` | `(as_of_date, wallet_address, coin)` | — (extension) | daily perp positions / unrealized PnL; no `updated_at` (use `created_at`); replaced per `(as_of_date, wallet)` every hour |
+| `l4x_spot_balance_snapshot` | `(as_of_date, wallet_address, token_address)` | — (extension) | the exchange's own spot balances per tracked wallet, replaced per `(as_of_date, wallet)` every hour; the anchor the balance rollups are pinned to *(v1.9.0)* |
+| `l1_token_categories` | `(token_address, token_group, category)` | `token_categories` | on-chain rules (`source = 'hypercore_rules'`): `stablecoin`, `native`, `spot`, `hip3-collateral` *(v1.9.0)* |
+| `l4_wallet_balance_per_tx` | `(wallet_address, token_address, tx_hash, event_index)` | `wallet_balance_per_tx` | one row per ledger row, `balance_amount` after it; `event_index AS log_index`, `balance_amount AS balance_qty` on your side; partitioned by wallet, **replaced per wallet** when the wallet's ledger changes (so `updated_at` moves for the whole wallet) *(v1.9.0)* |
+| `l4_wallet_balance_1d_dense` | `(wallet_address, token_address, snapshot_date)` | `wallet_balance_1d_dense` | dense UTC days, carry-forward; same replace-per-wallet rule *(v1.9.0)* |
+| `l4_wallet_networth_1d_dense` | `(wallet_address, snapshot_date)` | `wallet_networth_1d_dense` | Σ spot balance × 1d close + perp account value; `in_usd`/`out_usd`/`net_flow_usd` from deposits, withdrawals and transfers *(v1.9.0)* |
+| `l4_wallet_pnl_state_fifo` / `l4_wallet_pnl_realized_1d` | `(wallet, token)` / `(wallet, snapshot_date)` | `wallet_pnl_state_fifo` / `wallet_pnl_realized_1d` | FIFO over spot fills and transfers (atlas `fifo-pnl` port), perp realized PnL, funding, fees and interest as USDC legs; opening lots from the spot-balance anchor priced at the first observed instant; `last_event_index AS last_log_index` *(v1.9.0)* |
+| `wallet_token_stats` / `wallet_trade_summary` | `(wallet, token)` | same labels | from the FIFO state + latest price / buy-sell aggregates (`vw_wallet_token_stats`, `wallet-trades-usd` ports) *(v1.9.0)* |
+| `wallet_whale_moves_24h` / `token_netflow_24h` | `(wallet, token, direction)` / `(token)` | same labels | trailing 24h at run time, whole table replaced every run; `create_at AS created_at`; **tracked wallets only** *(v1.9.0)* |
+| `wallet_overview_pnl_percentile_1d` / `wallet_performance_30d` / `l4_token_wallet_sharpe_1d` | per wallet (+ token) per day | `wallet_overview_pnl_percentile_1d` / `wallet_performance_30d` / `token_wallet_top_sharp_ratio` | ranks across the tracked wallet set; `wallet_performance_30d` is **chain-scoped** (contract option (a)) with ETH via the UETH candle as benchmark; `updated_at AS source_updated_at` for the sharpe label *(v1.9.0)* |
 | `control.table_watermarks` | `(namespace, table_name)` | — | one row per table per lift, section 5 |
 
 Every `TIMESTAMP` column of the data tables is Iceberg **timestamptz (UTC,
@@ -155,11 +166,22 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
    is green, stables at 1.0 via `is_stablecoin`), `token_price_usd_1h` /
    `token_price_usd_1d` (plain SELECTs on `l3_token_price_usd_1h` / `_1d`: same
    column names as your spec; `num_trades` is INT here, cast to BIGINT if you
-   reconcile sums). Every other label (balances, networth, PnL, sharpe,
-   token stats/signals/quality, DEX pair volume, market cap / fear index /
-   exchange flow, `wallet_performance_30d`) has **no HyperCore source**: leave it
-   out of the hypercore bundle — the fixed 34-label clone would fail at export and
-   a 0-row stub would fail your full refresh after the shared truncate.
+   reconcile sums). **From v1.9.0** the 13 wallet-level labels (`token_categories`,
+   `wallet_balance_per_tx`, `wallet_balance_1d_dense`, `wallet_networth_1d_dense`,
+   `wallet_pnl_state_fifo`, `wallet_pnl_realized_1d`, `wallet_token_stats`,
+   `wallet_trade_summary`, `wallet_whale_moves_24h`, `token_netflow_24h`,
+   `wallet_overview_pnl_percentile_1d`, `token_wallet_top_sharp_ratio`,
+   `wallet_performance_30d`) are plain pass-through SELECTs on the lake tables of
+   section 3 with the renames listed there (`event_index AS log_index`,
+   `balance_amount AS balance_qty`, `last_event_index AS last_log_index`,
+   `create_at AS created_at`, `updated_at AS source_updated_at`); their columns, keys
+   and tiers are the ethereum spec's byte for byte. The remaining 14 labels (token
+   stats / gainers / new rank / beta / signals / quality / summary / activity / active
+   address, market volume / fear index / cap, DEX pair volume, exchange flow) still
+   have **no HyperCore source** (planned as phases B and C in
+   `docs/HYPERCORE_FULL_CONTRACT_PLAN.md`): leave them out of the hypercore bundle —
+   the fixed 34-label clone would fail at export and a 0-row stub would fail your
+   full refresh after the shared truncate.
 3. **`chains` row** for `hypercore` in every destination before the first load:
    `is_evm = false`, `chain_numeric_id = NULL` (HyperCore has none; 999 is HyperEVM,
    a separate future chain), `native_symbol` / `native_decimals` to be decided with
@@ -197,6 +219,7 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
 | v1.6.0 | `l4_wallet_metadata` is a running aggregate over the wallet's **accumulated history** (count_tx = non-funding ledger rows, active_days = distinct UTC days, last_active = UTC days since the latest event, first/latest instants; funding excluded; `active_on_avg` NULL pending a definition), carried next to our per-wallet watermark and advanced only over complete windows; dimension rows re-stamped **only on content change** (`created_at` = first ingestion); `first_seen` stable, with a one-time repair that re-stamps drifted token rows once |
 | v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows), written FIRST in every hourly run under a 3-minute budget (tokens with recent ledger activity every run, the rest rotated most-stale first) and lifted before the wallet phase, so they are present even when a run defers wallets. **Onboarding gate:** `prices.history_pending == 0` in `_run_summary.json` (every priceable token carries its 32-day history; after the deploy this takes a few hours of rotation). `prices_deferred=N` in a summary means the budget was reached that hour - the next run continues |
 | v1.8.0 | nightly **compaction** of closed, fragmented partitions (≥ 8 files; a partition is closed 2 UTC days after its date, 1 for `l4x`) into one file each - one commit per table per night just after 00:05 UTC, so your scans of yesterday-and-older partitions open one file instead of 24; `write.metadata.previous-versions-max` raised to 100, so a `metadata_location` you fetched stays readable for well over a day even through commit bursts (fetch it once per run anyway) |
+| v1.9.0 | **the wallet-level L4 layer** (section 3, 13 tables + `l4x_spot_balance_snapshot`), recomputed after every lift for the wallets whose ledger changed, with the atlas formulas. Semantics to carry into your consumers: (1) wallet-derived aggregates (`token_netflow_24h`, `wallet_whale_moves_24h`, the ranks and percentiles) cover the **tracked wallet set** (~150 wallets), not the whole chain; (2) running balances are pinned to the exchange's spot balance at the snapshot instant, so a wallet's first `wallet_balance_per_tx` row may already carry a non-zero `balance_qty` and the FIFO state an opening lot priced at the first observed instant; (3) perp cashflows appear as USDC legs; (4) per-wallet tables are **replaced per wallet**, so `updated_at` moves for all of a wallet's rows at once (Tier-A cursors pull the whole wallet, Tier-B windows the trailing dates); (5) `created_at` on `wallet_balance_per_tx` is re-stamped on rewrite. `control.table_watermarks` gains one row per rollup table (`status = 'completed'` after each run that reached it; a table skipped by the time budget keeps its previous row and the run summary says `rollups_skipped=`) |
 
 Check the deployed version before onboarding (`/api/status` on the web monitor, or
 `hypercore-status --json`): while the host still runs v1.4.0, project
@@ -223,4 +246,4 @@ as they are. From v1.5.0 the columns are the instants themselves.
 - `native_symbol` / `native_decimals` for the `chains` row; explorer templates.
 - De-listing (`is_active = false` + fresh stamp) for wallets/tokens that leave the set.
 - `active_on_avg` definition (NULL until then). Decided: funding is excluded from `count_tx` / `active_days` / first and latest instants.
-- Whether a hypercore L4 layer (balances, networth, PnL, sharpe) is built at all, and by whom; the contract's L4 labels stay excluded until then.
+- ~~Whether a hypercore L4 layer (balances, networth, PnL, sharpe) is built at all, and by whom.~~ Decided 2026-10-21: built on the lake side, shipped in v1.9.0 (section 3). Still open: the token/market layer (phases B and C of `docs/HYPERCORE_FULL_CONTRACT_PLAN.md`).

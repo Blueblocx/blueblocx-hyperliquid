@@ -69,7 +69,11 @@ log = logging.getLogger("blueblocx_hyperliquid.query")
 CONTROL_TABLE = "table_watermarks"
 # the identity-partitioned DATE column a time bound prunes on (fact / snapshot tables)
 DATE_COLUMN = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m": "bucket_date",
-               "l4x_perp_position_snapshot": "as_of_date"}
+               "l4x_perp_position_snapshot": "as_of_date", "l4x_spot_balance_snapshot": "as_of_date",
+               "l4_wallet_balance_per_tx": "block_date", "l4_wallet_balance_1d_dense": "snapshot_date",
+               "l4_wallet_networth_1d_dense": "snapshot_date", "l4_wallet_pnl_realized_1d": "snapshot_date",
+               "wallet_overview_pnl_percentile_1d": "computed_date", "l4_token_wallet_sharpe_1d": "snapshot_date",
+               "wallet_performance_30d": "as_of_date"}
 DEFAULT_DAYS = 30
 FORMATS = ("table", "csv", "json")
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

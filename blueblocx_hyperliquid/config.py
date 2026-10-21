@@ -74,6 +74,13 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
     "HL_PRICE_HISTORY_DAYS": ("32", False,
                               "candle history fetched on a token's first visit (the ETL loads 32 days); "
                               "max 200 (5000 hourly candles per request)"),
+    # --- rollups (rollups/: the wallet-level L4 tables of the ETL contract, v1.9.0) -------
+    "HL_ROLLUPS": ("1", False,
+                   "1 = after every successful lift, recompute the rollup tables for the wallets whose "
+                   "ledger changed (docs/HYPERCORE_FULL_CONTRACT_PLAN.md); 0 = off"),
+    "HL_ROLLUP_TIME_BUDGET_MIN": ("8", False,
+                                  "minutes the rollup step may spend per run; tables whose turn comes later are "
+                                  "skipped and reported (rollups.skipped) and caught up by the next run. 0 = no limit"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock whose holder cannot be observed (another host, no /proc) is treated as "

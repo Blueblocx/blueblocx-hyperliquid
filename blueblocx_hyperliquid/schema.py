@@ -224,6 +224,25 @@ L4X_PERP_POSITION_SNAPSHOT_COLUMNS = [
     "created_at",
 ]
 
+# v1.9.0: spot balances as HyperCore reports them (spotClearinghouseState), one row per
+# (as_of_date, wallet, token), replaced per (as_of_date, wallet) every run like l4x perp.
+# The ANCHOR of the rollups' balance tables: the ledger a tracked wallet has in the lake
+# starts at its first pull (and the Info API caps fills at 10k), so a running sum of
+# movements alone is a balance "since go-live"; pinning it to the exchange's own
+# balance at the snapshot instant makes l4_wallet_balance_per_tx exact.
+L4X_SPOT_BALANCE_SNAPSHOT_COLUMNS = [
+    "as_of_ts",
+    "as_of_date",
+    "wallet_address",
+    "wallet_group",
+    "token_address",
+    "coin",                # the HL token symbol as the balance row names it
+    "total",               # spotClearinghouseState.balances[].total (decimal-adjusted units)
+    "hold",                # ... .hold (reserved by resting orders / perp margin)
+    "entry_ntl",           # ... .entryNtl (HL's own cost basis of the holding, USD)
+    "created_at",
+]
+
 
 def addr_group(addr: str) -> int:
     """Deterministic shard 0..3999 — matches Rust production addr_group().

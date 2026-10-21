@@ -494,12 +494,42 @@ def _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding) -> dict
     }
 
 
+def spot_balance_rows(balances: list[dict], wallet: str, now_ms: int, now_iso: str, resolver) -> list[dict]:
+    """l4x_spot_balance_snapshot rows from spotClearinghouseState.balances (v1.9.0): one
+    per non-zero holding, keyed by the same token_address the ledger uses (resolver;
+    unresolved symbols fall back to the ledger's hlcore:spot:<SYMBOL> convention)."""
+    as_of_ts = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat()
+    out: list[dict] = []
+    for b in balances or []:
+        coin = b.get("coin")
+        try:
+            total = float(b.get("total", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if not coin or total == 0.0:
+            continue
+        info = resolver.resolve_symbol(coin) if resolver is not None else None
+        token_address = info.token_address if info is not None else (
+            S.USDC_ADDRESS if coin == "USDC" else f"hlcore:spot:{coin}")
+
+        def _f(key):
+            try:
+                v = b.get(key)
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        out.append({"as_of_ts": as_of_ts, "as_of_date": as_of_ts[:10], "wallet_address": wallet,
+                    "wallet_group": S.addr_group(wallet), "token_address": token_address, "coin": coin,
+                    "total": total, "hold": _f("hold"), "entry_ntl": _f("entryNtl"), "created_at": now_iso})
+    return out
+
+
 def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = False,
         max_workers: int = 4, max_perp_price_coins: int = 30,
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
         hip3: bool = True, retention_days: int = 0, deadline_ts: float | None = None,
         soft_wallets: set[str] | None = None, progress=None,
-        price_budget_min: float | None = None) -> dict:
+        price_budget_min: float | None = None, rollup_budget_min: float | None = None) -> dict:
     """Pull, map, snapshot, analyse and write every wallet in `wallets` (in order).
 
     deadline_ts (epoch seconds): after it, no further wallet is STARTED and the
@@ -606,6 +636,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     registry = mappers.TokenRegistry()
     all_l1: list[dict] = []
     all_snap: list[dict] = []
+    all_spot: list[dict] = []                 # v1.9.0: l4x_spot_balance_snapshot rows
     wallet_meta_rows: list[dict] = []
     watchlist_rows: list[dict] = []
     contrib: dict[str, dict] = {}
@@ -903,6 +934,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
         all_l1 += l1_rows
         all_snap += snap_rows
+        all_spot += spot_balance_rows(balances, wallet, now_ms, now_iso, resolver)
         meta_row = wallet_meta.row(wallet, meta_state, now_ms, now_iso)
         if meta_row is not None:                  # no non-funding activity covered yet: no row
             wallet_meta_rows.append(meta_row)
@@ -1006,6 +1038,11 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                key_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"]), s(r["coin"])),
                sort_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"]), s(r["coin"])),
                replace_scope_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"])) in l4x_scope)
+    upsert_csv(ns_dir / "l4x_spot_balance_snapshot.csv", S.L4X_SPOT_BALANCE_SNAPSHOT_COLUMNS,
+               all_spot,
+               key_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"]), s(r["token_address"])),
+               sort_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"]), s(r["token_address"])),
+               replace_scope_fn=lambda r: (s(r["as_of_date"]), s(r["wallet_address"])) in l4x_scope)
     upsert_csv(ns_dir / "l4_wallet_metadata.csv", S.L4_WALLET_METADATA_COLUMNS, wallet_meta_rows,
                key_fn=lambda r: (s(r["wallet_address"]),), sort_fn=lambda r: s(r["wallet_address"]),
                merge_fn=content_merge(S.L4_WALLET_METADATA_COLUMNS))
@@ -1039,6 +1076,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     # --- optional: lift straight into Iceberg (nessie.hypercore.* or local) ----
     iceberg_report = None
     retention_report = None
+    rollups_report = None
     if iceberg:
         from .iceberg_load import lift_directory, lift_since, read_lift_state, write_lift_state
         config.load_env()
@@ -1073,11 +1111,27 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                     "l3_token_price_usd_1h": prune_csv(ns_dir / "l3_token_price_usd_1h.csv", "bucket_minute", cutoff_ms),
                     "l3_token_price_usd_1d": prune_csv(ns_dir / "l3_token_price_usd_1d.csv", "bucket_minute", cutoff_ms),
                     "l4x_perp_position_snapshot": prune_csv(ns_dir / "l4x_perp_position_snapshot.csv", "as_of_ts", cutoff_ms),
+                    "l4x_spot_balance_snapshot": prune_csv(ns_dir / "l4x_spot_balance_snapshot.csv", "as_of_ts", cutoff_ms),
                 }
                 extra_state["last_prune_iso"] = now_iso
             else:
                 retention_report = {"retention_days": retention_days, "skipped": f"last prune {last_prune}"}
         write_lift_state(ns_dir, now_iso, iceberg_report, extra=extra_state)
+        # --- rollups: the wallet-level L4 tables, from the lake just committed (v1.9.0) ---
+        # Never fails the run: a rollup error or a skipped table is a run-summary warning.
+        if config.env("HL_ROLLUPS").strip().lower() not in ("0", "false", "no", "off", ""):
+            progress(phase="rollups")
+            try:
+                from . import rollups
+                from .iceberg_load import dispose_catalog, load_catalog_from_env
+                catalog, _ = load_catalog_from_env()
+                try:
+                    rollups_report = rollups.run(ns_dir, catalog, budget_min=rollup_budget_min)
+                finally:
+                    dispose_catalog(catalog)
+            except Exception as e:  # noqa: BLE001 - reported, never fatal
+                log.exception("rollups failed")
+                rollups_report = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
     elif retention_days:
         log.warning("retention_days=%d ignored: staged CSVs are the only store without --iceberg",
                     retention_days)
@@ -1125,6 +1179,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "prices": native_price_report,
         "iceberg": iceberg_report,
         "retention": retention_report,
+        "rollups": rollups_report,
         "hip3_dexes_checked": dexes,
         "hip3_collateral_by_dex": collateral_report,
         "by_wallet": prev_by_wallet,
