@@ -184,6 +184,10 @@ class CategoryTests(unittest.TestCase):
         self.assertEqual(categories.categories_for("USDC", True, {"USDC"}), ["spot", "stablecoin", "hip3-collateral"])
         self.assertEqual(categories.categories_for("HYPE", False, set()), ["spot", "native"])
         self.assertEqual(categories.categories_for("UETH", False, set()), ["spot", "wrapped"])
+        self.assertEqual(categories.categories_for("UZEC", False, set()), ["spot", "wrapped"])      # Unit naming rule
+        self.assertEqual(categories.categories_for("UANSEM", False, set()), ["spot", "wrapped"])
+        self.assertEqual(categories.categories_for("USDE", False, set()), ["spot"])                 # USD* is never Unit
+        self.assertEqual(categories.categories_for("USDT0", True, set()), ["spot", "stablecoin"])
         self.assertEqual(categories.categories_for("PURR", False, set()), ["spot"])
 
 

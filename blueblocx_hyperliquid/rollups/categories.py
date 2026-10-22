@@ -26,7 +26,11 @@ def categories_for(symbol: str | None, is_stable: bool, hip3_collateral: set[str
         cats.append("stablecoin")
     if sym == "HYPE":
         cats.append("native")
-    if sym in WRAPPED or (sym.startswith("U") and sym[1:] in {"ETH", "BTC", "SOL"}):
+    # Unit names every bridged asset U<ASSET> (UBTC, UETH, UZEC, UMON, UANSEM, ...); the
+    # stablecoins are the only U-prefixed tokens that are not Unit assets (v1.10.3: the
+    # curated set alone let UZEC / UMON through to market cap with their pre-minted pool)
+    if sym in WRAPPED or (sym.startswith("U") and len(sym) >= 4 and not is_stable
+                          and not sym.startswith("USD")):
         cats.append("wrapped")
     if sym in hip3_collateral:
         cats.append("hip3-collateral")
