@@ -217,6 +217,13 @@ class InfoClient:
         meta, ctxs = self._post({"type": "spotMetaAndAssetCtxs"}, est_items=1500)
         return meta, ctxs
 
+    def token_details(self, token_id: str) -> dict:
+        """tokenDetails for ONE spot token (its spotMeta `tokenId`): name, maxSupply,
+        totalSupply, circulatingSupply, deployTime, markPx, ... (weight 20). The only
+        supply source HyperCore has (v1.10.0: market cap, token summary, new-token rank)."""
+        data = self._post({"type": "tokenDetails", "tokenId": token_id})
+        return data if isinstance(data, dict) else {}
+
     def meta_and_asset_ctxs(self) -> tuple[dict, list[dict]]:
         """Perp universe PLUS live markPx/funding/OI per coin — one call."""
         meta, ctxs = self._post({"type": "metaAndAssetCtxs"}, est_items=500)

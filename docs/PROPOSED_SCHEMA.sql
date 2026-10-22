@@ -566,3 +566,282 @@ TBLPROPERTIES (
     'format-version' = '2',
     'write.parquet.compression-codec' = 'zstd'
 );
+
+-- ============================================================================
+-- v1.10.0 ROLLUPS (phases B and C): the token / market tables of the ETL contract,
+-- built from the native candles (1m / 1h / 1d), l1_token_metadata (supply from
+-- Info tokenDetails), token_whitelist and the tracked wallets' ledger, with the atlas
+-- Trino view / Rust definitions (docs/ATLAS_WALLET_TABLE_FORMULAS.md, "token / market").
+-- Written by blueblocx_hyperliquid.rollups after every lift. Column names and types
+-- are the ETL contract's (chain_id is added by the ETL); `updated_at` = the write
+-- stamp of the run that (re)wrote the row. Tables with a date column are replaced
+-- per date, the rest whole. Wallet-derived counts (token_active_address, the active
+-- address columns of token_summary, exchange_flow) cover the TRACKED wallet set.
+-- ============================================================================
+
+-- vw_market_volume_24h: the last 24 complete hours of market-wide trade volume from
+-- the 1h candles (every priceable token; the EVM view sums the chain's transfers)
+CREATE TABLE IF NOT EXISTS nessie.hypercore.market_volume_24h (
+    hour_ts                 TIMESTAMP,
+    volume_token_1h         DOUBLE,
+    volume_usd_1h           DOUBLE,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_market_cap_1d: closed days, close x total supply, with the atlas admission gates
+CREATE TABLE IF NOT EXISTS nessie.hypercore.market_cap_latest (
+    token_address           STRING,
+    as_of_date              DATE,
+    total_supply            DOUBLE,
+    total_market_cap        DOUBLE,
+    is_stablecoin           BOOLEAN,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_market_fear_index v3: five factors, point-in-time 730-day midrank calibration
+CREATE TABLE IF NOT EXISTS nessie.hypercore.market_fear_index (
+    as_of_date              DATE,
+    momentum_score          DOUBLE,
+    breadth_score           DOUBLE,
+    volatility_score        DOUBLE,
+    volume_score            DOUBLE,
+    market_comp_score       DOUBLE,
+    fear_index              DOUBLE,
+    market_profile          STRING,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_stats: as-of-now price and 24h change from the 1m candles, all-time
+-- high / low / average from the 1d candles, strength vs ETH (UETH)
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_stats (
+    token_address           STRING,
+    last_updated_at         TIMESTAMP,
+    current_price           DOUBLE,
+    all_time_high           DOUBLE,
+    all_time_low            DOUBLE,
+    all_time_avg            DOUBLE,
+    price_pct_change_24h    DOUBLE,
+    eth_relative_strength   DOUBLE,
+    performance_status      STRING,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_price_gainers: 24h gainers anchored to the 1m data tip
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_price_gainers (
+    token_address           STRING,
+    timeframe               STRING,
+    current_ts              TIMESTAMP,
+    previous_ts             TIMESTAMP,
+    current_price_usd       DOUBLE,
+    previous_price_usd      DOUBLE,
+    price_change_pct        DOUBLE,
+    rank_price_change       BIGINT,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_new_rank: tokens deployed within 30 days, 0.5 return + 0.3 newness + 0.2 ln(trades)
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_new_rank (
+    token_address           STRING,
+    current_ts              TIMESTAMP,
+    previous_24h_ts         TIMESTAMP,
+    current_price_usd       DOUBLE,
+    price_24h_ago_usd       DOUBLE,
+    price_change_24h_pct    DOUBLE,
+    first_seen_ts           TIMESTAMP,
+    token_age_days          BIGINT,
+    tx_count_24h            BIGINT,
+    ranking_score           DOUBLE,
+    rank_new_token          BIGINT,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_beta_volatility_sharp: 30-day log returns of the whitelisted tokens vs ETH
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_beta_volatility_sharp (
+    token_address           STRING,
+    beta                    DOUBLE,
+    desc_beta               STRING,
+    annual_volatility       DOUBLE,
+    sharp_ratio             DOUBLE,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_activity_trending: last complete day vs the day before (trades, volume, price)
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_activity_trending (
+    token_address           STRING,
+    activity_date           DATE,
+    tx_count_today          BIGINT,
+    tx_count_yesterday      BIGINT,
+    tx_change_pct           DOUBLE,
+    price_usd               DOUBLE,
+    price_change_pct        DOUBLE,
+    volume_token            DOUBLE,
+    volume_change_pct       DOUBLE,
+    rank_tx_change          BIGINT,
+    rank_volume_change      BIGINT,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (activity_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_active_address: distinct TRACKED wallets with a ledger row per token, last 24h
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_active_address (
+    token_address           STRING,
+    active_address          BIGINT,
+    updated_at              TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_token_summary: price, live market cap, yesterday's volume, active (tracked)
+-- wallets and the four ranks
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_summary (
+    token_address                   STRING,
+    current_price_usd               DOUBLE,
+    price_change_24h_pct            DOUBLE,
+    market_cap_usd                  DOUBLE,
+    volume_usd_24h                  DOUBLE,
+    active_address_count_24h        BIGINT,
+    active_address_change_24h_pct   DOUBLE,
+    rank_trending                   BIGINT,
+    rank_mover                      BIGINT,
+    rank_new_coin                   BIGINT,
+    rank_gainer                     BIGINT,
+    updated_at                      TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- market_signals (Rust): per token per 1m bucket EMA9 / EMA21, 20-bucket volume spike
+-- ratio (>= 2x = spike), 20-bucket resistance and breakout; one global row per
+-- minute (global_flag = 'global', token_address = ''). Last 3 UTC days, replaced per day.
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_market_signals (
+    global_flag                 STRING,
+    token_address               STRING,
+    bucket_minute               TIMESTAMP,
+    bucket_date                 DATE,
+    close_price_usd             DOUBLE,
+    ema9                        DOUBLE,
+    ema21                       DOUBLE,
+    ema_signal                  STRING,
+    volume_token                DOUBLE,
+    volume_token_spike_ratio    DOUBLE,
+    volume_token_spike_signal   STRING,
+    volume_usd                  DOUBLE,
+    volume_usd_spike_ratio      DOUBLE,
+    volume_usd_spike_signal     STRING,
+    resistance_price            DOUBLE,
+    price_breakout              STRING,
+    created_at                  TIMESTAMP,
+    updated_at                  TIMESTAMP
+) USING iceberg
+PARTITIONED BY (bucket_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- token_quality (Rust): per token per day, trades in the window and the largest
+-- minute-over-minute vwap jump against the v1_trades_jump thresholds (>= 10 trades,
+-- jump <= 0.80). Last 3 UTC days, replaced per day.
+CREATE TABLE IF NOT EXISTS nessie.hypercore.token_quality (
+    as_of_date              DATE,
+    quality_version         STRING,
+    token_address           STRING,
+    lookback_hours          INT,
+    trades_in_window        BIGINT,
+    max_jump_from_prev      DOUBLE,
+    trade_threshold         INT,
+    jump_threshold          DOUBLE,
+    score                   INT,
+    is_pass                 BOOLEAN,
+    fail_reason             STRING,
+    latest_bucket_minute    TIMESTAMP,
+    created_at              TIMESTAMP,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- l3_dex_pair_volume_1d: one HyperCore spot market = one pair (TOKEN/USDC) = one pool;
+-- the day's volume and trade count from the market's 1d candle (decision 7A: the
+-- direction split is not observable market-wide, the per-direction columns are 0)
+CREATE TABLE IF NOT EXISTS nessie.hypercore.dex_pair_volume_1d (
+    bucket_date                     DATE,
+    pair_address                    STRING,
+    pair_symbol                     STRING,
+    token0_address                  STRING,
+    token1_address                  STRING,
+    token0_symbol                   STRING,
+    token1_symbol                   STRING,
+    amount_token0_to_token1         DOUBLE,
+    amount_token1_to_token0         DOUBLE,
+    volume_usd_token0_to_token1     DOUBLE,
+    volume_usd_token1_to_token0     DOUBLE,
+    volume_usd                      DOUBLE,
+    swap_count_token0_to_token1     INT,
+    swap_count_token1_to_token0     INT,
+    swap_count_total                INT,
+    pool_count                      INT,
+    created_at                      TIMESTAMP,
+    updated_at                      TIMESTAMP
+) USING iceberg
+PARTITIONED BY (bucket_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);
+
+-- vw_exchange_flow: daily USDC that the TRACKED wallets bridged into (deposit) and
+-- out of (withdraw) HyperCore, closed days of the last 31
+CREATE TABLE IF NOT EXISTS nessie.hypercore.exchange_flow (
+    bucket_date             DATE,
+    incoming_volume_usd     DOUBLE,
+    outgoing_volume_usd     DOUBLE,
+    net_flow_usd            DOUBLE,
+    updated_at              TIMESTAMP
+) USING iceberg
+PARTITIONED BY (bucket_date)
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.parquet.compression-codec' = 'zstd'
+);

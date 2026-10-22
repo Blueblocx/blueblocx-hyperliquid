@@ -31,6 +31,7 @@ class TokenInfo:
     decimals: int
     token_address: str
     is_stablecoin: bool
+    token_id: str | None = None      # spotMeta `tokenId` (0x...): the key of Info `tokenDetails`
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class SpotMetaResolver:
                 decimals=int(t.get("weiDecimals", 0) or 0),
                 token_address=_token_address(idx, sym),
                 is_stablecoin=sym.upper() in _STABLE_SYMBOLS,
+                token_id=(str(t["tokenId"]) if t.get("tokenId") else None),
             )
         # coin string -> SpotPair, indexed by BOTH canonical name and "@index".
         self._pairs: dict[str, SpotPair] = {}

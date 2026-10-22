@@ -113,16 +113,35 @@ TABLE_PLAN = {
     "wallet_overview_pnl_percentile_1d": (["wallet_address", "computed_date"], "replace_scope", ["computed_date"]),
     "l4_token_wallet_sharpe_1d": (["token_address", "wallet_address", "snapshot_date"], "replace_scope", ["snapshot_date"]),
     "wallet_performance_30d": (["wallet_address", "as_of_date"], "replace_scope", ["as_of_date"]),
+    # v1.10.0 rollups (phases B and C): the token / market tables of the ETL contract
+    "market_volume_24h": (["hour_ts"], "replace_keys", []),
+    "market_cap_latest": (["token_address", "as_of_date"], "replace_scope", ["as_of_date"]),
+    "market_fear_index": (["as_of_date"], "replace_scope", ["as_of_date"]),
+    "token_stats": (["token_address"], "replace_keys", []),
+    "token_price_gainers": (["token_address", "timeframe", "current_ts"], "replace_keys", []),
+    "token_new_rank": (["token_address", "current_ts"], "replace_keys", []),
+    "token_beta_volatility_sharp": (["token_address"], "replace_keys", []),
+    "token_activity_trending": (["token_address", "activity_date"], "replace_scope", ["activity_date"]),
+    "token_active_address": (["token_address"], "replace_keys", []),
+    "token_summary": (["token_address"], "replace_keys", []),
+    "token_market_signals": (["global_flag", "token_address", "bucket_minute"], "replace_scope", ["bucket_date"]),
+    "token_quality": (["as_of_date", "quality_version", "token_address"], "replace_scope", ["as_of_date"]),
+    "dex_pair_volume_1d": (["pair_address", "bucket_date"], "replace_scope", ["bucket_date"]),
+    "exchange_flow": (["bucket_date"], "replace_scope", ["bucket_date"]),
 }
 ROLLUP_TABLES = frozenset({   # written by blueblocx_hyperliquid.rollups, never staged as CSV
     "l1_token_categories", "l4_wallet_balance_per_tx", "l4_wallet_balance_1d_dense", "l4_wallet_networth_1d_dense",
     "l4_wallet_pnl_state_fifo", "l4_wallet_pnl_realized_1d", "wallet_token_stats", "wallet_trade_summary",
     "wallet_whale_moves_24h", "token_netflow_24h", "wallet_overview_pnl_percentile_1d", "l4_token_wallet_sharpe_1d",
-    "wallet_performance_30d"})
+    "wallet_performance_30d",
+    "market_volume_24h", "market_cap_latest", "market_fear_index", "token_stats", "token_price_gainers",
+    "token_new_rank", "token_beta_volatility_sharp", "token_activity_trending", "token_active_address",
+    "token_summary", "token_market_signals", "token_quality", "dex_pair_volume_1d", "exchange_flow"})
 
-# Tables that production is not expected to populate: l3_token_price_usd_1m is the
-# development-only output of `--with-prices` (the production unit never passes it),
-# so its absence from the catalog is normal, not a missing-table warning.
+# Tables whose absence from the catalog is normal: l3_token_price_usd_1m is created by
+# the first lift of the 1-minute feed (HL_PRICE_1M_DAYS > 0, v1.10.0; before that the
+# development-only output of `--with-prices`), so a lake without it is not a
+# missing-table warning.
 OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"})
 
 # Per table: the per-row WRITE stamp (what the ETL's Tier-A cursor reads: `updated_at`,
@@ -138,7 +157,11 @@ _BUSINESS_DATE_COL = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m":
                       "l4_wallet_networth_1d_dense": "snapshot_date", "l4_wallet_pnl_realized_1d": "snapshot_date",
                       "wallet_trade_summary": "last_activity_date",
                       "wallet_overview_pnl_percentile_1d": "computed_date",
-                      "l4_token_wallet_sharpe_1d": "snapshot_date", "wallet_performance_30d": "as_of_date"}
+                      "l4_token_wallet_sharpe_1d": "snapshot_date", "wallet_performance_30d": "as_of_date",
+                      "market_cap_latest": "as_of_date", "market_fear_index": "as_of_date",
+                      "token_activity_trending": "activity_date", "token_market_signals": "bucket_date",
+                      "token_quality": "as_of_date", "dex_pair_volume_1d": "bucket_date",
+                      "exchange_flow": "bucket_date"}
 _SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts", "l4x_spot_balance_snapshot": "as_of_ts"}
 
 # Columns that are NOT NULL by construction (natural keys, business dates, stamps,

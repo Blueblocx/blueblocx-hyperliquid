@@ -27,7 +27,8 @@ Output (nessie.hypercore.*):
     out/hypercore/l4_wallet_metadata.csv          upsert wallet_address
     out/hypercore/wallet_watchlist.csv            upsert wallet_address  (consumer gate)
     out/hypercore/token_whitelist.csv             upsert token_address   (consumer gate)
-    out/hypercore/l3_token_price_usd_1m.csv       (only with --with-prices; development)
+    out/hypercore/l3_token_price_usd_1m.csv       native closed 1m candles, last HL_PRICE_1M_DAYS (price_step,
+                                                  v1.10.0; the token/market tables read them)
     out/hypercore/l3_token_price_usd_1h.csv       native closed 1h candles (price_step, FIRST in the
     out/hypercore/l3_token_price_usd_1d.csv       run under HL_PRICE_TIME_BUDGET_MIN; state _price_state.json)
     out/hypercore/wallet_analytics_contrib.json   per-wallet contribution; the Rust
@@ -621,19 +622,26 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         progress(phase="prices")
         try:
             native_price_report = price_step.run(client, resolver, ns_dir, now_ms, now_iso, budget_s=budget_min * 60,
-                                                 history_days=config.env_int("HL_PRICE_HISTORY_DAYS"), clock=time)
+                                                 history_days=config.env_int("HL_PRICE_HISTORY_DAYS"), clock=time,
+                                                 history_days_1d=min(config.env_int("HL_PRICE_HISTORY_DAYS_1D"), 4000),
+                                                 minute_days=config.env_float("HL_PRICE_1M_DAYS"),
+                                                 supply_refresh_h=config.env_float("HL_SUPPLY_REFRESH_HOURS"))
         except Exception as e:  # noqa: BLE001 - prices never block the wallet phase
             log.warning("price step failed: %s: %s", type(e).__name__, e)
             native_price_report = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
         if iceberg and not native_price_report.get("error") and (native_price_report.get("rows_1h")
-                                                                 or native_price_report.get("rows_1d")):
+                                                                 or native_price_report.get("rows_1d")
+                                                                 or native_price_report.get("rows_1m")):
             from .iceberg_load import lift_directory, lift_since, read_lift_state
             config.load_env()
             prev_lift = read_lift_state(ns_dir).get("last_success_run_iso") if incremental else None
+            price_tables = [price_step.TABLE_1H, price_step.TABLE_1D]
+            if native_price_report.get("rows_1m"):
+                price_tables.append(price_step.TABLE_1M)
             try:
-                early = lift_directory(ns_dir, tables=[price_step.TABLE_1H, price_step.TABLE_1D],
+                early = lift_directory(ns_dir, tables=price_tables,
                                        since_iso=lift_since(prev_lift, now_iso), watermarks=False)
-                native_price_report["early_lift"] = {t: early.get(t) for t in (price_step.TABLE_1H, price_step.TABLE_1D)}
+                native_price_report["early_lift"] = {t: early.get(t) for t in price_tables}
             except Exception as e:  # noqa: BLE001 - the main lift retries these tables at the end of the run
                 log.warning("early lift of the price tables failed (the main lift retries): %s: %s",
                             type(e).__name__, e)
@@ -994,6 +1002,11 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     all_l1.sort(key=lambda r: (r["block_timestamp"], r["tx_hash"], r["event_index"]))
     reg_items = registry.items()
     meta_rows = prices.token_metadata_rows(reg_items, now_iso)
+    # v1.10.0: total supply / deploy time from the price step's tokenDetails refresh
+    # (the only supply source HyperCore has; NULL for tokens it has not reached yet)
+    supplied = price_step.apply_supply(meta_rows, price_step.supply_overrides(ns_dir))
+    if supplied:
+        log.info("token metadata: supply known for %d of %d token(s)", supplied, len(meta_rows))
     whitelist_rows = [{
         "token_address": addr, "token_group": S.addr_group(addr),
         "is_active": True, "whitelist_reason": "hypercore_token",
@@ -1113,7 +1126,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                     "retention_days": retention_days,
                     "cutoff": datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).isoformat(),
                     "l1_wallet_ledger": prune_csv(ns_dir / "l1_wallet_ledger.csv", "block_timestamp", cutoff_ms),
-                    "l3_token_price_usd_1m": prune_csv(ns_dir / "l3_token_price_usd_1m.csv", "bucket_minute", cutoff_ms),
+                    # the 1m feed stages ~50k rows/day (v1.10.0); the lake is insert-if-absent, so
+                    # the CSV only has to span the lift margin: 7 days, never the full retention
+                    "l3_token_price_usd_1m": prune_csv(ns_dir / "l3_token_price_usd_1m.csv", "bucket_minute",
+                                                       max(cutoff_ms, now_ms - 7 * 86_400_000)),
                     "l3_token_price_usd_1h": prune_csv(ns_dir / "l3_token_price_usd_1h.csv", "bucket_minute", cutoff_ms),
                     "l3_token_price_usd_1d": prune_csv(ns_dir / "l3_token_price_usd_1d.csv", "bucket_minute", cutoff_ms),
                     "l4x_perp_position_snapshot": prune_csv(ns_dir / "l4x_perp_position_snapshot.csv", "as_of_ts", cutoff_ms),

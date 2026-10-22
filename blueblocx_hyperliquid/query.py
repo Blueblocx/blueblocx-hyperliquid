@@ -73,7 +73,10 @@ DATE_COLUMN = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m": "bucke
                "l4_wallet_balance_per_tx": "block_date", "l4_wallet_balance_1d_dense": "snapshot_date",
                "l4_wallet_networth_1d_dense": "snapshot_date", "l4_wallet_pnl_realized_1d": "snapshot_date",
                "wallet_overview_pnl_percentile_1d": "computed_date", "l4_token_wallet_sharpe_1d": "snapshot_date",
-               "wallet_performance_30d": "as_of_date"}
+               "wallet_performance_30d": "as_of_date",
+               "market_cap_latest": "as_of_date", "market_fear_index": "as_of_date",
+               "token_activity_trending": "activity_date", "token_market_signals": "bucket_date",
+               "token_quality": "as_of_date", "dex_pair_volume_1d": "bucket_date", "exchange_flow": "bucket_date"}
 DEFAULT_DAYS = 30
 FORMATS = ("table", "csv", "json")
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

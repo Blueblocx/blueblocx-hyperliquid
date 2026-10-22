@@ -20,11 +20,38 @@ LEDGER_COLS = ("wallet_address", "token_address", "counterparty_address", "block
                "decimals")
 
 
+# the 1-minute candles an engine may read back (the tip-anchored views look 30 days
+# back for the "24h ago" bucket; signals / quality need a few days of warm-up)
+PX1M_DAYS = 31
+
+# l1_token_metadata total supply in token units (the atlas normalization, shared by
+# market cap, token summary and whale moves): tokenDetails fills `total_supply` already
+# normalized, so the first two branches are the ones HyperCore takes
+SUPPLY_EXPR = ("CASE WHEN total_supply_raw IS NOT NULL AND decimals IS NOT NULL AND decimals > 0 "
+               "THEN total_supply_raw / power(10, decimals) "
+               "WHEN total_supply IS NOT NULL AND total_supply < 1e15 THEN total_supply "
+               "WHEN total_supply IS NOT NULL AND decimals IS NOT NULL AND decimals > 0 "
+               "THEN total_supply / power(10, decimals) ELSE total_supply END")
+
+
+def load_or_empty(ctx, name: str, alias: str, **kw) -> int:
+    """ctx.load, or an EMPTY table with the DDL columns when the lake does not have the
+    table yet (the 1m feed before its first lift): the engines then produce no rows
+    instead of failing the whole group."""
+    if alias in ctx._loaded:
+        return ctx._loaded[alias]
+    if not ctx.has_table(name):
+        ctx.register(alias, table_from_rows([], ddl_columns(name)))
+        return 0
+    return ctx.load(name, alias=alias, **kw)
+
+
 def ensure_inputs(ctx, *, ledger: bool = True, meta: bool = True, px1h: bool = False, px1d: bool = False,
-                  ledger_all_days: int | None = None) -> None:
+                  ledger_all_days: int | None = None, px1m: bool = False, whitelist: bool = False) -> None:
     """Register the lake inputs an engine needs (idempotent). `ledger` is bounded to the
     wallets being recomputed; `ledger_all_<n>d` is every wallet's ledger for the last n
-    days (the cross-wallet 24h tables)."""
+    days (the cross-wallet 24h tables); `px1m` the last PX1M_DAYS of 1-minute candles;
+    `whitelist` the token gate."""
     if ledger:
         ctx.load("l1_wallet_ledger", date_col="block_date", alias="ledger")
     if meta:
@@ -33,9 +60,37 @@ def ensure_inputs(ctx, *, ledger: bool = True, meta: bool = True, px1h: bool = F
         ctx.load("l3_token_price_usd_1h", date_col="bucket_date", wallet_col=None, alias="px1h")
     if px1d:
         ctx.load("l3_token_price_usd_1d", date_col="bucket_date", wallet_col=None, alias="px1d")
+    if px1m:
+        load_or_empty(ctx, "l3_token_price_usd_1m", "px1m", date_col="bucket_date", wallet_col=None,
+                      since=ctx.today - dt.timedelta(days=PX1M_DAYS))
+    if whitelist:
+        load_or_empty(ctx, "token_whitelist", "whitelist", wallet_col=None)
     if ledger_all_days:
         ctx.load("l1_wallet_ledger", date_col="block_date", wallet_col=None,
                  since=ctx.today - dt.timedelta(days=ledger_all_days), alias=f"ledger_all_{ledger_all_days}d")
+
+
+def eth_token(ctx) -> str | None:
+    """The token_address of the ETH benchmark (UETH, decision 3A), None when the lake
+    has never seen it."""
+    rows = ctx.sql(f"SELECT token_address FROM meta WHERE upper(symbol) = '{ETH_SYMBOL}' LIMIT 1").to_pylist()
+    return rows[0]["token_address"] if rows else None
+
+
+def sample_stdev(values: list[float]) -> float | None:
+    """Trino / DuckDB STDDEV (sample): None with fewer than 2 values."""
+    vals = [v for v in values if v is not None]
+    if len(vals) < 2:
+        return None
+    import statistics
+    return statistics.stdev(vals)
+
+
+def midrank_percentile(window: list[float], value: float) -> float:
+    """(#strictly less + 0.5 * #equal) / n in [0, 1]: an all-tied window maps to 0.5."""
+    less = sum(1 for x in window if x < value)
+    equal = sum(1 for x in window if x == value)
+    return (less + 0.5 * equal) / len(window)
 
 
 def sort_key(row: dict) -> tuple:

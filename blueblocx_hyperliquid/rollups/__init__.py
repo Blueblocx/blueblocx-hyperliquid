@@ -32,6 +32,13 @@ the ETL already consumes for ethereum), ported one module per table family:
   activity.py   wallet_whale_moves_24h, token_netflow_24h
   ranks.py      wallet_overview_pnl_percentile_1d, wallet_performance_30d, l4_token_wallet_sharpe_1d
   categories.py l1_token_categories
+v1.10.0 (phases B and C, the token / market tables, from the native 1m/1h/1d candles,
+the tokenDetails supply in l1_token_metadata, token_whitelist and the tracked ledger):
+  market.py     market_volume_24h, market_cap_latest, market_fear_index
+  tokens.py     token_stats, token_price_gainers, token_new_rank, token_beta_volatility_sharp,
+                token_activity_trending, token_active_address, token_summary
+  signals.py    token_market_signals          quality.py  token_quality
+  pairs.py      dex_pair_volume_1d            flows.py    exchange_flow
 
 Scope: wallet-derived aggregates cover the TRACKED wallet set (the lake holds only
 those wallets' ledgers); the run summary and control.table_watermarks say so.
@@ -85,6 +92,21 @@ PLAN: dict[str, dict] = {
     "wallet_overview_pnl_percentile_1d": dict(key=["wallet_address", "computed_date"], kind="dated", date="computed_date"),
     "l4_token_wallet_sharpe_1d":        dict(key=["token_address", "wallet_address", "snapshot_date"], kind="dated", date="snapshot_date"),
     "wallet_performance_30d":           dict(key=["wallet_address", "as_of_date"], kind="dated", date="as_of_date"),
+    # v1.10.0 (phases B and C): token / market tables
+    "market_volume_24h":                dict(key=["hour_ts"], kind="global", date=None),
+    "market_cap_latest":                dict(key=["token_address", "as_of_date"], kind="dated", date="as_of_date"),
+    "market_fear_index":                dict(key=["as_of_date"], kind="dated", date="as_of_date"),
+    "token_stats":                      dict(key=["token_address"], kind="global", date=None),
+    "token_price_gainers":              dict(key=["token_address", "timeframe", "current_ts"], kind="global", date=None),
+    "token_new_rank":                   dict(key=["token_address", "current_ts"], kind="global", date=None),
+    "token_beta_volatility_sharp":      dict(key=["token_address"], kind="global", date=None),
+    "token_activity_trending":          dict(key=["token_address", "activity_date"], kind="dated", date="activity_date"),
+    "token_active_address":             dict(key=["token_address"], kind="global", date=None),
+    "token_summary":                    dict(key=["token_address"], kind="global", date=None),
+    "token_market_signals":             dict(key=["global_flag", "token_address", "bucket_minute"], kind="dated", date="bucket_date"),
+    "token_quality":                    dict(key=["as_of_date", "quality_version", "token_address"], kind="dated", date="as_of_date"),
+    "dex_pair_volume_1d":               dict(key=["pair_address", "bucket_date"], kind="dated", date="bucket_date"),
+    "exchange_flow":                    dict(key=["bucket_date"], kind="dated", date="bucket_date"),
 }
 # NOT NULL by construction (checked before any commit, like the lift)
 REQUIRED: dict[str, list[str]] = {name: list(p["key"]) + ["updated_at"] for name, p in PLAN.items()}
@@ -285,7 +307,7 @@ def write_table(ctx: Context, name: str, arrow: pa.Table, ddl: dict, *, dry_run:
 
 def _engines() -> list[tuple[str, list[str], Callable[[Context], dict[str, pa.Table]]]]:
     """(group, tables produced, compute) in dependency order."""
-    from . import activity, balances, categories, fifo, networth, positions, ranks
+    from . import activity, balances, categories, fifo, flows, market, networth, pairs, positions, quality, ranks, signals, tokens
     return [
         ("categories", ["l1_token_categories"], categories.compute),
         ("balances", ["l4_wallet_balance_per_tx", "l4_wallet_balance_1d_dense"], balances.compute),
@@ -295,6 +317,14 @@ def _engines() -> list[tuple[str, list[str], Callable[[Context], dict[str, pa.Ta
         ("activity", ["wallet_whale_moves_24h", "token_netflow_24h"], activity.compute),
         ("ranks", ["wallet_overview_pnl_percentile_1d", "wallet_performance_30d", "l4_token_wallet_sharpe_1d"],
          ranks.compute),
+        # v1.10.0: token / market tables (phases B and C)
+        ("market", ["market_volume_24h", "market_cap_latest", "market_fear_index"], market.compute),
+        ("tokens", ["token_stats", "token_price_gainers", "token_new_rank", "token_beta_volatility_sharp",
+                    "token_activity_trending", "token_active_address", "token_summary"], tokens.compute),
+        ("signals", ["token_market_signals"], signals.compute),
+        ("quality", ["token_quality"], quality.compute),
+        ("pairs", ["dex_pair_volume_1d"], pairs.compute),
+        ("flows", ["exchange_flow"], flows.compute),
     ]
 
 

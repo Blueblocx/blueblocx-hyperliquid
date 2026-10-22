@@ -7,9 +7,9 @@
 > catalog**, not through Trino (owner decision, 2026-10-14).
 >
 > **Status.** Every producer-side change this document relies on is implemented in
-> `blueblocx-hyperliquid` v1.4.0 … v1.9.0 (section 8 says what each release adds;
-> v1.9.0 adds the 13 wallet-level L4 tables, so the hypercore spec grows from 7 to
-> 20 labels).
+> `blueblocx-hyperliquid` v1.4.0 … v1.10.0 (section 8 says what each release adds;
+> v1.9.0 adds the 13 wallet-level L4 tables, v1.10.0 the 14 token / market tables:
+> **all 34 labels of the contract have a HyperCore source from v1.10.0 on**).
 > Which release the host actually runs is shown by the web monitor (`/api/status`,
 > field `version`) and by `hypercore-status --json`; sections marked *(vX.Y.Z)*
 > describe behaviour that exists from that release on. Use the onboarding checklist
@@ -80,7 +80,20 @@ pointers in one statement at the start of your run; use `control.table_watermark
 | `l1_wallet_ledger` | `(tx_hash, event_index, direction)` | source of `wallet_transactions` (your SQL, section 6) | immutable facts, insert-if-absent; `block_number`/`tx_index` NULL (no EVM block) |
 | `l3_token_price_usd_1h` | `(token_address, bucket_minute)` | `token_price_usd_1h` | one row per **closed** native 1h candle (`bucket_minute` = the candle open) for every token the ledger referenced that has a USDC spot market, plus stables pinned at 1.0 on the same grid; 32 days back on a token's first visit; no perp rows *(v1.7.0)* |
 | `l3_token_price_usd_1d` | `(token_address, bucket_date)` | `token_price_usd_1d` | same per closed UTC day (`bucket_minute` = 00:00Z of `bucket_date`) *(v1.7.0)* |
-| `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — | development-only output, **not populated in production** |
+| `l3_token_price_usd_1m` | `(token_address, bucket_minute)` | — (input of the token views) | one row per closed native **1-minute** candle of every priceable token, stables pinned at 1.0, from v1.10.0 (the first run after the deploy reaches 3 days back; before that, development-only). The token views below read it the way the EVM views read the atlas 1m table |
+| `market_volume_24h` | `hour_ts` | `market_volume_24h` | the last 24 complete hours anchored to the 1h data tip: Σ volume_token / volume_usd over every token's 1h candle (market-wide trade volume; the EVM view sums the chain's transfers) *(v1.10.0)* |
+| `market_cap_latest` | `(token_address, as_of_date)` | `market_cap_latest` | closed days: 1d close × total supply (Info tokenDetails) with the atlas admission gates; last 35 days rewritten per run *(v1.10.0)* |
+| `market_fear_index` | `as_of_date` | `market_fear_index` | the v3 five-factor index, point-in-time 730-day midrank calibration, whitelisted non-stable tokens cap-weighted; whole series rewritten per run, prints once >= 60 calibrated days exist *(v1.10.0)* |
+| `token_stats` | `token_address` | `token_stats` | as-of-now price and 24h change from the 1m candles; **all-time high / low / average from the 1d candles** (820 days), not from the 1m table; strength vs ETH = UETH *(v1.10.0)* |
+| `token_price_gainers` / `token_new_rank` | `(token, timeframe, current_ts)` / `(token, current_ts)` | same labels | 1m tip-anchored 24h gainers; new-token rank for tokens **deployed** within 30 days (`token_created_at` from tokenDetails; tokens without a deploy time are not ranked) *(v1.10.0)* |
+| `token_beta_volatility_sharp` | `token_address` | same | 30 daily log returns of the whitelisted tokens vs UETH *(v1.10.0)* |
+| `token_activity_trending` | `(token_address, activity_date)` | same | last complete day vs the day before, from the 1d candles (= the day's 1m sums) *(v1.10.0)* |
+| `token_active_address` | `token_address` | same (`current_date AS snapshot_date` on your side) | distinct **tracked** wallets with a ledger row per token in the last 24h *(v1.10.0)* |
+| `token_summary` | `token_address` | same | price, live market cap, yesterday's candle volume, active **tracked** wallets, the four ranks *(v1.10.0)* |
+| `token_market_signals` | `(global_flag, token_address, bucket_minute)` | same (`entity_key` derived on your side) | the Rust market-signals port on the 1m candles, last 3 UTC days rewritten per run (partitioned by `bucket_date`); `price_breakout` is the Rust string `breakout` / `normal` *(v1.10.0)* |
+| `token_quality` | `(as_of_date, quality_version, token_address)` | same | the Rust token_quality port (`v1_trades_jump`: >= 10 trades, jump <= 0.80), last 3 days rewritten per run *(v1.10.0)* |
+| `dex_pair_volume_1d` | `(pair_address, bucket_date)` | same | one spot market = one pair `TOKEN/USDC` = one pool, volume and trade count from the market's 1d candle; **the per-direction columns are 0** (not observable from candles), `pair_address` = `<token_address>/<usdc address>` *(v1.10.0)* |
+| `exchange_flow` | `bucket_date` | same | USDC the **tracked** wallets bridged in (`deposit`) / out (`withdraw`) per closed day, last 31 days *(v1.10.0)* |
 | `l4x_perp_position_snapshot` | `(as_of_date, wallet_address, coin)` | — (extension) | daily perp positions / unrealized PnL; no `updated_at` (use `created_at`); replaced per `(as_of_date, wallet)` every hour |
 | `l4x_spot_balance_snapshot` | `(as_of_date, wallet_address, token_address)` | — (extension) | the exchange's own spot balances per tracked wallet, replaced per `(as_of_date, wallet)` every hour; the anchor the balance rollups are pinned to *(v1.9.0)* |
 | `l1_token_categories` | `(token_address, token_group, category)` | `token_categories` | on-chain rules (`source = 'hypercore_rules'`): every token is `spot`, plus `stablecoin`, `native` (HYPE), `wrapped` (U-prefixed bridged assets such as UETH, UBTC), `hip3-collateral` where they apply *(v1.9.0)* |
@@ -175,13 +188,19 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
    section 3 with the renames listed there (`event_index AS log_index`,
    `balance_amount AS balance_qty`, `last_event_index AS last_log_index`,
    `create_at AS created_at`, `updated_at AS source_updated_at`); their columns, keys
-   and tiers are the ethereum spec's byte for byte. The remaining 14 labels (token
-   stats / gainers / new rank / beta / signals / quality / summary / activity / active
-   address, market volume / fear index / cap, DEX pair volume, exchange flow) still
-   have **no HyperCore source** (planned as phases B and C in
-   `docs/HYPERCORE_FULL_CONTRACT_PLAN.md`): leave them out of the hypercore bundle —
-   the fixed 34-label clone would fail at export and a 0-row stub would fail your
-   full refresh after the shared truncate.
+   and tiers are the ethereum spec's byte for byte. **From v1.10.0** the remaining 14
+   labels (`token_stats`, `token_price_gainers`, `token_new_rank`,
+   `token_beta_volatility_sharp`, `token_activity_trending`, `token_active_address`,
+   `token_summary`, `token_market_signals`, `token_quality`, `market_volume_24h`,
+   `market_fear_index`, `market_cap_latest`, `dex_pair_volume_1d`, `exchange_flow`)
+   are pass-through SELECTs on the lake tables of section 3 as well, with the two
+   expressions the ethereum spec already carries (`current_date AS snapshot_date` for
+   `token_active_address`; `entity_key` and the boolean `price_breakout` for
+   `token_market_signals` - the lake stores the Rust strings `breakout` / `normal`, so
+   test `price_breakout IN ('true', 'breakout')`). The hypercore bundle is therefore
+   the full 34-label contract; until a host runs v1.10.0 the 14 lake tables do not
+   exist and those labels must stay out (a 0-row stub would fail your full refresh
+   after the shared truncate).
 3. **`chains` row** for `hypercore` in every destination before the first load:
    `is_evm = false`, `chain_numeric_id = NULL` (HyperCore has none; 999 is HyperEVM,
    a separate future chain), `native_symbol` / `native_decimals` to be decided with
@@ -220,6 +239,7 @@ varchar (no `char(n)`), NUL-free from v1.4.0.
 | v1.7.0 | native candle tables `l3_token_price_usd_1h` / `l3_token_price_usd_1d` (one row per closed candle, stables pinned at 1.0, no perp reference rows), written FIRST in every hourly run under a 3-minute budget (tokens with recent ledger activity every run, the rest rotated most-stale first) and lifted before the wallet phase, so they are present even when a run defers wallets. **Onboarding gate:** `prices.history_pending == 0` in `_run_summary.json` (every priceable token carries its 32-day history; after the deploy this takes a few hours of rotation). `prices_deferred=N` in a summary means the budget was reached that hour - the next run continues |
 | v1.8.0 | nightly **compaction** of closed, fragmented partitions (≥ 8 files; a partition is closed 2 UTC days after its date, 1 for `l4x`) into one file each - one commit per table per night just after 00:05 UTC, so your scans of yesterday-and-older partitions open one file instead of 24; `write.metadata.previous-versions-max` raised to 100, so a `metadata_location` you fetched stays readable for well over a day even through commit bursts (fetch it once per run anyway) |
 | v1.9.0 | **the wallet-level L4 layer** (section 3, 13 tables + `l4x_spot_balance_snapshot`), recomputed after every lift for the wallets whose ledger changed, with the atlas formulas. Semantics to carry into your consumers: (1) wallet-derived aggregates (`token_netflow_24h`, `wallet_whale_moves_24h`, the ranks and percentiles) cover the **tracked wallet set** (~150 wallets), not the whole chain; (2) running balances are pinned to the exchange's spot balance at the snapshot instant, so a wallet's first `wallet_balance_per_tx` row may already carry a non-zero `balance_qty` and the FIFO state an opening lot priced at the first observed instant; (3) perp cashflows appear as USDC legs; (4) per-wallet tables are **replaced per wallet**, so `updated_at` moves for all of a wallet's rows at once (Tier-A cursors pull the whole wallet, Tier-B windows the trailing dates); (5) `created_at` on `wallet_balance_per_tx` is re-stamped on rewrite. `control.table_watermarks` gains one row per rollup table (`status = 'completed'` after each run that reached it; a table skipped by the time budget keeps its previous row and the run summary says `rollups_skipped=`) |
+| v1.10.0 | **the token / market layer** (section 3, 14 tables) and the inputs it needs: `l3_token_price_usd_1m` populated in production (1m candles, 3 days back then the gap), 820 days of 1d candles per token (fetched once), `l1_token_metadata.total_supply` / `token_created_at` / `supply_*` from Info `tokenDetails` (refreshed daily per token; NULL until a token's first refresh). Semantics to carry into your consumers: (1) `token_active_address`, the active-address columns of `token_summary` and `exchange_flow` count the **tracked wallet set**; (2) `token_stats` all-time high / low / average are over the 1d candles (820 days), the as-of prices over the 1m candles; (3) `token_new_rank` ranks tokens by **deploy time**, tokens without one (genesis tokens, USDC) never appear; (4) `dex_pair_volume_1d` has no direction split (per-direction columns 0, totals in `volume_usd` / `swap_count_total`), one pool per pair; (5) `market_volume_24h` is market-wide candle volume; (6) `market_fear_index` appears only once 60 calibrated days exist (about two days after the deploy) and the whole series is rewritten each run (point-in-time scores do not change, `updated_at` does); (7) `token_market_signals` and `token_quality` rewrite the last 3 UTC days every hour (Tier-A cursors pull ~170k signal rows per hour, as on ethereum). The first 4-5 runs after the deploy are a candle catch-up (`prices_deferred=N`); the token views fill in as their inputs land |
 
 Check the deployed version before onboarding (`/api/status` on the web monitor, or
 `hypercore-status --json`): while the host still runs v1.4.0, project
@@ -246,4 +266,4 @@ as they are. From v1.5.0 the columns are the instants themselves.
 - `native_symbol` / `native_decimals` for the `chains` row; explorer templates.
 - De-listing (`is_active = false` + fresh stamp) for wallets/tokens that leave the set.
 - `active_on_avg` definition (NULL until then). Decided: funding is excluded from `count_tx` / `active_days` / first and latest instants.
-- ~~Whether a hypercore L4 layer (balances, networth, PnL, sharpe) is built at all, and by whom.~~ Decided 2026-10-21: built on the lake side, shipped in v1.9.0 (section 3). Still open: the token/market layer (phases B and C of `docs/HYPERCORE_FULL_CONTRACT_PLAN.md`).
+- ~~Whether a hypercore L4 layer (balances, networth, PnL, sharpe) is built at all, and by whom.~~ Decided 2026-10-21: built on the lake side, shipped in v1.9.0 (section 3); the token / market layer followed in v1.10.0 (2026-10-22). Nothing of the 34-label contract is left out.

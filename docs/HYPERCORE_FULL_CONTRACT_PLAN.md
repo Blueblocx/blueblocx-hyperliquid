@@ -1,9 +1,12 @@
 # HyperCore: filling all 34 contract tables (plan, 2026-10-20)
 
-> Status 2026-10-21: owner approved 1A / 3A / 4A / 5A / 6A / 7A. **Phase A is
+> Status 2026-10-22: owner approved 1A / 3A / 4A / 5A / 6A / 7A. **Phase A is
 > implemented in v1.9.0** (`blueblocx_hyperliquid/rollups/`, 13 tables + the
-> `l4x_spot_balance_snapshot` anchor; see docs/DEPLOY.md release notes and
-> docs/ATLAS_WALLET_TABLE_FORMULAS.md). Phases B and C are still plans.
+> `l4x_spot_balance_snapshot` anchor), **phases B and C in v1.10.0** (14 tables,
+> the 1-minute candle feed, 820 days of 1d history, the tokenDetails supply
+> refresh) - **all 34 labels of the contract have a source**. See docs/DEPLOY.md
+> release notes and docs/ATLAS_WALLET_TABLE_FORMULAS.md (section 11 = the token /
+> market formulas and the HyperCore deviations).
 > Companion: `docs/ETL_HANDOFF_HYPERCORE.md` (what exists),
 > `dagster_blueblocx/NEW_CHAIN_SOURCE_CONTRACT_TABLES.md` (the per-table contract).
 >

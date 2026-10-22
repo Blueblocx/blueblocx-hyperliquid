@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.9.3}"
+RELEASE_TAG="${RELEASE_TAG:-v1.10.0}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -308,6 +308,9 @@ ensure_env HL_PRICE_TIME_BUDGET_MIN 3 "v1.7: minutes per run (first) for native 
 ensure_env HL_PRICE_HISTORY_DAYS 32 "v1.7: candle history fetched on a token's first visit (the ETL loads 32 days)"
 ensure_env HL_ROLLUPS 1 "v1.9: after every lift, recompute the wallet-level L4 rollup tables of the ETL contract (0 = off)"
 ensure_env HL_ROLLUP_TIME_BUDGET_MIN 8 "v1.9: minutes per run for the rollup step; later tables are skipped + reported and caught up next run"
+ensure_env HL_PRICE_HISTORY_DAYS_1D 820 "v1.10: 1d candle history per token (the market fear index calibrates against 730 trailing days)"
+ensure_env HL_PRICE_1M_DAYS 3 "v1.10: 1-minute candles into l3_token_price_usd_1m for the token views, market signals and token quality (0 = off)"
+ensure_env HL_SUPPLY_REFRESH_HOURS 24 "v1.10: hours between two Info tokenDetails calls per token (total supply, deploy time)"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then

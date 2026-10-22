@@ -72,8 +72,22 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                  "rest rotated most-stale first; closed candles only); the tables are lifted "
                                  "before any wallet is pulled. 0 = off (the price tables stay empty)"),
     "HL_PRICE_HISTORY_DAYS": ("32", False,
-                              "candle history fetched on a token's first visit (the ETL loads 32 days); "
+                              "1h candle history fetched on a token's first visit (the ETL loads 32 days); "
                               "max 200 (5000 hourly candles per request)"),
+    "HL_PRICE_HISTORY_DAYS_1D": ("820", False,
+                                 "v1.10: 1d candle history per token (fetched once, then the gap): the market "
+                                 "fear index calibrates each day against its trailing 730 days and needs >= 60 "
+                                 "days before it prints; max 4000"),
+    "HL_PRICE_1M_DAYS": ("3", False,
+                         "v1.10: 1-minute candles kept flowing into l3_token_price_usd_1m for every priceable "
+                         "token (first visit this many days back, then the gap; the API serves ~5000 "
+                         "candles = 3.4 days per request): the tip-anchored token views (token_stats, "
+                         "price gainers, new rank, summary), token_market_signals and token_quality read "
+                         "them. 0 = off (those tables stay empty)"),
+    "HL_SUPPLY_REFRESH_HOURS": ("24", False,
+                                "v1.10: hours between two Info tokenDetails calls per token (total supply, "
+                                "deploy time -> l1_token_metadata.total_supply / token_created_at, the "
+                                "inputs of market_cap_latest, token_summary and token_new_rank); 0 = off"),
     # --- rollups (rollups/: the wallet-level L4 tables of the ETL contract, v1.9.0) -------
     "HL_ROLLUPS": ("1", False,
                    "1 = after every successful lift, recompute the rollup tables for the wallets whose "

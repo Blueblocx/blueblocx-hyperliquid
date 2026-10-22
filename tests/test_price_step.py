@@ -53,7 +53,7 @@ class _CandleClient:
             self.clock.t += self.cost_s
         if coin in self.fail:
             raise RuntimeError("boom")
-        step = H if interval == "1h" else D
+        step = {"1h": H, "1d": D, "1m": price_step.MINUTE_MS}[interval]
         t = -(-start_ms // step) * step
         out = []
         while t <= end_ms:
@@ -182,6 +182,98 @@ class PriceStepTests(unittest.TestCase):
         st = price_step.load_state(self.ns_dir)
         self.assertEqual(st["tokens"][PURR]["last_1h_ms"], X - H)           # no trades = no candle; not retried forever
         self.assertEqual(rep["rows_1h"], len(price_step.interval_grid(((NOW - 2 * D) // H) * H, NOW, H)))   # pins only
+
+    # ---- v1.10.0: the 1-minute feed, the deep 1d history, the supply refresh ----------------
+    def _run10(self, client, now_ms, **kw):
+        return price_step.run(client, self.resolver, self.ns_dir, now_ms, NOW_ISO, budget_s=60.0, history_days=2,
+                              clock=_Clock(1000.0), token_meta=META, **kw)
+
+    def test_minute_feed_first_visit_then_the_gap(self):
+        M = price_step.MINUTE_MS
+        c = _CandleClient()
+        rep = self._run10(c, NOW, minute_days=1)
+        first_1m = ((NOW - D) // M) * M
+        grid_m = price_step.interval_grid(first_1m, NOW, M)
+        self.assertEqual(rep["fetched_1m"], 2)
+        self.assertEqual(rep["rows_1m"], 3 * len(grid_m))                   # PURR, HYPE + the USDC pin
+        self.assertEqual(rep["holes_1m"], [])
+        calls_1m = [k for k in c.calls if k[1] == "1m"]
+        self.assertEqual((calls_1m[0][2], calls_1m[0][3]), (first_1m, NOW))
+        self.assertTrue((self.ns_dir / "l3_token_price_usd_1m.csv").exists())
+        st = price_step.load_state(self.ns_dir)
+        self.assertEqual(st["tokens"][PURR]["last_1m_ms"], NOW - M)          # the last CLOSED minute
+        self.assertEqual(st["pins"][S.USDC_ADDRESS]["last_1m_ms"], NOW - M)
+        c.calls.clear()
+        rep = self._run10(c, NOW + 5 * M, minute_days=1)
+        calls_1m = [k for k in c.calls if k[1] == "1m"]
+        self.assertEqual(calls_1m[0][2], NOW)                                 # the gap: cursor + 1 minute
+        self.assertEqual(rep["rows_1m"], 3 * 5)
+        # a cursor older than the API's ~5000-candle reach restarts at the cap and reports the hole
+        c.calls.clear()
+        rep = self._run10(c, NOW + 6 * D, minute_days=1)
+        self.assertEqual(len(rep["holes_1m"]), 2)
+        self.assertGreaterEqual([k for k in c.calls if k[1] == "1m"][0][2], NOW + 6 * D - 5000 * M)
+        # off by default: no 1m call, no report keys
+        rep = self._run10(_CandleClient(), NOW)
+        self.assertNotIn("rows_1m", rep)
+
+    def test_deep_1d_history_is_fetched_once_and_again_when_the_depth_grows(self):
+        c = _CandleClient()
+        self._run10(c, NOW, history_days_1d=5)
+        first = [k for k in c.calls if k[1] == "1d"][0]
+        self.assertEqual(first[2], ((NOW - 5 * D) // D) * D)                 # the deep start in ONE call
+        st = price_step.load_state(self.ns_dir)
+        self.assertEqual(st["tokens"][PURR]["hist_1d_days"], 5)
+        self.assertEqual(st["pins"][S.USDC_ADDRESS]["hist_1d_days"], 5)
+        rows = _read(self.ns_dir / "l3_token_price_usd_1d.csv")
+        self.assertEqual(len([r for r in rows if r["token_address"] == S.USDC_ADDRESS]),
+                         len(price_step.interval_grid(((NOW - 5 * D) // D) * D, NOW, D)))   # the pin reaches as deep
+        c.calls.clear()
+        self._run10(c, NOW + D, history_days_1d=5)                           # next day: only the gap
+        gap = [k for k in c.calls if k[1] == "1d"][0]
+        self.assertEqual(gap[2], st["tokens"][PURR]["last_1d_ms"] + D)
+        c.calls.clear()
+        self._run10(c, NOW + D, history_days_1d=7)                           # deeper configured: once more from 7d back
+        deep = [k for k in c.calls if k[1] == "1d"][0]
+        self.assertEqual(deep[2], ((NOW + D - 7 * D) // D) * D)
+        self.assertEqual(price_step.load_state(self.ns_dir)["tokens"][PURR]["hist_1d_days"], 7)
+
+    def test_supply_refresh_once_per_period_and_merged_into_metadata(self):
+        class _Client(_CandleClient):
+            details: list[str] = []
+
+            def token_details(self, token_id):
+                self.details.append(token_id)
+                if token_id == "0xbad":
+                    raise RuntimeError("500")
+                return {"name": "PURR", "totalSupply": "1000000.5", "circulatingSupply": "600000", "maxSupply": "1000000.5",
+                        "deployTime": "2026-01-02T03:04:05.000", "markPx": "1.5"}
+        meta = {"tokens": [dict(t, tokenId=f"0x{t['index']:02x}") for t in SPOT_META["tokens"]],
+                "universe": SPOT_META["universe"]}
+        meta["tokens"][2]["tokenId"] = "0xbad"                                # HYPE's details fail
+        resolver = SpotMetaResolver(meta)
+        c = _Client()
+        rep = price_step.run(c, resolver, self.ns_dir, NOW, NOW_ISO, budget_s=60.0, history_days=2,
+                             clock=_Clock(1000.0), token_meta=META, supply_refresh_h=24)
+        self.assertEqual(sorted(c.details), ["0x01", "0xbad"])
+        self.assertEqual((rep["fetched_supply"], rep["supply_known"]), (1, 1))
+        self.assertIn("supply:", rep["errors"][HYPE])
+        sup = price_step.supply_overrides(self.ns_dir)
+        self.assertEqual(set(sup), {PURR})
+        self.assertEqual(sup[PURR]["total"], 1000000.5)
+        self.assertEqual(sup[PURR]["deploy_ms"], 1767323045000)
+        rows = [{"token_address": PURR, "total_supply": None, "token_created_at": None},
+                {"token_address": HYPE, "total_supply": None, "token_created_at": None}]
+        self.assertEqual(price_step.apply_supply(rows, sup), 1)
+        self.assertEqual((rows[0]["total_supply"], rows[0]["supply_source"], rows[0]["token_created_at"]),
+                         (1000000.5, price_step.SUPPLY_SOURCE, "2026-01-02T03:04:05+00:00"))
+        self.assertIsNone(rows[1]["total_supply"])
+        c.details.clear()
+        price_step.run(c, resolver, self.ns_dir, NOW + 3 * H, NOW_ISO, budget_s=60.0, history_days=2,
+                       clock=_Clock(1000.0), token_meta=META, supply_refresh_h=24)
+        self.assertEqual(c.details, ["0xbad"])                               # PURR is fresh; HYPE retried
+        self.assertIsNone(price_step.parse_token_details({"name": "x"}, NOW))
+        self.assertEqual(price_step.parse_token_details({"totalSupply": "7", "deployTime": "garbage"}, NOW)["deploy_ms"], None)
 
     def test_state_file_round_trip_and_corruption(self):
         (self.ns_dir / price_step.STATE_FILE).write_text("{not json", encoding="utf-8")
