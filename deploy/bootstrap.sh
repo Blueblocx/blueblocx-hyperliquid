@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.10.5}"
+RELEASE_TAG="${RELEASE_TAG:-v1.10.6}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"

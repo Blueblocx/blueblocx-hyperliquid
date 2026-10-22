@@ -994,19 +994,39 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         raise RuntimeError(f"{reason} - nothing written (see _reconciliation.json)")
 
     # --- chain-wide natural-key uniqueness (the Rust dedup key, NO wallet) -----
-    seen: dict[tuple, str] = {}
+    # v1.10.6: dup_within now counts only same-wallet repeats of a key (a cross-wallet
+    # repeat goes to `collisions` instead, as before); `dup_examples` pins down WHICH
+    # rows and how the two differ, instead of a bare count - added after three
+    # consecutive production aborts (2026-10-22/23) with no way to tell which wallet
+    # or event was responsible, pre-dating this release (first seen on v1.10.4).
+    _DUP_FIELDS = ("event_type", "direction", "amount", "amount_signed", "token_address",
+                  "block_timestamp", "counterparty_address")
+    seen: dict[tuple, dict] = {}
     collisions: list[dict] = []
+    dup_within = 0
+    dup_examples: list[dict] = []
     for r in all_l1:
         k = mappers.natural_key(r)
-        if k in seen and seen[k] != r["wallet_address"]:
-            collisions.append({"key": list(k), "wallets": [seen[k], r["wallet_address"]]})
-        seen.setdefault(k, r["wallet_address"])
-    dup_within = len(all_l1) - len(seen)
+        prior = seen.get(k)
+        if prior is None:
+            seen[k] = r
+            continue
+        if prior["wallet_address"] != r["wallet_address"]:
+            collisions.append({"key": list(k), "wallets": [prior["wallet_address"], r["wallet_address"]]})
+            continue
+        dup_within += 1
+        if len(dup_examples) < 20:
+            dup_examples.append({"key": list(k), "wallet_address": r["wallet_address"],
+                                 "first": {f: prior.get(f) for f in _DUP_FIELDS},
+                                 "second": {f: r.get(f) for f in _DUP_FIELDS}})
     orphans: list[str] | None = None            # set by the referential check below
     dims_distinct: bool | None = None
     if collisions or dup_within:
         # writing would let upsert_csv silently collapse the colliding rows
-        abort_run(f"natural key violation: {len(collisions)} cross-wallet collisions, {dup_within} duplicates")
+        if dup_examples:
+            log.error("natural key duplicate sample: %s", json.dumps(dup_examples, default=str))
+        abort_run(f"natural key violation: {len(collisions)} cross-wallet collisions, {dup_within} duplicates",
+                 natural_key_duplicate_examples=dup_examples)
 
     all_l1.sort(key=lambda r: (r["block_timestamp"], r["tx_hash"], r["event_index"]))
     reg_items = registry.items()
