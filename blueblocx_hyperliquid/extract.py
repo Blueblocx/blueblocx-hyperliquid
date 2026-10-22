@@ -501,10 +501,14 @@ def _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding) -> dict
     }
 
 
-def spot_balance_rows(balances: list[dict], wallet: str, now_ms: int, now_iso: str, resolver) -> list[dict]:
+def spot_balance_rows(balances: list[dict], wallet: str, now_ms: int, now_iso: str, resolver,
+                      registry=None) -> list[dict]:
     """l4x_spot_balance_snapshot rows from spotClearinghouseState.balances (v1.9.0): one
     per non-zero holding, keyed by the same token_address the ledger uses (resolver;
-    unresolved symbols fall back to the ledger's hlcore:spot:<SYMBOL> convention)."""
+    unresolved symbols fall back to the ledger's hlcore:spot:<SYMBOL> convention).
+    `registry` (v1.10.4): the held tokens are noted so l1_token_metadata covers every
+    token the balance rollups reference, not only the tokens the ledger traded (128 held
+    tokens had no metadata row on 2026-10-22)."""
     as_of_ts = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat()
     out: list[dict] = []
     for b in balances or []:
@@ -518,6 +522,11 @@ def spot_balance_rows(balances: list[dict], wallet: str, now_ms: int, now_iso: s
         info = resolver.resolve_symbol(coin) if resolver is not None else None
         token_address = info.token_address if info is not None else (
             S.USDC_ADDRESS if coin == "USDC" else f"hlcore:spot:{coin}")
+        if registry is not None:
+            if info is not None:
+                registry.note_token(info)
+            else:
+                registry.note(token_address, coin, 0, coin.upper() in _STABLE_SYMBOLS)
 
         def _f(key):
             try:
@@ -948,7 +957,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
 
         all_l1 += l1_rows
         all_snap += snap_rows
-        all_spot += spot_balance_rows(balances, wallet, now_ms, now_iso, resolver)
+        all_spot += spot_balance_rows(balances, wallet, now_ms, now_iso, resolver, registry=registry)
         meta_row = wallet_meta.row(wallet, meta_state, now_ms, now_iso)
         if meta_row is not None:                  # no non-funding activity covered yet: no row
             wallet_meta_rows.append(meta_row)
