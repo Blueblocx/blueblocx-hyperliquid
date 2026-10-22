@@ -53,7 +53,9 @@ def market_cap(ctx, since: dt.date) -> pa.Table:
     return ctx.sql(f"""
         WITH n AS (
             SELECT token_address, coalesce(is_stablecoin, false) AS is_stablecoin, {SUPPLY_EXPR} AS total_supply
-            FROM meta WHERE total_supply IS NOT NULL OR total_supply_raw IS NOT NULL)
+            FROM meta WHERE (total_supply IS NOT NULL OR total_supply_raw IS NOT NULL)
+              -- Unit-bridged assets report their pre-minted pool, not the bridged amount
+              AND coalesce(supply_confidence, '') <> 'low')
         SELECT p.token_address, p.bucket_date AS as_of_date, n.total_supply,
                n.total_supply * p.close_price_usd AS total_market_cap, n.is_stablecoin
         FROM px1d p JOIN n ON n.token_address = p.token_address

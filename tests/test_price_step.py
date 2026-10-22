@@ -262,12 +262,17 @@ class PriceStepTests(unittest.TestCase):
         self.assertEqual(set(sup), {PURR})
         self.assertEqual(sup[PURR]["total"], 1000000.5)
         self.assertEqual(sup[PURR]["deploy_ms"], 1767323045000)
-        rows = [{"token_address": PURR, "total_supply": None, "token_created_at": None},
-                {"token_address": HYPE, "total_supply": None, "token_created_at": None}]
+        rows = [{"token_address": PURR, "symbol": "PURR", "total_supply": None, "token_created_at": None},
+                {"token_address": HYPE, "symbol": "HYPE", "total_supply": None, "token_created_at": None}]
         self.assertEqual(price_step.apply_supply(rows, sup), 1)
-        self.assertEqual((rows[0]["total_supply"], rows[0]["supply_source"], rows[0]["token_created_at"]),
-                         (1000000.5, price_step.SUPPLY_SOURCE, "2026-01-02T03:04:05+00:00"))
+        self.assertEqual((rows[0]["total_supply"], rows[0]["supply_source"], rows[0]["token_created_at"],
+                          rows[0]["supply_confidence"]),
+                         (1000000.5, price_step.SUPPLY_SOURCE, "2026-01-02T03:04:05+00:00", "high"))
         self.assertIsNone(rows[1]["total_supply"])
+        # a Unit-bridged asset reports its pre-minted pool: the supply lands, flagged low
+        ueth = [{"token_address": PURR, "symbol": "UETH", "total_supply": None, "token_created_at": None}]
+        price_step.apply_supply(ueth, sup)
+        self.assertEqual((ueth[0]["total_supply"], ueth[0]["supply_confidence"]), (1000000.5, "low"))
         c.details.clear()
         price_step.run(c, resolver, self.ns_dir, NOW + 3 * H, NOW_ISO, budget_s=60.0, history_days=2,
                        clock=_Clock(1000.0), token_meta=META, supply_refresh_h=24)

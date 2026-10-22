@@ -260,7 +260,8 @@ def token_summary(ctx, stats: pa.Table, trending: pa.Table, new_rank: pa.Table, 
     today = ctx.today.isoformat()
     arrow = ctx.sql(f"""
         WITH ts AS (SELECT token_address, {SUPPLY_EXPR} AS supply FROM meta
-                    WHERE total_supply IS NOT NULL OR total_supply_raw IS NOT NULL),
+                    WHERE (total_supply IS NOT NULL OR total_supply_raw IS NOT NULL)
+                      AND coalesce(supply_confidence, '') <> 'low'),
         v AS (SELECT token_address, coalesce(volume_usd, 0) AS volume_usd_24h FROM px1d WHERE bucket_date = DATE '{today}' - 1),
         ac AS (SELECT token_address,
                       count(DISTINCT CASE WHEN block_date = DATE '{today}' - 1 THEN wallet_address END) AS active_today,

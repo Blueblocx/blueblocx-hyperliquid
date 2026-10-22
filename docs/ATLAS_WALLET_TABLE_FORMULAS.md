@@ -347,3 +347,6 @@ token, `HL_PRICE_1M_DAYS` back on first visit, then the gap; stables pinned), 1d
 `HL_PRICE_HISTORY_DAYS_1D` (820) back per token, Info `tokenDetails` per token every
 `HL_SUPPLY_REFRESH_HOURS` (24) → `l1_token_metadata.total_supply`, `supply_as_of`,
 `supply_source`, `supply_confidence`, `token_created_at`.
+Unit-bridged assets (category `wrapped`: UETH, UBTC, USOL, ...) report their pre-minted pool as
+`totalSupply`, so their supply is stored with `supply_confidence = 'low'` and skipped by market cap,
+fear index and token summary (v1.10.2).

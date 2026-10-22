@@ -122,7 +122,13 @@ def apply_supply(meta_rows: list[dict], supply: dict[str, dict]) -> int:
         r["total_supply_raw"] = None
         r["supply_as_of"] = prices._iso(int(s["as_of_ms"])) if s.get("as_of_ms") else None
         r["supply_source"] = SUPPLY_SOURCE
-        r["supply_confidence"] = "high"
+        # Unit-bridged assets (UETH, UBTC, USOL, ...: category "wrapped") report the
+        # pre-minted pool (100M UETH) as their supply, not the bridged amount: a true
+        # on-chain figure, but no basis for a market cap (UETH would read $247B). Flag
+        # it "low"; the market-cap consumers skip low-confidence supplies.
+        from .rollups.categories import categories_for
+        wrapped = "wrapped" in categories_for(r.get("symbol"), bool(r.get("is_stablecoin")), set())
+        r["supply_confidence"] = "low" if wrapped else "high"
         if s.get("deploy_ms"):
             r["token_created_at"] = prices._iso(int(s["deploy_ms"]))
         n += 1
