@@ -279,6 +279,35 @@ class PriceStepTests(unittest.TestCase):
         self.assertEqual(c.details, ["0xbad"])                               # PURR is fresh; HYPE retried
         self.assertIsNone(price_step.parse_token_details({"name": "x"}, NOW))
         self.assertEqual(price_step.parse_token_details({"totalSupply": "7", "deployTime": "garbage"}, NOW)["deploy_ms"], None)
+
+    def test_sentinel_supply_detection(self):
+        # WMNT (2026-10-23): maxSupply = 2**64-1 scaled by weiDecimals=8, totalSupply
+        # a hair under it - the "no real cap configured" default
+        self.assertTrue(price_step._is_sentinel_supply(184467440736.4348, 184467440736.4348,
+                                                        184467440737.09552, decimals=8))
+        # the HIP-3 synthetic tickers: int64 max instead of uint64 max
+        self.assertTrue(price_step._is_sentinel_supply(92233720368.54039, None, 92233720368.54775808, decimals=8))
+        # USDE: all three fields bit-identical at 100B - no mint/burn ever tracked
+        self.assertTrue(price_step._is_sentinel_supply(1e11, 1e11, 1e11, decimals=8))
+        # a real, actively traded token never has this: UETH's circulating != its cap
+        self.assertFalse(price_step._is_sentinel_supply(99999999.971, 99999999.967, 1e8, decimals=9))
+        self.assertFalse(price_step._is_sentinel_supply(998834080.7, 302024504.5, 1e9, decimals=8))
+        # BONK's real ~88.8T and PUMP's real 1T are nowhere near a power of two
+        self.assertFalse(price_step._is_sentinel_supply(88819999999810.66, None, None, decimals=5))
+        self.assertFalse(price_step._is_sentinel_supply(999999999759.93, 999999999759.93, 1e12, decimals=8))
+        # no decimals known: only the circ==total==max pattern can still fire
+        self.assertFalse(price_step._is_sentinel_supply(184467440736.4348, None, 184467440737.09552, decimals=None))
+        self.assertTrue(price_step._is_sentinel_supply(1e11, 1e11, 1e11, decimals=None))
+        # below the placeholder floor: an exact match is just a quiet small token, not a sentinel
+        self.assertFalse(price_step._is_sentinel_supply(100.0, 100.0, 100.0, decimals=8))
+
+    def test_apply_supply_flags_sentinel_as_low_confidence(self):
+        sup = {PURR: {"total": 184467440736.4348, "circulating": 184467440736.4348,
+                     "max": 184467440737.09552, "deploy_ms": None, "as_of_ms": NOW}}
+        rows = [{"token_address": PURR, "symbol": "WMNT", "decimals": 8, "total_supply": None,
+                "token_created_at": None}]
+        self.assertEqual(price_step.apply_supply(rows, sup), 1)
+        self.assertEqual(rows[0]["supply_confidence"], "low")
         # a quiet token (not in this run's registry) still receives its supply through its
         # staged row, re-stamped (v1.10.1)
         csv_path = self.ns_dir / "l1_token_metadata.csv"

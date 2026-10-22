@@ -109,6 +109,40 @@ def supply_overrides(ns_dir: Path) -> dict[str, dict]:
             if isinstance(st, dict) and isinstance(st.get("supply"), dict)}
 
 
+# v1.10.5: a HyperCore token deployed without a real supply cap reports the raw
+# uint64 or (less often) int64 maximum as totalSupply/maxSupply, scaled by its
+# weiDecimals - not a real figure. Confirmed on-chain 2026-10-23 on WMNT (cap =
+# 2**64-1 / 1e8), KHYPE, FXRP and the HIP-3 synthetic-stock tickers MUX/SPYX/QQQX/
+# NVDAX/SKHYX (cap = 2**63-1, scaled); WMNT alone read a $102B market cap on a
+# token trading at $0.53. A tolerance of 1 part per million distinguishes this from
+# a genuinely huge supply that happens to be close to a round number (BONK's real
+# ~88.8T, PUMP's real 1T) because neither is anywhere near a power of two.
+_UINT64_MAX = 2 ** 64 - 1
+_INT64_MAX = 2 ** 63 - 1
+_SENTINEL_RELTOL = 1e-6
+# Second pattern, same root cause by a different symptom: circulatingSupply ==
+# totalSupply == maxSupply bit-for-bit (USDE: all three exactly 100,000,000,000) -
+# no mint/burn was ever tracked for the token, so the three fields never diverge.
+# A real, actively traded token's circulating supply is never bit-identical to its
+# cap (UETH's circulating is 99999999.9674654007 against a 100000000.0 cap). The
+# >= 1e9 floor keeps a genuinely small, quiet-week token from matching by chance.
+_PLACEHOLDER_FLOOR = 1e9
+
+
+def _is_sentinel_supply(total: float, circulating: float | None, max_supply: float | None,
+                        decimals: int | None) -> bool:
+    """True when `total` is not a usable supply figure (see the two patterns above)."""
+    if decimals is not None:
+        raw = total * (10 ** decimals)
+        for sentinel in (_UINT64_MAX, _INT64_MAX):
+            if abs(raw - sentinel) / sentinel < _SENTINEL_RELTOL:
+                return True
+    if total >= _PLACEHOLDER_FLOOR and circulating is not None and max_supply is not None:
+        if circulating == total == max_supply:
+            return True
+    return False
+
+
 def apply_supply(meta_rows: list[dict], supply: dict[str, dict]) -> int:
     """Fill the supply columns of l1_token_metadata rows from supply_overrides();
     returns how many rows got a supply. Rows of tokens without one are untouched (the
@@ -118,7 +152,8 @@ def apply_supply(meta_rows: list[dict], supply: dict[str, dict]) -> int:
         s = supply.get(r.get("token_address"))
         if not s or s.get("total") is None:
             continue
-        r["total_supply"] = float(s["total"])
+        total = float(s["total"])
+        r["total_supply"] = total
         r["total_supply_raw"] = None
         r["supply_as_of"] = prices._iso(int(s["as_of_ms"])) if s.get("as_of_ms") else None
         r["supply_source"] = SUPPLY_SOURCE
@@ -128,7 +163,10 @@ def apply_supply(meta_rows: list[dict], supply: dict[str, dict]) -> int:
         # it "low"; the market-cap consumers skip low-confidence supplies.
         from .rollups.categories import categories_for
         wrapped = "wrapped" in categories_for(r.get("symbol"), bool(r.get("is_stablecoin")), set())
-        r["supply_confidence"] = "low" if wrapped else "high"
+        decimals_raw = r.get("decimals")
+        decimals = int(decimals_raw) if decimals_raw not in (None, "") else None
+        sentinel = _is_sentinel_supply(total, s.get("circulating"), s.get("max"), decimals)
+        r["supply_confidence"] = "low" if (wrapped or sentinel) else "high"
         if s.get("deploy_ms"):
             r["token_created_at"] = prices._iso(int(s["deploy_ms"]))
         n += 1

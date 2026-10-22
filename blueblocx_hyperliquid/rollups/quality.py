@@ -12,6 +12,16 @@ import pyarrow as pa
 
 from .common import as_date, ddl_columns, ensure_inputs, table_from_rows, utc
 
+# v1.10.5: USDC (and any other stablecoin) is the QUOTE asset of every HyperCore
+# spot market, never the base - it has no real trade count of its own (its 1m rows
+# are a synthetic $1.00 pin, num_trades always 0), so the trade-count gate the atlas
+# formula assumes for a traded base asset fails it every day (score 40,
+# fail_reason low_trades:0). Confirmed on 2026-10-23: because every dex pair is
+# quoted in USDC, that made token_quality.is_pass false for EVERY pair on the
+# chain, and /token-pulse/flow-history (which reads it) was empty for all of them.
+# A stablecoin's quality signal is its peg, not its own trade volume: treated as
+# always-passing.
+
 QUALITY_VERSION = "v1_trades_jump"
 TRADE_THRESHOLD = 10
 JUMP_THRESHOLD = 0.80
@@ -61,14 +71,25 @@ def quality_rows(rows: list[dict], first_day: dt.date) -> list[dict]:
     return out
 
 
+def apply_stablecoin_override(rows: list[dict], stable_addresses) -> None:
+    """In place: a stablecoin's row always passes (see the module note above)."""
+    for r in rows:
+        if r["token_address"] in stable_addresses:
+            r["is_pass"] = True
+            r["score"] = 100
+            r["fail_reason"] = ""
+
+
 def compute(ctx) -> dict[str, pa.Table]:
-    ensure_inputs(ctx, ledger=False, meta=False, px1m=True)
+    ensure_inputs(ctx, ledger=False, meta=True, px1m=True)
     first_day = ctx.today - dt.timedelta(days=QUALITY_DAYS - 1)
     arrow = ctx.sql(f"""
         SELECT token_address, bucket_minute, bucket_date, vwap_price_usd, num_trades
         FROM px1m WHERE bucket_date >= DATE '{(first_day - dt.timedelta(days=1)).isoformat()}'
         ORDER BY token_address, bucket_minute""")
     rows = quality_rows(arrow.to_pylist(), first_day)
+    stables = {r["token_address"] for r in ctx.sql("SELECT token_address FROM meta WHERE is_stablecoin").to_pylist()}
+    apply_stablecoin_override(rows, stables)
     for r in rows:
         r["created_at"] = ctx.now
     return {"token_quality": table_from_rows(rows, ddl_columns("token_quality"))}

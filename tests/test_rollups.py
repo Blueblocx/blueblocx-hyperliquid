@@ -266,6 +266,20 @@ class QualityTests(unittest.TestCase):
         out = quality.quality_rows(self._rows(T, d, [1.0, 3.0], [1, 1]), d)
         self.assertEqual((out[0]["score"], out[0]["fail_reason"]), (0, "low_trades:2,high_jump:2"))
 
+    def test_stablecoin_override_always_passes(self):
+        # USDC's 1m rows are a synthetic $1.00 pin with num_trades=0: on its own it
+        # fails the trade-count gate every day (score 40), which would otherwise fail
+        # every dex pair on HyperCore (all quoted in USDC)
+        d = dt.date(2026, 10, 2)
+        rows = quality.quality_rows(self._rows(S.USDC_ADDRESS, d, [1.0] * 3, [0, 0, 0]), d)
+        self.assertEqual((rows[0]["score"], rows[0]["is_pass"]), (40, False))
+        quality.apply_stablecoin_override(rows, {S.USDC_ADDRESS})
+        self.assertEqual((rows[0]["score"], rows[0]["is_pass"], rows[0]["fail_reason"]), (100, True, ""))
+        # a non-stable token with the same shape is left alone
+        rows2 = quality.quality_rows(self._rows(T, d, [1.0] * 3, [0, 0, 0]), d)
+        quality.apply_stablecoin_override(rows2, {S.USDC_ADDRESS})
+        self.assertEqual((rows2[0]["score"], rows2[0]["is_pass"]), (40, False))
+
 
 class MarketTests(unittest.TestCase):
     def test_midrank_percentile(self):
