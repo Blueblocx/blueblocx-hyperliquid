@@ -274,6 +274,21 @@ class PriceStepTests(unittest.TestCase):
         self.assertEqual(c.details, ["0xbad"])                               # PURR is fresh; HYPE retried
         self.assertIsNone(price_step.parse_token_details({"name": "x"}, NOW))
         self.assertEqual(price_step.parse_token_details({"totalSupply": "7", "deployTime": "garbage"}, NOW)["deploy_ms"], None)
+        # a quiet token (not in this run's registry) still receives its supply through its
+        # staged row, re-stamped (v1.10.1)
+        csv_path = self.ns_dir / "l1_token_metadata.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=S.L1_TOKEN_METADATA_COLUMNS)
+            w.writeheader()
+            for addr, sym in ((PURR, "PURR"), (HYPE, "HYPE")):
+                w.writerow({c: "" for c in S.L1_TOKEN_METADATA_COLUMNS} | {"token_address": addr, "symbol": sym,
+                                                                          "updated_at": "2026-01-01T00:00:00+00:00"})
+        extra = price_step.staged_rows_with_supply(csv_path, sup, exclude={HYPE}, now_iso=NOW_ISO)
+        self.assertEqual([r["token_address"] for r in extra], [PURR])
+        self.assertEqual(extra[0]["updated_at"], NOW_ISO)
+        self.assertEqual(price_step.apply_supply(extra, sup), 1)
+        self.assertEqual(price_step.staged_rows_with_supply(csv_path, sup, exclude={PURR}, now_iso=NOW_ISO), [])
+        self.assertEqual(price_step.staged_rows_with_supply(self.ns_dir / "nope.csv", sup, set(), NOW_ISO), [])
 
     def test_state_file_round_trip_and_corruption(self):
         (self.ns_dir / price_step.STATE_FILE).write_text("{not json", encoding="utf-8")

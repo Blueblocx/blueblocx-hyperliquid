@@ -129,6 +129,25 @@ def apply_supply(meta_rows: list[dict], supply: dict[str, dict]) -> int:
     return n
 
 
+def staged_rows_with_supply(csv_path: Path, supply: dict[str, dict], exclude, now_iso: str) -> list[dict]:
+    """l1_token_metadata rows of tokens that have a supply but are NOT in `exclude` (the
+    tokens this run's ledger referenced), taken from the staged CSV with a fresh write
+    stamp: the refresh rotates over every priceable token, while a run only rebuilds the
+    rows of the tokens it saw, so a quiet token's supply would otherwise never land."""
+    import csv
+    if not supply or not Path(csv_path).exists():
+        return []
+    out = []
+    with Path(csv_path).open("r", newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            addr = r.get("token_address")
+            if addr in supply and addr not in exclude:
+                row = dict(r)
+                row["updated_at"] = now_iso
+                out.append(row)
+    return out
+
+
 def parse_token_details(details: dict, now_ms: int) -> dict | None:
     """The supply record kept in the state from one tokenDetails answer."""
     def num(key):

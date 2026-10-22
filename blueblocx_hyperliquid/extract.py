@@ -1004,7 +1004,15 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     meta_rows = prices.token_metadata_rows(reg_items, now_iso)
     # v1.10.0: total supply / deploy time from the price step's tokenDetails refresh
     # (the only supply source HyperCore has; NULL for tokens it has not reached yet)
-    supplied = price_step.apply_supply(meta_rows, price_step.supply_overrides(ns_dir))
+    supply = price_step.supply_overrides(ns_dir)
+    supplied = price_step.apply_supply(meta_rows, supply)
+    # a run rebuilds only the rows of the tokens its ledger referenced; the tokens the
+    # refresh reached that stayed quiet this run get their supply from their staged row
+    # (fresh stamp, so the ETL's Tier-A cursor sees it) - v1.10.1
+    extra = price_step.staged_rows_with_supply(ns_dir / "l1_token_metadata.csv", supply,
+                                               {r["token_address"] for r in meta_rows}, now_iso)
+    supplied += price_step.apply_supply(extra, supply)
+    meta_rows += extra
     if supplied:
         log.info("token metadata: supply known for %d of %d token(s)", supplied, len(meta_rows))
     whitelist_rows = [{
