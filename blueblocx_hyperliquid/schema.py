@@ -303,10 +303,24 @@ def funding_tx_hash(wallet: str, coin: str, time_ms) -> str:
     return f"hlcore:{_w(wallet)}:funding:{coin}:{time_ms}"
 
 
-def ledger_tx_hash(wallet: str, hash_val, typ: str, time_ms) -> str:
+def ledger_tx_hash(wallet: str, hash_val, typ: str, time_ms, dup_seq: int = 0) -> str:
     """Ledger updates usually carry a real L1 hash — but a `send` shows the SAME
     hash on both sender and receiver, so even real hashes must be wallet-scoped.
-    The delta type is appended so two deltas in one tx stay distinct."""
+    The delta type is appended so two deltas in one tx stay distinct.
+
+    `dup_seq` (v1.10.7): HyperCore's `withdraw` deltas carry no real hash (a
+    withdrawal is a bridge request, not yet an L1 tx when the ledger records it),
+    so the fallback branch keys on `time_ms` alone, millisecond resolution. Two
+    withdrawals (or two other hash-less deltas of the same type) landing in the
+    same millisecond then produced byte-identical rows with different amounts and
+    aborted the run's natural-key check (confirmed on-chain 2026-10-23: wallet
+    0x023a3d05..., tx key colliding $346,408.54 against $149,899.00). The caller
+    passes the 0-based occurrence index of this exact (hash_val, typ, time_ms)
+    tuple within the wallet's batch; the first occurrence (0) keeps the hash
+    unchanged (every already-written row is untouched), a later one gets this
+    suffix instead of colliding."""
     if hash_val and hash_val != ZERO_HASH:
-        return f"hlcore:{_w(wallet)}:{hash_val}:{typ}"
-    return f"hlcore:{_w(wallet)}:{typ}:{time_ms}"
+        base = f"hlcore:{_w(wallet)}:{hash_val}:{typ}"
+    else:
+        base = f"hlcore:{_w(wallet)}:{typ}:{time_ms}"
+    return base if not dup_seq else f"{base}:dup{dup_seq}"

@@ -187,6 +187,37 @@ class ContentAddressedKeyTests(unittest.TestCase):
         b, _ = map_all(WALLET_A, fills=[f2, f1])
         self.assertEqual(sorted(keys(a)), sorted(keys(b)))
 
+    def test_two_withdrawals_same_millisecond_get_distinct_keys(self):
+        # withdraw deltas carry no real L1 hash (a withdrawal is a bridge request,
+        # not yet settled when the ledger records it); the fallback tx_hash was
+        # (wallet, type, time_ms) with no sub-millisecond disambiguator, so two
+        # withdrawals landing in the same millisecond collided and aborted the
+        # run's natural-key check (confirmed 2026-10-23: $346,408.54 vs $149,899.00
+        # for the same wallet, same millisecond)
+        t = 1_700_000_000_000
+        rows, _ = map_all(WALLET_A, led=[ledger(t, "withdraw", h=S.ZERO_HASH, usdc="346408.54"),
+                                         ledger(t, "withdraw", h=S.ZERO_HASH, usdc="149899.0")])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({r["tx_hash"] for r in rows}), 2, "the two withdrawals must get distinct tx_hash")
+        self.assertEqual(len(keys(rows)), len(set(keys(rows))))
+        self.assertEqual({r["amount"] for r in rows}, {346408.54, 149899.0})
+
+    def test_first_occurrence_keeps_the_hash_unchanged(self):
+        # the common, non-colliding case must be byte-for-byte what it always was -
+        # dup_seq only engages from the SECOND occurrence of the exact same
+        # (hash, type, time) tuple, so no previously-written row's tx_hash moves
+        t = 1_700_000_000_000
+        solo, _ = map_all(WALLET_A, led=[ledger(t, "withdraw", h=S.ZERO_HASH, usdc="500")])
+        first_of_two, _ = map_all(WALLET_A, led=[ledger(t, "withdraw", h=S.ZERO_HASH, usdc="500"),
+                                                 ledger(t, "withdraw", h=S.ZERO_HASH, usdc="700")])
+        self.assertEqual(solo[0]["tx_hash"], first_of_two[0]["tx_hash"])
+
+    def test_three_way_collision_stays_pairwise_distinct(self):
+        t = 1_700_000_000_000
+        rows, _ = map_all(WALLET_A, led=[ledger(t, "withdraw", h=S.ZERO_HASH, usdc=str(v))
+                                        for v in (1, 2, 3)])
+        self.assertEqual(len({r["tx_hash"] for r in rows}), 3)
+
 
 class AccountingInvariantTests(unittest.TestCase):
     def test_account_class_transfer_nets_to_zero(self):

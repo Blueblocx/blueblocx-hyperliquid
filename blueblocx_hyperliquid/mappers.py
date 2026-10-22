@@ -353,10 +353,19 @@ def map_non_funding_ledger(updates: list[dict], wallet: str, now_iso: str,
     tx_hash = schema.ledger_tx_hash(wallet, hash, type, time). Internal
     perp<->spot moves emit TWO legs (ordinals 0 out / 1 in) so the wallet nets
     to zero. Returns (rows, unknown_type_counts) for alerting on unmapped types.
+
+    v1.10.7: `withdraw` (and any other hash-less type) falls back to a
+    (wallet, type, time_ms) key with no sub-millisecond disambiguator; two such
+    deltas landing in the same millisecond collide. `tx_hash_seq` counts repeats
+    of the exact (hash, type, time) tuple seen so far in THIS wallet's batch and
+    passes the 0-based occurrence index to ledger_tx_hash, which only changes the
+    hash from the second occurrence on - the common, non-colliding case is
+    byte-for-byte unchanged.
     """
     rows: list[dict] = []
     unknown: dict[str, int] = {}
     wl = wallet.lower()
+    tx_hash_seq: dict[tuple, int] = {}
     for e in updates:
         d = e["delta"]
         typ = d.get("type")
@@ -368,7 +377,10 @@ def map_non_funding_ledger(updates: list[dict], wallet: str, now_iso: str,
             _resolve_ledger_delta(d, wallet, resolver)
         if amount == 0.0:
             continue
-        h = S.ledger_tx_hash(wallet, e.get("hash"), typ, e["time"])
+        seq_key = (e.get("hash"), typ, e["time"])
+        dup_seq = tx_hash_seq.get(seq_key, 0)
+        tx_hash_seq[seq_key] = dup_seq + 1
+        h = S.ledger_tx_hash(wallet, e.get("hash"), typ, e["time"], dup_seq=dup_seq)
 
         if typ in _NET_ZERO_INTERNAL_TYPES or (
                 typ in ("send", "spotTransfer") and _is_self_move(d, wl)):
