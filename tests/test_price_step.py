@@ -265,14 +265,20 @@ class PriceStepTests(unittest.TestCase):
         rows = [{"token_address": PURR, "symbol": "PURR", "total_supply": None, "token_created_at": None},
                 {"token_address": HYPE, "symbol": "HYPE", "total_supply": None, "token_created_at": None}]
         self.assertEqual(price_step.apply_supply(rows, sup), 1)
+        # v1.10.8: the circulating supply (600000) prices the market cap, not the minted total
         self.assertEqual((rows[0]["total_supply"], rows[0]["supply_source"], rows[0]["token_created_at"],
                           rows[0]["supply_confidence"]),
-                         (1000000.5, price_step.SUPPLY_SOURCE, "2026-01-02T03:04:05+00:00", "high"))
+                         (600000.0, price_step.SUPPLY_SOURCE, "2026-01-02T03:04:05+00:00", "high"))
         self.assertIsNone(rows[1]["total_supply"])
         # a Unit-bridged asset reports its pre-minted pool: the supply lands, flagged low
         ueth = [{"token_address": PURR, "symbol": "UETH", "total_supply": None, "token_created_at": None}]
         price_step.apply_supply(ueth, sup)
-        self.assertEqual((ueth[0]["total_supply"], ueth[0]["supply_confidence"]), (1000000.5, "low"))
+        self.assertEqual((ueth[0]["total_supply"], ueth[0]["supply_confidence"]), (600000.0, "low"))
+        # no / implausible circulating figure -> the minted total is the fallback
+        for circ in (None, 0, -1, 2000000.0):
+            rows2 = [{"token_address": PURR, "symbol": "PURR", "total_supply": None, "token_created_at": None}]
+            price_step.apply_supply(rows2, {PURR: dict(sup[PURR], circulating=circ)})
+            self.assertEqual(rows2[0]["total_supply"], 1000000.5, circ)
         c.details.clear()
         price_step.run(c, resolver, self.ns_dir, NOW + 3 * H, NOW_ISO, budget_s=60.0, history_days=2,
                        clock=_Clock(1000.0), token_meta=META, supply_refresh_h=24)

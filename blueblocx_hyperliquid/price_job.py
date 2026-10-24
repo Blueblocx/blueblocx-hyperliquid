@@ -40,7 +40,7 @@ log = logging.getLogger("blueblocx_hyperliquid.price_job")
 OUT_ROOT = Path(__file__).resolve().parent.parent / "out"
 
 _INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
-_STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD"}
+_STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD", "USDH", "USDE", "USDXL"}
 
 
 def _now_iso() -> str:

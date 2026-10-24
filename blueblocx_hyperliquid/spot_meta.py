@@ -44,7 +44,7 @@ class SpotPair:
 
 
 # Tokens we treat as $1 stablecoins on HyperCore (priced by pinning, not candles).
-_STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD"}
+_STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD", "USDH", "USDE", "USDXL"}
 
 
 def _token_address(index: int, symbol: str) -> str:

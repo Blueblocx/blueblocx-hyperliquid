@@ -60,7 +60,7 @@ OUT_ROOT = Path(__file__).resolve().parent.parent / "out"     # repo default; HL
 
 # Reconciliation tolerance for the USDC cashflow identity (float rounding).
 _RECON_EPSILON = 1.0  # USD
-_STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD"}
+_STABLE_SYMBOLS = {"USDC", "USDT0", "USDT", "USDHL", "FEUSD", "USDH", "USDE", "USDXL"}
 # ETL contract 4.4(c): a row must be readable within 2 h of its updated_at. Rows are
 # stamped at run START and committed at the end; warn when the gap grows past this.
 _STAMP_AGE_WARN_MIN = 60.0

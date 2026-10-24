@@ -153,7 +153,18 @@ def apply_supply(meta_rows: list[dict], supply: dict[str, dict]) -> int:
         if not s or s.get("total") is None:
             continue
         total = float(s["total"])
-        r["total_supply"] = total
+        # v1.10.8: the supply that prices a market cap is the CIRCULATING one (the
+        # CoinGecko / CMC convention). tokenDetails' totalSupply is the minted amount,
+        # which on HyperCore is often the whole cap parked in the deployer's wallet
+        # (DRV: 100B minted, USDH: 100B minted; priced at total they read $38B and
+        # $99.7B and dominated the platform-wide total market cap). total stays the
+        # fallback when circulating is missing or not a sane fraction of it, and the
+        # sentinel test below still looks at total.
+        circulating = s.get("circulating")
+        if circulating is not None and 0 < float(circulating) <= total:
+            r["total_supply"] = float(circulating)
+        else:
+            r["total_supply"] = total
         r["total_supply_raw"] = None
         r["supply_as_of"] = prices._iso(int(s["as_of_ms"])) if s.get("as_of_ms") else None
         r["supply_source"] = SUPPLY_SOURCE
