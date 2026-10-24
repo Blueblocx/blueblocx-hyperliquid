@@ -253,7 +253,7 @@ class WalletMetadataRowTests(unittest.TestCase):
         self.assertEqual(row["latest_tx"], "2026-10-11T06:00:00+00:00")
         self.assertEqual(row["first_tx"], row["first_block_timestamp"])
         self.assertEqual(row["latest_tx"], row["latest_block_timestamp"])
-        self.assertEqual((row["count_tx"], row["active_days"]), (3, 2))
+        self.assertEqual((row["count_tx"], row["active_days"]), (2, 2))   # v1.10.9: the fee row is not activity
         # the lift parses the row as TIMESTAMP (no hash reaches a timestamptz column)
         spec = il.parse_ddl()["l4_wallet_metadata"]
         arrow = il.rows_to_arrow([row], spec["columns"])

@@ -29,13 +29,19 @@ def _row(ts_ms: int, event_type: str = S.EVT_SPOT_FILL, **extra) -> dict:
 
 
 class WalletMetaStateTests(unittest.TestCase):
-    def test_seed_excludes_funding_and_counts_distinct_utc_days(self):
+    def test_seed_counts_token_movements_only_and_distinct_utc_days(self):
+        # v1.10.9: perp cashflow (fee here) and funding are not activity; only the two spot
+        # fills count, and latest_tx is the latest token movement, not the later fee row
         rows = [_row(T0 - 30 * H), _row(T0 - 30 * H, S.EVT_FUNDING), _row(T0 - 2 * H), _row(T0 - H, S.EVT_PERP_FEE),
                 _row(T0 - 40 * H, S.EVT_FUNDING)]                           # funding only earlier: not "first"
         st = wallet_meta.seed(rows, T0)
-        self.assertEqual((st["count_tx"], st["first_ms"], st["latest_ms"], st["through_ms"]), (3, T0 - 30 * H, T0 - H, T0))
+        self.assertEqual((st["count_tx"], st["first_ms"], st["latest_ms"], st["through_ms"]), (2, T0 - 30 * H, T0 - 2 * H, T0))
         self.assertEqual(len(st["days"]), 2)
         self.assertEqual(wallet_meta.seed([_row(T0, S.EVT_FUNDING)], T0)["count_tx"], 0)
+        for evt in (S.EVT_PERP_PNL, S.EVT_PERP_FEE, S.EVT_STAKING_REWARD, S.EVT_INTEREST):
+            self.assertEqual(wallet_meta.seed([_row(T0, evt)], T0)["count_tx"], 0, evt)
+        for evt in (S.EVT_SPOT_FILL, S.EVT_TRANSFER, S.EVT_DEPOSIT, S.EVT_WITHDRAW):
+            self.assertEqual(wallet_meta.seed([_row(T0, evt)], T0)["count_tx"], 1, evt)
 
     def test_update_folds_only_the_advanced_window_and_is_idempotent(self):
         st = wallet_meta.seed([_row(T0 - 2 * H)], T0)
@@ -224,13 +230,11 @@ class ExtractRunStampingTests(unittest.TestCase):
             # run 1: the fake reports the window as API-capped; a soft wallet accepts the hole,
             # so the watermark (and the aggregate) advance
             extract.run([W1], 2, out, incremental=True, hip3=False, soft_wallets={W1})
-            meta1 = self._read(ns, "l4_wallet_metadata.csv")[W1]
-            self.assertEqual(meta1["count_tx"], "2")                      # perp_realized_pnl + fee, no funding
-            self.assertEqual(meta1["first_tx"], wallet_meta._iso(T0 - H))
-            self.assertEqual((meta1["latest_tx"], meta1["active_days"], meta1["last_active"]),
-                             (wallet_meta._iso(T0 - H), "1", "0"))
+            # v1.10.9: a perp fill books perp_realized_pnl + fee only - not token movements - so the
+            # wallet has no l4_wallet_metadata row, but the aggregate still covers the window
+            self.assertNotIn(W1, self._read(ns, "l4_wallet_metadata.csv"))
             wm1 = json.loads((ns / "_watermarks.json").read_text(encoding="utf-8"))[W1]
-            self.assertEqual((wm1["meta"]["count_tx"], wm1["meta"]["through_ms"], wm1["through_ms"]), (2, T0, T0))
+            self.assertEqual((wm1["meta"]["count_tx"], wm1["meta"]["through_ms"], wm1["through_ms"]), (0, T0, T0))
             watch1 = self._read(ns, "wallet_watchlist.csv")[W1]
             white1 = self._read(ns, "token_whitelist.csv")[S.USDC_ADDRESS]
             tok1 = self._read(ns, "l1_token_metadata.csv")[S.USDC_ADDRESS]
@@ -239,10 +243,9 @@ class ExtractRunStampingTests(unittest.TestCase):
             # run 2, one hour later, same fill re-pulled: nothing changed -> every stamp kept
             clock.t = T0s + 3600
             extract.run([W1], 2, out, incremental=True, hip3=False, soft_wallets={W1})
-            meta2 = self._read(ns, "l4_wallet_metadata.csv")[W1]
-            self.assertEqual(meta2, meta1)
+            self.assertNotIn(W1, self._read(ns, "l4_wallet_metadata.csv"))
             wm2 = json.loads((ns / "_watermarks.json").read_text(encoding="utf-8"))[W1]
-            self.assertEqual((wm2["meta"]["count_tx"], wm2["meta"]["through_ms"]), (2, T0 + H))
+            self.assertEqual((wm2["meta"]["count_tx"], wm2["meta"]["through_ms"]), (0, T0 + H))
             self.assertEqual(self._read(ns, "wallet_watchlist.csv")[W1], watch1)
             self.assertEqual(self._read(ns, "token_whitelist.csv")[S.USDC_ADDRESS], white1)
             self.assertEqual(self._read(ns, "l1_token_metadata.csv")[S.USDC_ADDRESS], tok1)
@@ -251,10 +254,9 @@ class ExtractRunStampingTests(unittest.TestCase):
             clock.t = T0s + 7200
             fake.fills = {W1: [fill1, dict(self.FILL, time=T0 + H + H // 2, tid=2, hash="0x" + "cd" * 32, oid=2)]}
             extract.run([W1], 2, out, incremental=True, hip3=False, soft_wallets={W1})
-            meta3 = self._read(ns, "l4_wallet_metadata.csv")[W1]
-            self.assertEqual((meta3["count_tx"], meta3["latest_tx"]), ("4", wallet_meta._iso(T0 + H + H // 2)))
-            self.assertEqual(meta3["first_tx"], meta1["first_tx"])
-            self.assertNotEqual(meta3["updated_at"], meta1["updated_at"])
+            self.assertNotIn(W1, self._read(ns, "l4_wallet_metadata.csv"))              # still perp-only
+            wm3 = json.loads((ns / "_watermarks.json").read_text(encoding="utf-8"))[W1]
+            self.assertEqual((wm3["meta"]["count_tx"], wm3["meta"]["through_ms"]), (0, T0 + 2 * H))
             self.assertEqual(self._read(ns, "l1_token_metadata.csv")[S.USDC_ADDRESS], tok1)   # still unchanged
 
 

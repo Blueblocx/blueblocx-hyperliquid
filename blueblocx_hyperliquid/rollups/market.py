@@ -18,6 +18,13 @@ import pyarrow as pa
 from .common import SUPPLY_EXPR, as_date, ddl_columns, ensure_inputs, midrank_percentile, sample_stdev, table_from_rows
 
 CAP_DAYS = 35               # market_cap_latest days (re)written per run (the ETL loads a 7-day window)
+# v1.10.9 liquidity gate: a non-stable token's market cap may not exceed this many days of
+# its own trailing-7-day average spot volume (turnover >= 0.02 %/day). HyperCore deployers
+# mint the whole cap up front and Info reports circulating == total for most of them, so
+# supply x price alone admitted DRV ($38 B on $1.2 M/day, 30,795 days), ONEAR ($42 B, 14,066),
+# ZAMA (19,352) and LINK0 (676,556) while every genuinely traded token sits far below:
+# HYPE 548, KNTQ 119, TREAD 382, HFUN 864, HPL 636, XMR1 1,716 (2026-10-23 calibration).
+CAP_MAX_TURNOVER_DAYS = 5000
 FEAR_HISTORY_DAYS = 820     # the view's scan: current_date - 820 .. current_date - 1
 FEAR_WINDOW_DAYS = 730      # point-in-time calibration window (calendar days, inclusive)
 FEAR_MIN_WINDOW = 60        # days in the window before a score is printed
@@ -48,23 +55,31 @@ def market_volume_24h(ctx) -> pa.Table:
 def market_cap(ctx, since: dt.date) -> pa.Table:
     """vw_market_cap_1d for bucket_date in [since, today): close x normalized supply with
     the admission gates (supply 1..1e15; stables: close in [0.5, 2]; others: close <
-    1e5, cap < 5e11, >= $10k volume and >= 50 trades that day)."""
+    1e5, cap < 5e11, >= $10k volume and >= 50 trades that day, and cap <=
+    CAP_MAX_TURNOVER_DAYS x the trailing-7-day average daily volume - v1.10.9)."""
     ensure_inputs(ctx, ledger=False, meta=True, px1d=True)
     return ctx.sql(f"""
         WITH n AS (
             SELECT token_address, coalesce(is_stablecoin, false) AS is_stablecoin, {SUPPLY_EXPR} AS total_supply
             FROM meta WHERE (total_supply IS NOT NULL OR total_supply_raw IS NOT NULL)
               -- Unit-bridged assets report their pre-minted pool, not the bridged amount
-              AND coalesce(supply_confidence, '') <> 'low')
+              AND coalesce(supply_confidence, '') <> 'low'),
+        liq AS (
+            SELECT token_address, bucket_date,
+                   avg(coalesce(volume_usd, 0)) OVER (PARTITION BY token_address ORDER BY bucket_date
+                                                      ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS vol_7d
+            FROM px1d)
         SELECT p.token_address, p.bucket_date AS as_of_date, n.total_supply,
                n.total_supply * p.close_price_usd AS total_market_cap, n.is_stablecoin
         FROM px1d p JOIN n ON n.token_address = p.token_address
+        JOIN liq l ON l.token_address = p.token_address AND l.bucket_date = p.bucket_date
         WHERE p.close_price_usd IS NOT NULL AND n.total_supply IS NOT NULL
           AND p.bucket_date >= DATE '{since.isoformat()}' AND p.bucket_date < DATE '{ctx.today.isoformat()}'
           AND n.total_supply BETWEEN 1 AND 1e15
           AND (CASE WHEN n.is_stablecoin THEN p.close_price_usd BETWEEN 0.5 AND 2.0
                     ELSE p.close_price_usd < 1e5 AND n.total_supply * p.close_price_usd < 5e11
-                         AND coalesce(p.volume_usd, 0) >= 1e4 AND coalesce(p.num_trades, 0) >= 50 END)
+                         AND coalesce(p.volume_usd, 0) >= 1e4 AND coalesce(p.num_trades, 0) >= 50
+                         AND n.total_supply * p.close_price_usd <= {CAP_MAX_TURNOVER_DAYS} * l.vol_7d END)
         ORDER BY 1, 2
     """)
 

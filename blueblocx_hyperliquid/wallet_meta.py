@@ -13,10 +13,13 @@ from every row held in staging up to the covered instant (disk + this run = up t
 days of staging, i.e. "since go-live" on the production host). Deleting a wallet's
 `meta` key re-seeds it the same way on the next run.
 
-Semantics (docs/ETL_HANDOFF_HYPERCORE.md section 7): funding rows are excluded
-everywhere (a mechanical hourly flow, not activity); first_tx / latest_tx = the
-first / latest non-funding event instants (= first/latest_block_timestamp);
-count_tx = non-funding ledger rows; active_days = distinct UTC days with activity;
+Semantics (docs/ETL_HANDOFF_HYPERCORE.md section 7): perp cashflow rows (perp PnL,
+fee, funding) and income rows (staking reward, interest) are excluded everywhere -
+v1.10.9, the same set wallet_transactions drops via HL_WALLET_TX_EVENT_TYPES, so
+count_tx matches the rows a consumer can see there; first_tx / latest_tx = the
+first / latest token-movement instants (= first/latest_block_timestamp);
+count_tx = token-movement ledger rows (spot_fill, transfer, deposit, withdraw, mint,
+burn); active_days = distinct UTC days with such activity;
 last_active = whole UTC days since the latest event (0 = active today);
 active_on_avg = NULL (no agreed definition). A wallet with no non-funding activity
 covered yet has no row.
@@ -27,7 +30,9 @@ import datetime as dt
 
 from . import schema as S
 
-META_EXCLUDED_EVENT_TYPES = frozenset({S.EVT_FUNDING})
+# v1.10.9: everything that is not a token movement (was: funding only). Keep equal to
+# the complement of the wallet_transactions event filter on the ETL side.
+META_EXCLUDED_EVENT_TYPES = frozenset(S.REALIZED_PNL_EVENT_TYPES)
 
 
 def empty() -> dict:
