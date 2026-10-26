@@ -54,6 +54,17 @@ def _is_spot(coin: str) -> bool:
     # Spot coins are named "BASE/USDC" (canonical) or "@index" (non-canonical).
     return "/" in coin or coin.startswith("@")
 
+def spot_market_counterparty(coin: str, pair) -> str:
+    """Counterparty label for a spot fill: "market:<BASE>/<QUOTE>" from spotMeta,
+    or "market:<coin>" ("market:@188") when the pair is unknown. The "market:"
+    prefix is the contract with the website (it renders "Market HYPE/USDC" and
+    explains that an order-book market is not a wallet); _ledger_row lowercases
+    it like every counterparty, so consumers must compare case-insensitively."""
+    if pair is not None:
+        return f"market:{pair.base.symbol}/{pair.quote.symbol}"
+    return f"market:{coin}"
+
+
 
 class TokenRegistry:
     """Accumulates token identity/metadata seen while mapping, so extract.py can
@@ -167,6 +178,11 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
             px = float(f["px"])
             quote_notional = sz * px
             buy = f.get("side") == "B"
+            # A spot fill settles against the order book, not a wallet. Name the
+            # market as the counterparty so downstream (wallet_transactions on
+            # the site) can say "Market HYPE/USDC" instead of showing NULL or the
+            # raw Hyperliquid pair id ("@188"). See spot_market_counterparty().
+            market_cp = spot_market_counterparty(coin, pair)
 
             if pair is not None:
                 base_t = _token_tuple(pair.base, pair.base.symbol)
@@ -181,13 +197,13 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
 
             rows.append(_ledger_row(
                 block_timestamp_ms=t, tx_hash=h, event_index=S.LEG_SPOT_BASE,
-                event_type=S.EVT_SPOT_FILL, wallet=wallet, counterparty=None,
+                event_type=S.EVT_SPOT_FILL, wallet=wallet, counterparty=market_cp,
                 token_address=base_t[0], token_symbol=base_t[1], decimals=base_t[2],
                 amount=sz, direction=S.DIRECTION_IN if buy else S.DIRECTION_OUT,
                 now_iso=now_iso, registry=registry, is_stablecoin=base_t[3]))
             rows.append(_ledger_row(
                 block_timestamp_ms=t, tx_hash=h, event_index=S.LEG_SPOT_QUOTE,
-                event_type=S.EVT_SPOT_FILL, wallet=wallet, counterparty=None,
+                event_type=S.EVT_SPOT_FILL, wallet=wallet, counterparty=market_cp,
                 token_address=quote_t[0], token_symbol=quote_t[1], decimals=quote_t[2],
                 amount=quote_notional,
                 direction=S.DIRECTION_OUT if buy else S.DIRECTION_IN,
@@ -203,6 +219,7 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
                     direction=S.DIRECTION_IN if closed > 0 else S.DIRECTION_OUT,
                     now_iso=now_iso, registry=registry, is_stablecoin=cash[3]))
             fee_leg = S.LEG_PERP_FEE
+            market_cp = None
 
         # Fee leg. HL charges the fee in the RECEIVED asset: USDC for perps and
         # spot sells, the BASE token for spot buys — emit it in its real token.
@@ -218,7 +235,7 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
                     log.warning("fee token %s not in spotMeta — decimals=0", fee_token)
             rows.append(_ledger_row(
                 block_timestamp_ms=t, tx_hash=h, event_index=fee_leg,
-                event_type=S.EVT_PERP_FEE, wallet=wallet, counterparty=coin,
+                event_type=S.EVT_PERP_FEE, wallet=wallet, counterparty=market_cp or coin,
                 token_address=ft[0], token_symbol=ft[1], decimals=ft[2],
                 amount=abs(fee), direction=S.DIRECTION_OUT if fee > 0 else S.DIRECTION_IN,
                 now_iso=now_iso, registry=registry, is_stablecoin=ft[3]))
@@ -228,7 +245,7 @@ def map_fills_to_ledger(fills: list[dict], wallet: str, now_iso: str,
                 block_timestamp_ms=t, tx_hash=h,
                 event_index=(S.LEG_SPOT_BUILDER_FEE if _is_spot(coin)
                              else S.LEG_PERP_BUILDER_FEE),
-                event_type=S.EVT_PERP_FEE, wallet=wallet, counterparty=coin,
+                event_type=S.EVT_PERP_FEE, wallet=wallet, counterparty=market_cp or coin,
                 token_address=cash[0], token_symbol=cash[1],
                 decimals=cash[2], amount=abs(builder_fee),
                 direction=S.DIRECTION_OUT if builder_fee > 0 else S.DIRECTION_IN,

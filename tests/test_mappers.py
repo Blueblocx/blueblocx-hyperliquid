@@ -170,6 +170,23 @@ class ContentAddressedKeyTests(unittest.TestCase):
                          "spot BUY fee is charged in the received (base) token")
         self.assertEqual(base["decimals"], 8)
 
+    def test_spot_legs_name_the_market_as_counterparty(self):
+        # A spot fill settles against the order book: base, quote AND fee legs
+        # carry "market:<BASE>/<QUOTE>" (lowercased like every counterparty) so the
+        # site can say "Market HYPE/USDC" instead of NULL or the raw pair id.
+        rows, _ = map_all(WALLET_A, fills=[spot_fill(5, 1_700_000_000_000)])
+        self.assertEqual({r["counterparty_address"] for r in rows}, {"market:hype/usdc"})
+
+    def test_unknown_spot_pair_keeps_the_raw_coin_in_the_market_label(self):
+        rows, _ = map_all(WALLET_A, fills=[spot_fill(6, 1_700_000_000_000, coin="@999",
+                                                     fee_token="USDC")])
+        self.assertEqual({r["counterparty_address"] for r in rows}, {"market:@999"})
+
+    def test_perp_fee_leg_keeps_the_coin_as_counterparty(self):
+        rows, _ = map_all(WALLET_A, fills=[perp_fill(7, 1_700_000_000_000)])
+        fee = next(r for r in rows if r["event_type"] == S.EVT_PERP_FEE)
+        self.assertEqual(fee["counterparty_address"], "btc")
+
     def test_idempotent_mapping(self):
         t = 1_700_000_000_000
         args = dict(fills=[perp_fill(1, t), spot_fill(2, t)],
