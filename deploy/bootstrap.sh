@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.10.11}"
+RELEASE_TAG="${RELEASE_TAG:-v1.10.12}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -316,6 +316,7 @@ ensure_env HL_ROLLUP_DUCKDB_THREADS 4 "v1.10.11: DuckDB threads of the rollup ru
 ensure_env HL_ROLLUP_BALANCE_CHUNK_ROWS 2000000 "v1.10.11: per-wallet rollup engines process wallets in chunks of about this many ledger rows"
 ensure_env HL_UPSERT_STREAM_MIN_BYTES 268435456 "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB (bounded memory) instead of Python dicts"
 ensure_env HL_UPSERT_DUCKDB_MEMORY 16GB "v1.10.11: DuckDB memory_limit of the staged-CSV upsert (spills to <state dir>/.duckdb/upsert)"
+ensure_env HL_ROLLUP_WALLET_BATCH_ROWS 8000000 "v1.10.12: the per-wallet rollup chain records its progress per batch of about this many ledger rows (a backlog drains across runs)"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then

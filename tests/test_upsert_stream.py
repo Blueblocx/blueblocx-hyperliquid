@@ -4,6 +4,7 @@ round trip of what DuckDB writes."""
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import os
 import shutil
 import tempfile
@@ -204,6 +205,162 @@ class StreamingUpsertParityTests(unittest.TestCase):
         with _Env(HL_UPSERT_DUCKDB_MEMORY="not a size"):
             with self.assertRaises(ValueError):
                 csv_merge.duckdb_memory_limit()
+
+
+class EdgeCaseTests(unittest.TestCase):
+    """v1.10.12: the two parity gaps found in review (an empty existing file, duplicate
+    keys already in the OLD file) and the retention prune's bounded-memory paths."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="hl-upsert-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_zero_byte_existing_file_streams_like_a_missing_one(self):
+        a, b = self.dir / "dict.csv", self.dir / "duck.csv"
+        a.touch()
+        b.touch()
+        self.assertEqual(b.stat().st_size, 0)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"), \
+                self.assertLogs("blueblocx_hyperliquid.extract", level="INFO") as logs:
+            extract.upsert_csv(a, COLS, NEW, key_fn=key_fn, sort_fn=sort_fn)
+            n = extract.upsert_csv(b, COLS, NEW, key_fn=key_fn, sort_fn=sort_fn, key_cols=KEY_COLS, sort_cols=SORT_COLS)
+        self.assertIn("(duckdb path)", "\n".join(logs.output))
+        self.assertEqual(n, 3)
+        self.assertEqual(read(a), read(b))
+        # header-only file: the same
+        c = self.dir / "header.csv"
+        c.write_text(",".join(COLS) + "\r\n", encoding="utf-8")
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"):
+            extract.upsert_csv(c, COLS, NEW, key_fn=key_fn, sort_fn=sort_fn, key_cols=KEY_COLS, sort_cols=SORT_COLS)
+        self.assertEqual(read(c), read(a))
+
+    def test_duplicate_keys_in_the_old_file_collapse_like_the_dict_path(self):
+        dup = [row("2026-11-01T00:00:00+00:00", "0xa", 0, "in", 1, "first"),
+               row("2026-11-02T00:00:00+00:00", "0xa", 0, "in", 2, "second (later, last in file order)"),
+               row("2026-11-03T00:00:00+00:00", "0xb", 1, "out", 3, "unique")]
+        a, b = self.dir / "dict.csv", self.dir / "duck.csv"
+        for p in (a, b):
+            with p.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=COLS)
+                w.writeheader()
+                for r in dup:
+                    w.writerow({c: ("" if r.get(c) is None else r[c]) for c in COLS})
+        # no new rows: the dict path keeps the LAST occurrence of 0xa/0/in
+        extract.upsert_csv(a, COLS, [], key_fn=key_fn, sort_fn=sort_fn)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"), \
+                self.assertLogs("blueblocx_hyperliquid.csv_merge", level="WARNING") as logs:
+            n = extract.upsert_csv(b, COLS, [], key_fn=key_fn, sort_fn=sort_fn, key_cols=KEY_COLS, sort_cols=SORT_COLS)
+        self.assertIn("collapsing the duplicates", "\n".join(logs.output))
+        self.assertEqual(n, 2)
+        self.assertEqual(read(a), read(b))
+        self.assertEqual([r["note"] for r in read(b)], ["second (later, last in file order)", "unique"])
+        # with a new row for the duplicated key both paths keep only the new row
+        new = [row("2026-11-04T00:00:00+00:00", "0xa", 0, "in", 9, "new")]
+        extract.upsert_csv(a, COLS, new, key_fn=key_fn, sort_fn=sort_fn)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"):
+            extract.upsert_csv(b, COLS, new, key_fn=key_fn, sort_fn=sort_fn, key_cols=KEY_COLS, sort_cols=SORT_COLS)
+        self.assertEqual(read(a), read(b))
+        self.assertEqual([r["note"] for r in read(b)], ["unique", "new"])
+
+    # --- retention prune ------------------------------------------------------------------
+    PRUNE_ROWS = [
+        row("2026-09-01T00:00:00+00:00", "0xold", 0, "in", 1, "old, dropped"),
+        row("2026-09-30T23:59:59.999000+00:00", "0xold", 1, "in", 1, "just before the cutoff"),
+        row("2026-10-01T00:00:00+00:00", "0xedge", 0, "in", 1, "at the cutoff: kept"),
+        row("2026-10-02T00:00:00Z", "0xz", 0, "in", 1, "Z suffix, kept"),
+        row("not a timestamp", "0xbad", 0, "in", 1, "unparseable: kept"),
+        row("", "0xempty", 0, "in", 1, "empty: kept"),
+        row("2026-10-03T00:00:00+00:00", "0xq", 0, "in", 1, 'quoted "value", with\nnewline and ü'),
+        row("2026-10-04T00:00:00+00:00", "0xn", 5, "out", None, None),
+    ]
+    CUTOFF_MS = int(dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc).timestamp() * 1000)
+
+    def _write(self, p: Path, rows):
+        with p.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=COLS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: ("" if r.get(c) is None else r[c]) for c in COLS})
+
+    def _reference_prune(self, rows, cutoff_ms):
+        """What the pre-v1.10.12 list-based prune_csv kept, in file order."""
+        kept = []
+        for r in rows:
+            ts = r["block_timestamp"]
+            try:
+                old = bool(ts) and extract._iso_to_ms(ts) < cutoff_ms
+            except ValueError:
+                old = False
+            if not old:
+                kept.append({c: ("" if r.get(c) is None else str(r[c])) for c in COLS})
+        return kept
+
+    def test_prune_streaming_and_duckdb_match_the_reference(self):
+        ref = self._reference_prune(self.PRUNE_ROWS, self.CUTOFF_MS)
+        self.assertEqual(len(ref), len(self.PRUNE_ROWS) - 2)
+        a, b = self.dir / "stream.csv", self.dir / "duck.csv"
+        self._write(a, self.PRUNE_ROWS)
+        self._write(b, self.PRUNE_ROWS)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES=str(10 ** 12)):                   # never DuckDB
+            ra = extract.prune_csv(a, "block_timestamp", self.CUTOFF_MS)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"), \
+                self.assertLogs("blueblocx_hyperliquid.extract", level="INFO") as logs:   # always DuckDB
+            rb = extract.prune_csv(b, "block_timestamp", self.CUTOFF_MS)
+        self.assertIn("DuckDB prune", "\n".join(logs.output))
+        self.assertEqual(ra, {"kept": len(ref), "dropped": 2})
+        self.assertEqual(rb, ra)
+        self.assertEqual(read(a), ref)                                            # rows, strings and ORDER
+        self.assertEqual(read(b), ref)
+        self.assertEqual(iceberg_load.read_csv_rows(b), ref)
+        self.assertFalse((self.dir / "stream.csv.tmp").exists())
+        self.assertFalse((self.dir / "duck.csv.tmp").exists())
+
+    def test_prune_leaves_the_file_untouched_when_nothing_is_old(self):
+        a, b = self.dir / "stream.csv", self.dir / "duck.csv"
+        self._write(a, self.PRUNE_ROWS)
+        self._write(b, self.PRUNE_ROWS)
+        before_a, before_b = a.read_bytes(), b.read_bytes()
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES=str(10 ** 12)):
+            ra = extract.prune_csv(a, "block_timestamp", 0)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"):
+            rb = extract.prune_csv(b, "block_timestamp", 0)
+        self.assertEqual(ra, {"kept": len(self.PRUNE_ROWS), "dropped": 0})
+        self.assertEqual(rb, ra)
+        self.assertEqual(a.read_bytes(), before_a)                                 # byte-identical: no rewrite
+        self.assertEqual(b.read_bytes(), before_b)
+        self.assertFalse((self.dir / "stream.csv.tmp").exists())
+        # a column the file lacks, a missing file and an empty file: nothing dropped
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"):
+            self.assertEqual(extract.prune_csv(b, "no_such_col", 10 ** 15), {"kept": len(self.PRUNE_ROWS), "dropped": 0})
+            self.assertEqual(extract.prune_csv(self.dir / "missing.csv", "block_timestamp", 1), {"kept": 0, "dropped": 0})
+            empty = self.dir / "empty.csv"
+            empty.touch()
+            self.assertEqual(extract.prune_csv(empty, "block_timestamp", 1), {"kept": 0, "dropped": 0})
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES=str(10 ** 12)):
+            self.assertEqual(extract.prune_csv(b, "no_such_col", 10 ** 15), {"kept": len(self.PRUNE_ROWS), "dropped": 0})
+
+    def test_prune_the_real_ledger_columns_both_ways(self):
+        base = {c: None for c in S.L1_WALLET_LEDGER_COLUMNS}
+        rows = [dict(base, block_timestamp=f"2026-10-{d:02d}T06:29:57.038000+00:00", block_date=f"2026-10-{d:02d}",
+                     tx_hash=f"hlcore:0xabc:tid:{d}", event_index=0, event_type="perp_realized_pnl", wallet_address="0xabc",
+                     wallet_group=3234, counterparty_address="imx", token_address="hlcore:usdc", direction="in",
+                     amount_raw=d * 1e6, decimals=6, amount=d, amount_signed=float(d),
+                     created_at="2026-11-01T00:00:00+00:00", updated_at="2026-11-01T00:00:00+00:00") for d in range(1, 11)]
+        cutoff = extract._iso_to_ms("2026-10-05T00:00:00+00:00")
+        a, b = self.dir / "la.csv", self.dir / "lb.csv"
+        for p in (a, b):
+            with p.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=S.L1_WALLET_LEDGER_COLUMNS)
+                w.writeheader()
+                for r in rows:
+                    w.writerow({c: ("" if r.get(c) is None else r[c]) for c in S.L1_WALLET_LEDGER_COLUMNS})
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES=str(10 ** 12)):
+            ra = extract.prune_csv(a, "block_timestamp", cutoff)
+        rb = csv_merge.prune_csv_duckdb(b, "block_timestamp", cutoff, memory_limit="256MB", threads=1)
+        self.assertEqual(ra, {"kept": 6, "dropped": 4})
+        self.assertEqual(rb, ra)
+        self.assertEqual(read(a), read(b))
+        self.assertEqual([r["block_date"] for r in read(b)], [f"2026-10-{d:02d}" for d in range(5, 11)])
 
 
 if __name__ == "__main__":

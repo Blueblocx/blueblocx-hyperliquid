@@ -45,8 +45,12 @@ those wallets' ledgers); the run summary and control.table_watermarks say so.
 
 Time budget: HL_ROLLUP_TIME_BUDGET_MIN (8). A table whose turn comes after the
 budget is spent is SKIPPED and reported (run summary `rollups.skipped`, a warning),
-never silently; the next run picks it up because the state marker only advances
-for tables that were written. Engine ORDER (v1.10.11): the cheap global groups
+never silently; the next run picks it up. The per-wallet chain runs in wallet
+BATCHES (HL_ROLLUP_WALLET_BATCH_ROWS ledger rows, v1.10.12) and records every
+finished batch in `_rollup_state.json[wallets_through]`, so a backlog the budget
+cannot absorb in one hour drains across runs (run() has the model; before, the
+marker only moved when the whole chain fit the budget and a backlog never drained).
+Engine ORDER (v1.10.11): the cheap global groups
 (categories, market, tokens, signals, quality, pairs, flows, activity: seconds
 each, no wallet inputs) run first, the heavy per-wallet chain (balances ->
 networth -> fifo -> positions -> ranks: minutes) last, so a run that cannot afford
@@ -381,8 +385,9 @@ def _engines() -> list[tuple[str, list[str], Callable[[Context], dict[str, pa.Ta
        `priced_statement` -> positions reads those three -> ranks reads the WRITTEN
        l4_wallet_pnl_realized_1d / l4_wallet_networth_1d_dense / l4_wallet_balance_*
        back from the lake, so it comes last.
-    networth and positions call their producer themselves when its tables were not
-    registered this run (a --tables subset), which keeps the subset path correct.
+    networth, fifo and positions call their producer themselves when its tables were
+    not registered this run (a --tables subset), which keeps the subset path correct.
+    run() executes the chain per wallet batch (WALLET_CHAIN, _run_wallet_chain).
     """
     from . import activity, balances, categories, fifo, flows, market, networth, pairs, positions, quality, ranks, signals, tokens
     return [
@@ -408,6 +413,13 @@ def _engines() -> list[tuple[str, list[str], Callable[[Context], dict[str, pa.Ta
 
 # the groups that read nothing another engine registers (tests pin the order)
 GLOBAL_GROUPS = ("categories", "market", "tokens", "signals", "quality", "pairs", "flows", "activity")
+# the per-wallet chain, run per wallet BATCH with the progress recorded after each batch
+# (v1.10.12; run() has the rationale); ranks follows it, reading the written tables back
+WALLET_CHAIN = ("balances", "networth", "fifo", "positions")
+# aliases bound to the wallets of ONE batch (the ledger slice, its anchors and what the
+# chain engines register for each other): dropped between batches
+BATCH_ALIASES = ("ledger", "spot_snap", "balance_per_tx_new", "balance_1d_new", "balance_openings",
+                 "networth_1d_new", "fifo_state_new", "fifo_pair_realized", "priced_statement")
 # consumer group -> the producer groups that must have run before it
 ENGINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "networth": ("balances",),
@@ -417,12 +429,210 @@ ENGINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 }
 
 
+def wallet_batch_rows() -> int:
+    """HL_ROLLUP_WALLET_BATCH_ROWS (8,000,000): about how many ledger rows of changed
+    wallets the per-wallet chain processes between two progress marks (one batch =
+    balances -> networth -> fifo -> positions for its wallets, written, then recorded
+    in `_rollup_state.json[wallets_through]`)."""
+    return max(1, config.env_int("HL_ROLLUP_WALLET_BATCH_ROWS", 8_000_000))
+
+
+def _later(a: str | None, b: str | None) -> bool:
+    """Stamp `a` is later than stamp `b` (None = never)."""
+    if a is None:
+        return False
+    if b is None:
+        return True
+    try:
+        return dt.datetime.fromisoformat(a) > dt.datetime.fromisoformat(b)
+    except ValueError:
+        return a > b
+
+
+def changed_wallet_stamps(ctx: Context, since_iso: str | None) -> dict[str, str]:
+    """wallet -> its newest ledger stamp (updated_at) among the rows stamped after
+    `since_iso` (None since = every wallet in the ledger, with its newest stamp)."""
+    from pyiceberg.expressions import AlwaysTrue, GreaterThan
+    table = ctx._table("l1_wallet_ledger")
+    flt = GreaterThan("updated_at", since_iso) if since_iso else AlwaysTrue()
+    arrow = table.scan(row_filter=flt, selected_fields=("wallet_address", "updated_at")).to_arrow()
+    if arrow.num_rows == 0:
+        return {}
+    agg = arrow.group_by("wallet_address").aggregate([("updated_at", "max")])
+    return {w: s.isoformat() for w, s in zip(agg.column("wallet_address").to_pylist(),
+                                             agg.column("updated_at_max").to_pylist()) if w is not None and s is not None}
+
+
+def changed_wallets(ctx: Context, since_iso: str | None) -> tuple[list[str], str | None]:
+    """Wallets with ledger rows stamped after `since_iso`, and the newest ledger stamp
+    seen (the next marker). None since = every wallet in the ledger."""
+    stamps = changed_wallet_stamps(ctx, since_iso)
+    return sorted(stamps), newest_stamp(stamps, since_iso)
+
+
+def newest_stamp(stamps: dict[str, str], default: str | None) -> str | None:
+    newest = default
+    for s in stamps.values():
+        if _later(s, newest):
+            newest = s
+    return newest
+
+
+def pending_wallets(stamps: dict[str, str], state: dict, full: bool) -> dict[str, str]:
+    """The changed wallets the chain still has to process: those whose newest stamp is
+    later than what `_rollup_state.json[wallets_through]` recorded for them (a batch
+    written by an earlier run that could not finish the whole set). --full: all."""
+    done = {} if full else (state.get("wallets_through") or {})
+    return {w: s for w, s in stamps.items() if full or _later(s, done.get(w))}
+
+
+def _merge_counts(tables: dict, name: str, counts: dict) -> None:
+    """Accumulate a table's write counts across the wallet batches of one run."""
+    cur = tables.get(name)
+    if cur is None:
+        tables[name] = dict(counts)
+        return
+    for k in ("incoming", "written", "commits", "seconds"):
+        if counts.get(k) is not None:
+            cur[k] = round((cur.get(k) or 0) + counts[k], 1) if k == "seconds" else (cur.get(k) or 0) + counts[k]
+    for k in ("table_total", "snapshot_id", "dry_run", "deleted_scope"):
+        if k in counts:
+            cur[k] = counts[k]
+    cur["batches"] = cur.get("batches", 1) + 1
+
+
+def _run_group(ctx: Context, group: str, wanted: list[str], compute, *, ddl: dict, now: dt.datetime, dry_run: bool,
+               report: dict, pending_wm: list, written_tables: list[str], t0: float | None = None) -> bool:
+    """Compute one group and write its wanted tables. Returns True when every wanted
+    table was written (dry run: computed); an exception in the engine or a writer is
+    recorded in report['errors'] and never sinks the other groups."""
+    t0 = time.monotonic() if t0 is None else t0
+    try:
+        outputs = compute(ctx)
+    except Exception as e:  # noqa: BLE001 - one group must not sink the others
+        log.exception("rollups: %s failed", group)
+        report["errors"][group] = f"{type(e).__name__}: {str(e)[:300]}"
+        for t in wanted:
+            pending_wm.append((t, "updated_at", None, None, None, None, il.WM_STATUS_FAILED))
+        return False
+    ok = True
+    for name in wanted:
+        arrow = outputs.get(name)
+        if arrow is None:
+            ok = False
+            continue
+        ctx.outputs[name] = arrow
+        try:
+            counts = write_table(ctx, name, arrow, ddl, dry_run=dry_run)
+        except Exception as e:  # noqa: BLE001
+            log.exception("rollups: write %s failed", name)
+            report["errors"][name] = f"{type(e).__name__}: {str(e)[:300]}"
+            pending_wm.append((name, "updated_at", None, None, None, None, il.WM_STATUS_FAILED))
+            ok = False
+            continue
+        counts["seconds"] = round(time.monotonic() - t0, 1)
+        _merge_counts(report["tables"], name, counts)
+        if not dry_run:
+            if counts.get("commits"):
+                written_tables.append(name)
+                date_col = PLAN[name]["date"]
+                wm_date = il._max_value(arrow, date_col) if date_col and arrow.num_rows else None
+                if isinstance(wm_date, dt.datetime):
+                    wm_date = wm_date.date()
+                pending_wm.append((name, "updated_at", now, counts.get("table_total"), counts.get("snapshot_id"),
+                                   wm_date, il.WM_STATUS_OK))
+            else:
+                ok = False
+        log.info("rollups: %-34s rows=%7d commits=%d %.1fs", name, counts["incoming"], counts.get("commits", 0),
+                 counts["seconds"])
+    return ok
+
+
+def _run_wallet_chain(ctx: Context, chain: list[tuple[str, list[str], Callable]], *, stamps: dict[str, str],
+                      pending: dict[str, str], full: bool, budget: Budget, state: dict, ns_dir: Path, ddl: dict,
+                      now: dt.datetime, dry_run: bool, record_progress: bool, report: dict, pending_wm: list,
+                      written_tables: list[str], batch_rows: int | None = None) -> bool:
+    """balances -> networth -> fifo -> positions for the pending wallets, one wallet
+    BATCH at a time (about `batch_rows` ledger rows, a wallet never split): every batch
+    is computed, written and - when `record_progress` - recorded in
+    state['wallets_through'] before the next one starts, and the time budget is
+    checked between batches. Returns True when every pending wallet was processed."""
+    from .common import ledger_chunk, wallet_chunks
+    wallets = sorted(pending)
+    # the ledger of every pending wallet (READ_DAYS), loaded from the lake ONCE as Arrow
+    # and sliced per batch below (a lake scan per batch would re-read every data file)
+    ctx.wallets = None if (full and ctx.all_wallets) else wallets
+    ctx.unregister("ledger_changed")
+    ctx.load("l1_wallet_ledger", date_col="block_date", alias="ledger_changed")
+    batches = wallet_chunks(ctx, "ledger_changed", batch_rows or wallet_batch_rows())
+    seen = {w for b in batches for w in b}
+    rest = [w for w in wallets if w not in seen]        # changed, but no ledger row inside READ_DAYS
+    if rest:
+        batches.append(rest)
+    ctx.all_wallets = False                             # every write below is scoped to its batch's wallets
+    report["wallet_batches"] = len(batches)
+    report.setdefault("wallets_done", 0)
+    report.setdefault("wallets_failed", 0)
+    done_all = True
+    for i, batch in enumerate(batches, 1):
+        if budget.exhausted():
+            left = sum(len(b) for b in batches[i - 1:])
+            report["wallets_pending"] = left
+            for _g, wanted, _c in chain:
+                report["skipped"] += [t for t in wanted if t not in report["skipped"]]
+            log.warning("rollups: time budget spent after %d of %d wallet batches; %d wallets wait for the next run",
+                        i - 1, len(batches), left)
+            done_all = False
+            break
+        t0 = time.monotonic()
+        for alias in BATCH_ALIASES:
+            ctx.unregister(alias)
+        ctx.wallets = list(batch)
+        ctx.register("ledger", ledger_chunk(ctx, list(batch), "SELECT * FROM ledger_changed"))
+        ok = True
+        for group, wanted, compute in chain:
+            ok = _run_group(ctx, group, wanted, compute, ddl=ddl, now=now, dry_run=dry_run, report=report,
+                            pending_wm=pending_wm, written_tables=written_tables) and ok
+        if not ok:
+            report["wallets_failed"] += len(batch)
+            done_all = False
+            log.error("rollups: wallet batch %d/%d (%d wallets) failed; its wallets stay pending", i, len(batches), len(batch))
+            continue
+        report["wallets_done"] += len(batch)
+        if not dry_run and record_progress:
+            through = state.setdefault("wallets_through", {})
+            for w in batch:
+                if w in stamps:
+                    through[w] = stamps[w]
+            write_state(ns_dir, state)
+        log.info("rollups: wallet batch %d/%d (%d wallets, %d ledger rows) done in %.1fs", i, len(batches), len(batch),
+                 ctx._loaded.get("ledger", 0), time.monotonic() - t0)
+    for alias in BATCH_ALIASES + ("ledger_changed",):
+        ctx.unregister(alias)
+    return done_all
+
+
 def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: float | None = None,
         tables: list[str] | None = None, full: bool = False, dry_run: bool = False,
-        namespace: str = S.NS_HYPERCORE, read_catalog=None) -> dict:
+        namespace: str = S.NS_HYPERCORE, read_catalog=None, batch_rows: int | None = None) -> dict:
     """Compute and write the rollup tables. Returns the report the run summary embeds.
     `read_catalog` (tests / rehearsals): read the lake inputs from another catalog
-    than the one the rollup tables are written to."""
+    than the one the rollup tables are written to.
+
+    Progress model (v1.10.12). The global groups run first (seconds each). The
+    per-wallet chain then runs in wallet batches of about HL_ROLLUP_WALLET_BATCH_ROWS
+    ledger rows; after each batch its wallets are recorded in
+    `_rollup_state.json[wallets_through]` (wallet -> the newest ledger stamp folded),
+    and the budget is checked BETWEEN batches. A run that runs out of budget leaves
+    the finished batches durable; the next run's `changed_wallets` only sees wallets
+    whose newest stamp is later than their recorded one, so a backlog drains across
+    runs instead of being recomputed from scratch each hour (before v1.10.12 the
+    marker `ledger_through` only moved when the WHOLE chain fit the budget: at ~60
+    changed wallets it never did again, and every hour redid the same work). When
+    every changed wallet is done, `ledger_through` becomes the newest stamp and
+    `wallets_through` is cleared. Progress is recorded only when every wallet-kind
+    table is in scope (no --tables subset of the chain) and never on --dry-run.
+    `ranks` (cross-wallet, reads the written tables back) runs after the chain."""
     now = now or utcnow()
     budget = Budget(config.env_float("HL_ROLLUP_TIME_BUDGET_MIN") if budget_min is None else budget_min)
     state = read_state(ns_dir)
@@ -436,78 +646,76 @@ def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: fl
             report["skipped"] = list(PLAN)
             report["note"] = "no ledger in the lake yet"
             return report
-        wallets, newest = changed_wallets(probe, since)
+        stamps = changed_wallet_stamps(probe, since)
     finally:
         probe.close()
+    newest = newest_stamp(stamps, since)
+    pending = pending_wallets(stamps, state, full)
     all_wallets = since is None
-    report["changed_wallets"] = len(wallets)
+    report["changed_wallets"] = len(stamps)
+    report["wallets_pending_before"] = len(pending)
     report["ledger_through"] = newest
-    if not wallets and not full:
+    if not stamps and not full:
         report["note"] = "no new ledger rows since the previous rollup"
-        # cross-wallet 24h tables still move with the clock: recompute them
-        wallets = None
-    ctx = Context(catalog, namespace, now, wallets=(None if all_wallets else wallets), all_wallets=all_wallets,
+    elif not pending:
+        report["note"] = "every changed wallet was already rolled up by an earlier run"
+    wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet"]
+    # the marker moves only when the whole chain is in scope: a --tables subset of it
+    # must not mark wallets done for the tables it did not refresh
+    record_progress = all(not tables or t in tables for t in wallet_tables)
+    ctx = Context(catalog, namespace, now, wallets=(None if all_wallets else sorted(pending)), all_wallets=all_wallets,
                   read_catalog=read_catalog)
     pending_wm: list[tuple] = []
     written_tables: list[str] = []
+    chain_done = True
     try:
-        for group, produced, compute in _engines():
+        engines = _engines()
+        chain = [(g, [t for t in p if not tables or t in tables], c) for g, p, c in engines if g in WALLET_CHAIN]
+        chain = [(g, w, c) for g, w, c in chain if w]
+        chain_ran = False
+        for group, produced, compute in engines:
+            if group in WALLET_CHAIN:
+                if chain_ran or not chain:
+                    continue
+                chain_ran = True
+                if not pending:
+                    continue                           # nothing changed for the per-wallet tables
+                if budget.exhausted():
+                    for _g, wanted, _c in chain:
+                        report["skipped"] += wanted
+                    report["wallets_pending"] = len(pending)
+                    chain_done = False
+                    continue
+                chain_done = _run_wallet_chain(ctx, chain, stamps=stamps, pending=pending, full=full, budget=budget,
+                                               state=state, ns_dir=ns_dir, ddl=ddl, now=now, dry_run=dry_run,
+                                               record_progress=record_progress, report=report, pending_wm=pending_wm,
+                                               written_tables=written_tables, batch_rows=batch_rows)
+                continue
             wanted = [t for t in produced if not tables or t in tables]
             if not wanted:
                 continue
             if budget.exhausted():
                 report["skipped"] += wanted
                 continue
-            if ctx.wallets is not None and not ctx.wallets and all(PLAN[t]["kind"] == "wallet" for t in wanted):
-                continue                               # nothing changed for per-wallet tables
-            t0 = time.monotonic()
-            try:
-                outputs = compute(ctx)
-            except Exception as e:  # noqa: BLE001 - one group must not sink the others
-                log.exception("rollups: %s failed", group)
-                report["errors"][group] = f"{type(e).__name__}: {str(e)[:300]}"
-                for t in wanted:
-                    pending_wm.append((t, "updated_at", None, None, None, None, il.WM_STATUS_FAILED))
-                continue
-            for name in wanted:
-                arrow = outputs.get(name)
-                if arrow is None:
-                    continue
-                ctx.outputs[name] = arrow
-                try:
-                    counts = write_table(ctx, name, arrow, ddl, dry_run=dry_run)
-                except Exception as e:  # noqa: BLE001
-                    log.exception("rollups: write %s failed", name)
-                    report["errors"][name] = f"{type(e).__name__}: {str(e)[:300]}"
-                    pending_wm.append((name, "updated_at", None, None, None, None, il.WM_STATUS_FAILED))
-                    continue
-                counts["seconds"] = round(time.monotonic() - t0, 1)
-                report["tables"][name] = counts
-                if not dry_run and counts.get("commits"):
-                    written_tables.append(name)
-                    date_col = PLAN[name]["date"]
-                    wm_date = il._max_value(arrow, date_col) if date_col and arrow.num_rows else None
-                    if isinstance(wm_date, dt.datetime):
-                        wm_date = wm_date.date()
-                    pending_wm.append((name, "updated_at", now, counts.get("table_total"), counts.get("snapshot_id"),
-                                       wm_date, il.WM_STATUS_OK))
-                log.info("rollups: %-34s rows=%7d commits=%d %.1fs", name, counts["incoming"], counts.get("commits", 0),
-                         counts["seconds"])
+            _run_group(ctx, group, wanted, compute, ddl=ddl, now=now, dry_run=dry_run, report=report,
+                       pending_wm=pending_wm, written_tables=written_tables)
         if pending_wm and not dry_run:
+            last: dict[str, tuple] = {}
+            for e in pending_wm:                       # one row per table: the last batch's entry
+                last[e[0]] = e
             try:
-                report["watermarks"] = il.write_watermarks(catalog, namespace, pending_wm, report["run_id"])
+                report["watermarks"] = il.write_watermarks(catalog, namespace, list(last.values()), report["run_id"])
             except Exception as e:  # noqa: BLE001 - never fail the run over watermark rows
                 report["watermarks"] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
     finally:
         ctx.close()
     report["finished_at"] = utcnow().isoformat()
     report["seconds"] = round((utcnow() - now).total_seconds(), 1)
-    # the marker advances only when every per-wallet table was written for the changed
-    # wallets (a skipped or failed one must see those wallets again next run)
-    wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet" and (not tables or t in tables)]
-    complete = all(t in written_tables for t in wallet_tables) and not report["errors"]
-    if not dry_run and complete and newest:
+    # the marker advances only when every changed wallet went through the whole chain
+    # (the batches an interrupted run finished are kept in wallets_through either way)
+    if not dry_run and record_progress and chain_done and newest:
         state["ledger_through"] = newest
+        state.pop("wallets_through", None)
         state["last_run_iso"] = now.isoformat()
         state["tables"] = {k: v.get("table_total") for k, v in report["tables"].items()}
         write_state(ns_dir, state)

@@ -104,6 +104,11 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                      "v1.10.11: the per-wallet engines (balances, fifo) process wallets in chunks of "
                                      "about this many ledger rows (a wallet is never split), converting each chunk to "
                                      "Arrow before the next: the Python-dict peak is one chunk, not the whole ledger"),
+    "HL_ROLLUP_WALLET_BATCH_ROWS": ("8000000", False,
+                                    "v1.10.12: the per-wallet chain (balances -> networth -> fifo -> positions) runs in "
+                                    "wallet batches of about this many ledger rows; every finished batch is written and "
+                                    "recorded in _rollup_state.json (wallets_through), the time budget is checked "
+                                    "between batches, so a backlog drains across runs instead of being redone each hour"),
     # --- staging (extract.upsert_csv) ---------------------------------------------------
     "HL_UPSERT_STREAM_MIN_BYTES": ("268435456", False,
                                    "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB under "

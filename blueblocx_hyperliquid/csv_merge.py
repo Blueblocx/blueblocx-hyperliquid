@@ -17,7 +17,12 @@ size. Semantics mirror the dict path exactly where it matters:
     and written back as an empty field (the csv module writes '' for None and '');
   * the natural key is compared as strings with NULL == '' (the dict path keys on
     `_s(v)`), new rows win, and among new rows carrying the same key the LAST one wins
-    (dict assignment order);
+    (dict assignment order); a file written by upsert_csv / prune_csv is key-unique,
+    and when the old file is NOT (a hand-concatenated restore) its duplicates are
+    collapsed too (v1.10.12: the latest by the sort columns wins, which is the last
+    in file order for a sorted file - the dict path keeps the last occurrence);
+  * an existing file that is EMPTY (zero bytes, no header) is treated like a missing
+    one (v1.10.12; the dict path's DictReader yields no rows for it);
   * the result is ordered by the sort columns (string or BIGINT comparison per
     column, as `sort_fn` does with `s(...)` / `int(...)`), ties broken by the key
     columns so the output is deterministic (the dict path breaks ties by file order);
@@ -30,6 +35,11 @@ The output is written by DuckDB (`COPY ... (FORMAT CSV, HEADER)`): comma delimit
 newline, `\\n` line ends (the csv module writes `\\r\\n`; `csv.DictReader`, the one
 reader of these files - iceberg_load.read_csv_rows, extract.prune_csv,
 extract._load_ledger_rows_by_wallet - accepts both, see tests/test_upsert_stream.py).
+
+`prune_csv_duckdb` (v1.10.12) is the same bounded-memory treatment for the daily
+retention rewrite of a large staged file (extract.prune_csv): rows whose timestamp is
+older than the cutoff are dropped, file order is preserved, unparseable or empty
+timestamps are kept, the file is left untouched when nothing is old.
 """
 from __future__ import annotations
 
@@ -89,6 +99,10 @@ def _read_csv_expr(path: Path, columns: list[str]) -> str:
 def _sort_sql(sort_cols: list[SortSpec], key_cols: list[str], alias: str = "") -> str:
     """ORDER BY mirroring sort_fn: `s(v)` -> string compare of COALESCE(v, ''),
     `int(v)` -> CAST AS BIGINT; then the key columns as the deterministic tie-break."""
+    return ", ".join(_sort_terms(sort_cols, key_cols, alias))
+
+
+def _sort_terms(sort_cols: list[SortSpec], key_cols: list[str], alias: str = "") -> list[str]:
     terms: list[str] = []
     seen: set[str] = set()
     for spec in sort_cols:
@@ -104,7 +118,64 @@ def _sort_sql(sort_cols: list[SortSpec], key_cols: list[str], alias: str = "") -
     for k in key_cols:
         if k not in seen:
             terms.append(f"COALESCE({alias}{_q(k)}, '')")
-    return ", ".join(terms)
+    return terms
+
+
+def _connect(memory_limit: str | None, threads: int, temp_dir: Path | None, *, preserve_order: bool):
+    import duckdb
+    con = duckdb.connect(database=":memory:")
+    con.execute("SET TimeZone = 'UTC'")
+    con.execute(f"SET memory_limit = {_lit(memory_limit or duckdb_memory_limit())}")
+    con.execute(f"SET threads = {max(1, int(threads))}")
+    if temp_dir is not None:
+        con.execute(f"SET temp_directory = {_lit(str(temp_dir))}")
+    con.execute(f"SET preserve_insertion_order = {'true' if preserve_order else 'false'}")
+    return con
+
+
+def _copy_csv(con, select_sql: str, out_path: Path) -> int:
+    """COPY `select_sql` to `out_path` with the csv module's conventions (comma, `"`
+    quote / escape, quoted only when needed, '' for NULL). Returns the row count."""
+    res = con.execute(f"COPY ({select_sql}) TO {_lit(str(out_path))} "
+                      "(FORMAT CSV, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULLSTR '')").fetchone()
+    return int(res[0]) if res else 0
+
+
+def prune_csv_duckdb(path: Path, ts_col: str, cutoff_ms: int, *, memory_limit: str | None = None, threads: int = 4,
+                     temp_dir: Path | None = None) -> dict:
+    """extract.prune_csv for a LARGE staged file: drop the rows whose `ts_col` parses to
+    an instant before `cutoff_ms` (unparseable / empty values are kept, as the dict
+    path does), keep the file order, rewrite atomically only when something was
+    dropped. Returns {"kept", "dropped"}."""
+    path = Path(path)
+    columns = _header(path)
+    if not columns:
+        return {"kept": 0, "dropped": 0}
+    memory_limit = memory_limit or duckdb_memory_limit()
+    temp_dir = Path(temp_dir) if temp_dir is not None else path.parent / ".duckdb" / "upsert"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    src = _read_csv_expr(path, columns)
+    if ts_col not in columns:
+        old_pred = "false"
+    else:
+        # fromisoformat accepts what TIMESTAMPTZ parses here (ISO 8601 with offset or Z;
+        # a naive value is UTC under the connection's TimeZone); NULL = keep
+        old_pred = (f"epoch_ms(TRY_CAST(nullif({_q(ts_col)}, '') AS TIMESTAMPTZ)) < {int(cutoff_ms)}")
+    con = _connect(memory_limit, threads, temp_dir, preserve_order=True)
+    out_tmp = path.with_name(path.name + ".tmp")
+    try:
+        total, dropped = con.execute(f"SELECT count(*), count(*) FILTER (WHERE {old_pred}) FROM {src}").fetchone()
+        if not dropped:
+            return {"kept": int(total), "dropped": 0}
+        sel = ", ".join(_q(c) for c in columns)
+        kept = _copy_csv(con, f"SELECT {sel} FROM {src} WHERE NOT coalesce({old_pred}, false)", out_tmp)
+    finally:
+        con.close()
+    os.replace(out_tmp, path)
+    log.info("csv_merge: %s pruned in DuckDB (memory_limit %s) in %.1fs: -%d rows -> %d rows", path.name, memory_limit,
+             time.monotonic() - t0, dropped, kept)
+    return {"kept": int(kept), "dropped": int(dropped)}
 
 
 def merge_csv_duckdb(path: Path, columns: list[str], rows: list[dict], *, key_cols: list[str],
@@ -114,7 +185,6 @@ def merge_csv_duckdb(path: Path, columns: list[str], rows: list[dict], *, key_co
     `sort_cols`, with DuckDB under `memory_limit` (default HL_UPSERT_DUCKDB_MEMORY),
     spilling under `temp_dir` (default <path.parent>/.duckdb/upsert). Writes
     `path` atomically (tmp file + os.replace). Returns the merged row count."""
-    import duckdb
     path = Path(path)
     for k in key_cols:
         if k not in columns:
@@ -132,30 +202,38 @@ def merge_csv_duckdb(path: Path, columns: list[str], rows: list[dict], *, key_co
         for i, r in enumerate(rows):
             w.writerow([("" if r.get(c) in (None, "") else str(r[c])) for c in columns] + [str(i)])
     out_tmp = path.with_name(path.name + ".tmp")
-    con = duckdb.connect(database=":memory:")
+    con = _connect(memory_limit, threads, temp_dir, preserve_order=False)
     try:
-        con.execute(f"SET memory_limit = {_lit(memory_limit)}")
-        con.execute(f"SET threads = {max(1, int(threads))}")
-        con.execute(f"SET temp_directory = {_lit(str(temp_dir))}")
-        con.execute("SET preserve_insertion_order = false")
         sel = ", ".join(_q(c) for c in columns)
         key_eq = " AND ".join(f"COALESCE(o.{_q(k)}, '') = COALESCE(n.{_q(k)}, '')" for k in key_cols)
         part = ", ".join(f"COALESCE({_q(k)}, '')" for k in key_cols)
         new_rel = (f"SELECT {sel} FROM {_read_csv_expr(new_tmp, columns + ['_rn'])} "
                    f"QUALIFY row_number() OVER (PARTITION BY {part} ORDER BY CAST(\"_rn\" AS BIGINT) DESC) = 1")
         con.execute(f"CREATE TEMP TABLE new_rows AS {new_rel}")
-        if path.exists():
-            old_cols = _header(path)
+        old_cols = _header(path) if path.exists() else []
+        if old_cols:
             old_sel = ", ".join((_q(c) if c in old_cols else f"CAST(NULL AS VARCHAR) AS {_q(c)}") for c in columns)
-            old_rel = (f"SELECT {old_sel} FROM {_read_csv_expr(path, old_cols)} o "
+            old_src = f"SELECT {old_sel} FROM {_read_csv_expr(path, old_cols)}"
+            # the dict path collapses a key that occurs twice in the OLD file (last occurrence
+            # wins); a file this module or the dict path wrote is key-unique, so the window
+            # below is only paid when a restored / concatenated file is not
+            n_all, n_keys = con.execute(f"SELECT count(*), count(*) FILTER (WHERE rn = 1) FROM "
+                                        f"(SELECT row_number() OVER (PARTITION BY {part}) AS rn FROM ({old_src}))").fetchone()
+            if n_all != n_keys:
+                order_desc = ", ".join(f"{t} DESC" for t in _sort_terms(sort_cols or [], key_cols))
+                log.warning("csv_merge: %s holds %d rows for %d keys; collapsing the duplicates (latest by sort order wins)",
+                            path.name, n_all, n_keys)
+                old_src = (f"SELECT * FROM ({old_src}) QUALIFY row_number() OVER (PARTITION BY {part} "
+                           f"ORDER BY {order_desc}) = 1")
+            old_rel = (f"SELECT {sel} FROM ({old_src}) o "
                        f"WHERE NOT EXISTS (SELECT 1 FROM new_rows n WHERE {key_eq})")
             merged = f"{old_rel} UNION ALL SELECT {sel} FROM new_rows"
         else:
+            if path.exists():
+                log.info("csv_merge: %s is empty (no header): merged = the new rows only", path.name)
             merged = f"SELECT {sel} FROM new_rows"
         order = f" ORDER BY {_sort_sql(sort_cols, key_cols)}" if sort_cols else ""
-        con.execute(f"COPY (SELECT {sel} FROM ({merged}) m{order}) TO {_lit(str(out_tmp))} "
-                    "(FORMAT CSV, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULLSTR '')")
-        total = con.execute(f"SELECT count(*) FROM {_read_csv_expr(out_tmp, columns)}").fetchone()[0]
+        total = _copy_csv(con, f"SELECT {sel} FROM ({merged}) m{order}", out_tmp)
     finally:
         con.close()
         try:

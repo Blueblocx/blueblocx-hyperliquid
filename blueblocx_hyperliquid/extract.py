@@ -204,14 +204,27 @@ def prune_csv(path: Path, ts_col: str, cutoff_ms: int) -> dict:
     the CSV is a staging + analytics-window buffer), so the file stays bounded at
     retention_days of history instead of growing forever — an MM wallet stages
     ~180k fills/day. Unparseable timestamps are kept, never dropped blindly.
-    Atomic rewrite; returns counts."""
+    Atomic rewrite; returns counts.
+
+    Memory (v1.10.12): the kept rows are no longer collected in a list (28 M
+    DictReader rows = ~40 GB resident on the 2026-11-06 staged ledger); they stream
+    to the tmp file one row at a time, and a file of at least
+    HL_UPSERT_STREAM_MIN_BYTES is pruned by DuckDB under HL_UPSERT_DUCKDB_MEMORY
+    (csv_merge.prune_csv_duckdb: same rows, same order) in a fraction of the time."""
     if not path.exists():
         return {"kept": 0, "dropped": 0}
-    kept: list[dict] = []
-    dropped = 0
-    with path.open("r", newline="", encoding="utf-8") as fh:
+    from . import csv_merge
+    size = path.stat().st_size
+    if size > 0 and size >= csv_merge.stream_threshold_bytes():
+        log.info("retention %s: %.1f MB >= HL_UPSERT_STREAM_MIN_BYTES -> DuckDB prune (bounded memory)", path.name, size / 1e6)
+        return csv_merge.prune_csv_duckdb(path, ts_col, cutoff_ms)
+    kept = dropped = 0
+    tmp = path.with_name(path.name + ".tmp")
+    with path.open("r", newline="", encoding="utf-8") as fh, tmp.open("w", newline="", encoding="utf-8") as out:
         reader = csv.DictReader(fh)
         columns = reader.fieldnames or []
+        w = csv.DictWriter(out, fieldnames=columns)
+        w.writeheader()
         for r in reader:
             ts = r.get(ts_col)
             try:
@@ -221,17 +234,18 @@ def prune_csv(path: Path, ts_col: str, cutoff_ms: int) -> dict:
             if old:
                 dropped += 1
             else:
-                kept.append(r)
+                kept += 1
+                w.writerow(r)
     if dropped:
-        tmp = path.with_name(path.name + ".tmp")
-        with tmp.open("w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=columns)
-            w.writeheader()
-            w.writerows(kept)
         os.replace(tmp, path)
         log.info("retention %-33s -%6d rows older than %s -> %6d rows", path.name, dropped,
-                 datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).date(), len(kept))
-    return {"kept": len(kept), "dropped": dropped}
+                 datetime.fromtimestamp(cutoff_ms / 1000, tz=timezone.utc).date(), kept)
+    else:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return {"kept": kept, "dropped": dropped}
 
 
 def compute_start_ms(default_start_ms: int, watermark_through_ms: int | None,

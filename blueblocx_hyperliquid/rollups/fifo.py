@@ -95,7 +95,8 @@ def opening_lots(ctx, prices: dict[str, list], stables: set[str]) -> dict[tuple[
     the cost basis is the market price at the start of our history - documented
     HyperCore deviation, the atlas has the chain's whole history instead."""
     if "balance_openings" not in ctx._loaded:
-        return {}
+        from . import balances                 # a --tables subset without the balances group (v1.10.12)
+        balances.compute(ctx)
     out: dict[tuple[str, str], dict] = {}
     arrow = ctx.sql("SELECT wallet_address, token_address, opening_qty, first_block_timestamp FROM balance_openings")
     for w, t, qty, ts in zip(*(arrow.column(c).to_pylist() for c in

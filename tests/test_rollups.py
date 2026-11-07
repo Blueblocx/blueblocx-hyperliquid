@@ -578,5 +578,170 @@ class WalletChunkingTests(unittest.TestCase):
         self.assertFalse(any("today" in r for r in priced))                  # rows dated today are not folded
 
 
+# --- v1.10.12: fifo auto-runs its producer; the wallet chain records progress per batch ----
+
+class FifoSubsetTests(unittest.TestCase):
+    setUp = WalletChunkingTests.setUp
+    _ctx = WalletChunkingTests._ctx
+
+    def test_fifo_alone_runs_balances_for_the_opening_lots(self):
+        full = self._ctx()
+        alone = self._ctx()
+        try:
+            balances.compute(full)
+            ref = fifo.compute(full)
+            self.assertNotIn("balance_openings", alone._loaded)
+            out = fifo.compute(alone)                                      # a --tables subset without balances
+            self.assertIn("balance_openings", alone._loaded)
+            self.assertEqual(_sorted_rows(out["l4_wallet_pnl_state_fifo"]), _sorted_rows(ref["l4_wallet_pnl_state_fifo"]))
+            self.assertEqual(_sorted_rows(out["l4_wallet_pnl_realized_1d"]), _sorted_rows(ref["l4_wallet_pnl_realized_1d"]))
+        finally:
+            full.close()
+            alone.close()
+
+
+class WalletBatchProgressTests(unittest.TestCase):
+    """rollups.run against a SQLite catalog + file warehouse: the per-wallet chain runs in
+    wallet batches, every finished batch is recorded in _rollup_state.json, a run cut
+    short by the budget leaves durable progress and the next run finishes the rest."""
+
+    WALLETS = ["0xw1", "0xw2", "0xw3"]
+    STAMP = dt.datetime(2026, 10, 5, 12, tzinfo=UTC)
+
+    def setUp(self):
+        from unittest import mock
+        from blueblocx_hyperliquid import iceberg_load as il
+        self.root = Path(tempfile.mkdtemp(prefix="hl-rollup-run-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        env = {"NESSIE_URI": "", "HL_CATALOG_URI": f"sqlite:///{(self.root / 'c.db').as_posix()}",
+               "WAREHOUSE": f"file://{(self.root / 'wh').as_posix()}", "HL_WAREHOUSE_MOUNT": "",
+               "HL_OUT_DIR": str(self.root / "out"), "HL_ROLLUP_DUCKDB_MEMORY": "1GB"}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.catalog, _ = il.load_catalog_from_env()
+        self.addCleanup(self.catalog.engine.dispose)
+        self.ns_dir = self.root / "out" / S.NS_HYPERCORE
+        self.ns_dir.mkdir(parents=True)
+        self.ddl = il.parse_ddl()
+        self.il = il
+        self.now = dt.datetime(2026, 10, 6, 12, tzinfo=UTC)
+        self._append("l1_token_metadata", [{"token_address": T, "symbol": "AAA", "name": "Token A", "decimals": 6,
+                                            "is_stablecoin": False, "updated_at": self.STAMP}])
+        self._append("l3_token_price_usd_1h", [{"token_address": T, "bucket_minute": ts(d, 0), "bucket_date": dt.date(2026, 10, d),
+                                                "close_price_usd": px, "updated_at": self.STAMP}
+                                               for d, px in ((1, 2.0), (2, 3.0), (3, 1.5), (4, 4.0), (5, 4.5))])
+        self._append("l3_token_price_usd_1d", [{"token_address": T, "bucket_minute": ts(d, 0), "bucket_date": dt.date(2026, 10, d),
+                                                "close_price_usd": px, "updated_at": self.STAMP}
+                                               for d, px in ((1, 2.0), (2, 3.0), (3, 1.5), (4, 4.0), (5, 4.5))])
+        self._append("l1_wallet_ledger", [r for w in self.WALLETS for r in self._ledger(w, self.STAMP)])
+
+    def _ledger(self, w, stamp, base=10.0, tag=""):
+        return [dict(row(1, 1, base, idx=0, tx=f"{w}a{tag}"), wallet_address=w, event_type="spot_fill", decimals=6, updated_at=stamp),
+                dict(row(2, 3, -4.0, idx=1, tx=f"{w}b{tag}"), wallet_address=w, event_type="spot_fill", decimals=6, updated_at=stamp),
+                dict(row(4, 0, 2.5, idx=0, tx=f"{w}c{tag}"), wallet_address=w, event_type="transfer", decimals=6, updated_at=stamp)]
+
+    def _append(self, name, rows):
+        spec = self.ddl[name]
+        table = self.il.ensure_table(self.catalog, S.NS_HYPERCORE, name, spec, tz=True)
+        arrow = table_from_rows(rows, [(c[0], c[1]) for c in spec["columns"]])
+        table.append(self.il.conform(arrow, table))
+
+    def _rows(self, name, col="wallet_address"):
+        table = self.catalog.load_table(f"{S.NS_HYPERCORE}.{name}")
+        return sorted(table.scan().to_arrow().column(col).to_pylist())
+
+    def _state(self):
+        return R.read_state(self.ns_dir)
+
+    def test_budget_cut_leaves_durable_progress_and_the_next_run_finishes(self):
+        from unittest import mock
+        wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet"]
+        # run 1: the budget is exhausted after the first wallet batch (1 wallet per batch)
+        calls = iter([False, False] + [True] * 50)
+        with mock.patch.object(R.Budget, "exhausted", lambda self: next(calls)):
+            rep = R.run(self.ns_dir, self.catalog, now=self.now, budget_min=8, tables=wallet_tables, batch_rows=1)
+        self.assertEqual(rep["errors"], {})
+        self.assertEqual((rep["changed_wallets"], rep["wallets_pending_before"]), (3, 3))
+        self.assertEqual((rep["wallet_batches"], rep["wallets_done"], rep["wallets_pending"]), (3, 1, 2))
+        self.assertFalse(rep["state_advanced"])
+        self.assertEqual(sorted(rep["skipped"]), sorted(wallet_tables))      # honest: the chain did not finish
+        state = self._state()
+        self.assertNotIn("ledger_through", state)
+        self.assertEqual(state["wallets_through"], {"0xw1": self.STAMP.isoformat()})
+        self.assertEqual(set(self._rows("l4_wallet_balance_per_tx")), {"0xw1"})
+        self.assertEqual(set(self._rows("wallet_token_stats")), {"0xw1"})
+        # run 2: only the two pending wallets are recomputed; the marker advances and the
+        # per-wallet marks are folded into it
+        rep = R.run(self.ns_dir, self.catalog, now=self.now + dt.timedelta(hours=1), budget_min=0, tables=wallet_tables,
+                    batch_rows=1)
+        self.assertEqual(rep["errors"], {})
+        self.assertEqual((rep["changed_wallets"], rep["wallets_pending_before"], rep["wallet_batches"]), (3, 2, 2))
+        self.assertEqual(rep["skipped"], [])
+        self.assertTrue(rep["state_advanced"])
+        state = self._state()
+        self.assertEqual(state["ledger_through"], self.STAMP.isoformat())
+        self.assertNotIn("wallets_through", state)
+        self.assertEqual(set(self._rows("l4_wallet_balance_per_tx")), set(self.WALLETS))
+        self.assertEqual(self._rows("wallet_token_stats"), self.WALLETS)
+        self.assertEqual(rep["tables"]["l4_wallet_balance_per_tx"]["batches"], 2)
+        self.assertEqual(rep["tables"]["l4_wallet_balance_per_tx"]["incoming"], 6)   # 3 rows x 2 wallets, summed
+        # run 3: nothing new -> no chain, marker unchanged
+        rep = R.run(self.ns_dir, self.catalog, now=self.now + dt.timedelta(hours=2), budget_min=0, tables=wallet_tables)
+        self.assertEqual(rep["changed_wallets"], 0)
+        self.assertNotIn("wallet_batches", rep)
+        self.assertEqual(self._state()["ledger_through"], self.STAMP.isoformat())
+        # run 4: new rows for one wallet -> that wallet only; the others keep their rows
+        later = self.STAMP + dt.timedelta(hours=3)
+        self._append("l1_wallet_ledger", self._ledger("0xw2", later, base=20.0, tag="x"))
+        rep = R.run(self.ns_dir, self.catalog, now=self.now + dt.timedelta(hours=3), budget_min=0, tables=wallet_tables)
+        self.assertEqual((rep["changed_wallets"], rep["wallet_batches"], rep["wallets_done"]), (1, 1, 1))
+        self.assertTrue(rep["state_advanced"])
+        self.assertEqual(self._state()["ledger_through"], later.isoformat())
+        per_tx = self._rows("l4_wallet_balance_per_tx")
+        self.assertEqual(per_tx.count("0xw2"), 6)
+        self.assertEqual(per_tx.count("0xw1"), 3)
+        # a --tables subset of the chain never records progress (it refreshed only part of it)
+        self._append("l1_wallet_ledger", self._ledger("0xw3", later + dt.timedelta(hours=1), base=30.0, tag="y"))
+        rep = R.run(self.ns_dir, self.catalog, now=self.now + dt.timedelta(hours=4), budget_min=0,
+                    tables=["l4_wallet_balance_per_tx"])
+        self.assertEqual((rep["changed_wallets"], rep["wallets_done"]), (1, 1))
+        self.assertFalse(rep["state_advanced"])
+        self.assertEqual(self._state()["ledger_through"], later.isoformat())
+        self.assertNotIn("wallets_through", self._state())
+        # ... and a global-only subset does not move the marker either
+        rep = R.run(self.ns_dir, self.catalog, now=self.now + dt.timedelta(hours=5), budget_min=0,
+                    tables=["l1_token_categories"])
+        self.assertFalse(rep["state_advanced"])
+        self.assertEqual(self._state()["ledger_through"], later.isoformat())
+
+    def test_budget_spent_before_the_chain_skips_it_whole(self):
+        from unittest import mock
+        wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet"]
+        with mock.patch.object(R.Budget, "exhausted", lambda self: True):
+            rep = R.run(self.ns_dir, self.catalog, now=self.now, budget_min=8, tables=wallet_tables, batch_rows=1)
+        self.assertEqual(sorted(rep["skipped"]), sorted(wallet_tables))
+        self.assertEqual(rep["wallets_pending"], 3)
+        self.assertFalse(rep["state_advanced"])
+        self.assertEqual(self._state(), {})
+        self.assertFalse(self.catalog.table_exists(f"{S.NS_HYPERCORE}.l4_wallet_balance_per_tx"))
+
+    def test_batch_rows_default_and_pending_logic(self):
+        with _Env(HL_ROLLUP_WALLET_BATCH_ROWS=None):
+            self.assertEqual(R.wallet_batch_rows(), 8_000_000)
+        with _Env(HL_ROLLUP_WALLET_BATCH_ROWS="0"):
+            self.assertEqual(R.wallet_batch_rows(), 1)
+        stamps = {"a": "2026-10-05T12:00:00+00:00", "b": "2026-10-05T13:00:00+00:00"}
+        state = {"wallets_through": {"a": "2026-10-05T12:00:00+00:00", "b": "2026-10-05T12:30:00+00:00"}}
+        self.assertEqual(R.pending_wallets(stamps, state, False), {"b": stamps["b"]})
+        self.assertEqual(R.pending_wallets(stamps, state, True), stamps)
+        self.assertEqual(R.pending_wallets(stamps, {}, False), stamps)
+        self.assertEqual(R.newest_stamp(stamps, None), stamps["b"])
+        self.assertEqual(R.newest_stamp({}, "x"), "x")
+        self.assertTrue(set(R.WALLET_CHAIN) < {g for g, _, _ in R._engines()})
+        for alias in ("ledger", "balance_openings", "fifo_state_new", "priced_statement", "spot_snap"):
+            self.assertIn(alias, R.BATCH_ALIASES)
+
+
 if __name__ == "__main__":
     unittest.main()
