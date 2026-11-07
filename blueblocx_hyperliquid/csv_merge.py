@@ -40,6 +40,11 @@ extract._load_ledger_rows_by_wallet - accepts both, see tests/test_upsert_stream
 retention rewrite of a large staged file (extract.prune_csv): rows whose timestamp is
 older than the cutoff are dropped, file order is preserved, unparseable or empty
 timestamps are kept, the file is left untouched when nothing is old.
+
+`WalletRowStore` (v1.10.13) serves the analyse phase (extract.open_ledger_rows): the
+file is loaded once into a DuckDB scratch database under the same memory_limit and the
+rows of ONE wallet at a time become Python dicts, in file order, strings as
+csv.DictReader would give them.
 """
 from __future__ import annotations
 
@@ -244,3 +249,100 @@ def merge_csv_duckdb(path: Path, columns: list[str], rows: list[dict], *, key_co
     log.info("csv_merge: %s merged in DuckDB (memory_limit %s, spill %s) in %.1fs -> %d rows",
              path.name, memory_limit, temp_dir, time.monotonic() - t0, total)
     return int(total)
+
+
+class WalletRowStore:
+    """The staged ledger's rows for a set of wallets, served ONE WALLET AT A TIME
+    (v1.10.13; the analyse phase of extract.run).
+
+    `extract._load_ledger_rows_by_wallet` kept every row of every wallet of the run as
+    Python dicts for the whole analyse / write / lift stretch - with every tracked
+    wallet in the run that is the whole staged file (~2 KB per typed row: ~60 GB on
+    the 28 M-row ledger, the 64 GB peak measured on 2026-11-07). Here the file is read
+    once by DuckDB into a table in a scratch database file under `temp_dir` (so the
+    buffer manager, not the Python heap, holds it: `memory_limit`, default
+    HL_UPSERT_DUCKDB_MEMORY), filtered to the wanted wallets and clustered by wallet;
+    `rows(wallet)` then materialises that wallet's rows only, in file order, as dicts
+    of strings exactly as csv.DictReader would have produced them (NULL -> '').
+    `close()` drops the database file; use as a context manager."""
+
+    def __init__(self, path: Path, wallets, *, memory_limit: str | None = None, threads: int = 4,
+                 temp_dir: Path | None = None, wallet_col: str = "wallet_address"):
+        path = Path(path)
+        self.path = path
+        self.columns = _header(path)
+        self.wallet_col = wallet_col
+        self.memory_limit = memory_limit or duckdb_memory_limit()
+        temp_dir = Path(temp_dir) if temp_dir is not None else path.parent / ".duckdb" / "upsert"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = temp_dir / f"ledger_rows.{os.getpid()}.duckdb"
+        self._unlink_db()
+        self.row_count = 0
+        self._con = None
+        wanted = sorted({str(w) for w in wallets})
+        if not self.columns or wallet_col not in self.columns or not wanted:
+            return
+        t0 = time.monotonic()
+        import duckdb
+        con = duckdb.connect(database=str(self.db_path))
+        try:
+            con.execute("SET TimeZone = 'UTC'")
+            con.execute(f"SET memory_limit = {_lit(self.memory_limit)}")
+            con.execute(f"SET threads = {max(1, int(threads))}")
+            con.execute(f"SET temp_directory = {_lit(str(temp_dir))}")
+            con.execute("SET preserve_insertion_order = true")
+            con.execute("CREATE TABLE wanted(w VARCHAR)")
+            con.executemany("INSERT INTO wanted VALUES (?)", [(w,) for w in wanted])
+            sel = ", ".join(_q(c) for c in self.columns)
+            # _rn = position in the file (preserve_insertion_order keeps the reader's order
+            # through the streaming row_number), the table is clustered by wallet so a
+            # per-wallet SELECT touches that wallet's row groups only (zonemaps)
+            con.execute(f"CREATE TABLE ledger AS SELECT row_number() OVER () AS _rn, {sel} "
+                        f"FROM {_read_csv_expr(path, self.columns)} "
+                        f"WHERE {_q(wallet_col)} IN (SELECT w FROM wanted) "
+                        f"ORDER BY {_q(wallet_col)}, _rn")
+            self.row_count = int(con.execute("SELECT count(*) FROM ledger").fetchone()[0])
+        except BaseException:
+            con.close()
+            self._unlink_db()
+            raise
+        self._con = con
+        log.info("csv_merge: %s loaded into DuckDB (memory_limit %s, db %s) in %.1fs: %d rows of %d wallet(s)",
+                 path.name, self.memory_limit, self.db_path, time.monotonic() - t0, self.row_count, len(wanted))
+
+    def rows(self, wallet: str) -> list[dict]:
+        """The wallet's rows in file order as {column: str} dicts ('' for an empty field);
+        [] for a wallet the store was not asked for or that has no rows."""
+        if self._con is None:
+            return []
+        sel = ", ".join(_q(c) for c in self.columns)
+        cur = self._con.execute(f"SELECT {sel} FROM ledger WHERE {_q(self.wallet_col)} = ? ORDER BY _rn", [str(wallet)])
+        cols = self.columns
+        out: list[dict] = []
+        while True:
+            batch = cur.fetchmany(50_000)
+            if not batch:
+                break
+            out.extend({c: ("" if v is None else v) for c, v in zip(cols, t)} for t in batch)
+        return out
+
+    def close(self) -> None:
+        if self._con is not None:
+            try:
+                self._con.close()
+            finally:
+                self._con = None
+        self._unlink_db()
+
+    def _unlink_db(self) -> None:
+        for p in (self.db_path, Path(str(self.db_path) + ".wal")):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

@@ -114,10 +114,12 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                    "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB under "
                                    "HL_UPSERT_DUCKDB_MEMORY instead of Python dicts (the 8.5 GB staged ledger of "
                                    "2026-11-06 needed ~98 GB as dicts). Applies to the ledger (key + sort columns "
-                                   "known); dimension / snapshot files always take the dict path. 0 = always"),
+                                   "known); dimension / snapshot files always take the dict path. v1.10.12: the "
+                                   "same threshold selects the DuckDB retention prune; v1.10.13: and the analyse "
+                                   "phase's per-wallet ledger store (extract.open_ledger_rows). 0 = always"),
     "HL_UPSERT_DUCKDB_MEMORY": ("16GB", False,
-                                "v1.10.11: DuckDB memory_limit of the staged-CSV upsert (spills to "
-                                "<state dir>/.duckdb/upsert beyond it)"),
+                                "v1.10.11: DuckDB memory_limit of the staged-CSV upsert, retention prune and (v1.10.13) "
+                                "the analyse phase's wallet store (spills to <state dir>/.duckdb/upsert beyond it)"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock whose holder cannot be observed (another host, no /proc) is treated as "

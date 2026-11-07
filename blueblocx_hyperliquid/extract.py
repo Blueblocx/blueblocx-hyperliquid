@@ -272,11 +272,19 @@ def _load_watermarks(path: Path) -> dict:
     return {}
 
 
+def _type_ledger_row(r: dict) -> dict:
+    """A staged ledger row read back as strings, typed enough for analytics (in place)."""
+    r["amount_signed"] = float(r["amount_signed"] or 0)
+    r["event_index"] = int(r["event_index"] or 0)
+    return r
+
+
 def _load_ledger_rows_by_wallet(path: Path, wallets: set[str]) -> dict[str, list[dict]]:
     """ONE pass over the staged ledger: rows of every wallet in `wallets`, typed
     enough for analytics. The per-wallet variant below used to re-read the whole
     file once per wallet (O(wallets x file): hours per run at a few hundred
-    wallets with 45 days of staging)."""
+    wallets with 45 days of staging). Holds every wanted row as a Python dict - the
+    dict path of `open_ledger_rows`, taken for a file below HL_UPSERT_STREAM_MIN_BYTES."""
     out: dict[str, list[dict]] = {w: [] for w in wallets}
     if not path.exists() or not wallets:
         return out
@@ -285,10 +293,76 @@ def _load_ledger_rows_by_wallet(path: Path, wallets: set[str]) -> dict[str, list
             rows = out.get(r.get("wallet_address"))
             if rows is None:
                 continue
-            r["amount_signed"] = float(r["amount_signed"] or 0)
-            r["event_index"] = int(r["event_index"] or 0)
-            rows.append(r)
+            rows.append(_type_ledger_row(r))
     return out
+
+
+class _DictLedgerRows:
+    """open_ledger_rows' dict path: everything in memory, as before v1.10.13."""
+    kind = "dict"
+
+    def __init__(self, by_wallet: dict[str, list[dict]]):
+        self._by_wallet = by_wallet
+
+    def rows(self, wallet: str) -> list[dict]:
+        return self._by_wallet.get(wallet, [])
+
+    def close(self) -> None:
+        self._by_wallet = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class _DuckLedgerRows:
+    """open_ledger_rows' bounded-memory path: csv_merge.WalletRowStore (the file lives
+    in a DuckDB scratch database under memory_limit), one wallet's rows typed at a time."""
+    kind = "duckdb"
+
+    def __init__(self, store):
+        self._store = store
+
+    def rows(self, wallet: str) -> list[dict]:
+        return [_type_ledger_row(r) for r in self._store.rows(wallet)]
+
+    def close(self) -> None:
+        self._store.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def open_ledger_rows(path: Path, wallets: set[str], *, temp_dir: Path | None = None):
+    """The staged ledger's rows for the run's wallets, served per wallet by `.rows(w)`
+    (typed as _load_ledger_rows_by_wallet types them; [] for a wallet without rows or
+    not in `wallets`); `.close()` releases them - use as a context manager.
+
+    v1.10.13: a file of at least HL_UPSERT_STREAM_MIN_BYTES (256 MiB) is loaded ONCE by
+    DuckDB under HL_UPSERT_DUCKDB_MEMORY into a scratch database under `temp_dir`
+    (default <path.parent>/.duckdb/upsert; removed by close) and only the wallet being
+    analysed is Python dicts, so the analyse / write / lift peak no longer scales with
+    the staged file (every tracked wallet is in the hourly run, so the dict path held
+    the WHOLE 28 M-row file: ~60 GB of the 64 GB peak measured on 2026-11-07). Below the
+    threshold (or with no file / no wallets) the dict path runs exactly as before."""
+    path = Path(path)
+    if not wallets or not path.exists():
+        return _DictLedgerRows({w: [] for w in wallets})
+    from . import csv_merge
+    size = path.stat().st_size
+    threshold = csv_merge.stream_threshold_bytes()
+    if size >= threshold and size > 0:
+        log.info("analyse %s: %.1f MB >= HL_UPSERT_STREAM_MIN_BYTES %.1f MB -> DuckDB wallet store (bounded memory)",
+                 path.name, size / 1e6, threshold / 1e6)
+        return _DuckLedgerRows(csv_merge.WalletRowStore(path, wallets, temp_dir=temp_dir))
+    log.info("analyse %s: %.1f MB < HL_UPSERT_STREAM_MIN_BYTES %.1f MB -> dict path", path.name, size / 1e6,
+             threshold / 1e6)
+    return _DictLedgerRows(_load_ledger_rows_by_wallet(path, wallets))
 
 
 def _load_wallet_ledger_rows(path: Path, wallet: str) -> list[dict]:
@@ -788,140 +862,106 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                         "the window (watermark NOT advanced)", p["wallet"][:10])
 
     # ---- phase 2: map, snapshot, analyse ---------------------------------------
-    # The staged CSVs are read ONCE per run for all wallets (not once per wallet).
+    # The staged CSVs are read ONCE per run for all wallets (not once per wallet). The
+    # ledger is served per wallet (open_ledger_rows: DuckDB-backed above the stream
+    # threshold, so only the wallet being analysed is Python dicts) and released before
+    # the write phase, whose own DuckDB merge then has the memory to itself (v1.10.13).
     progress(phase="analyse")
     run_wallets = {p["wallet"] for p in pending}
-    disk_rows_by_wallet = (_load_ledger_rows_by_wallet(ns_dir / "l1_wallet_ledger.csv", run_wallets)
-                           if incremental else {})
+    staged_ledger = (open_ledger_rows(ns_dir / "l1_wallet_ledger.csv", run_wallets)
+                     if incremental else _DictLedgerRows({}))
     prior_unreal_by_wallet = _load_prior_unrealized_all(ns_dir / "l4x_perp_position_snapshot.csv",
                                                         run_wallets, now_ms)
-    for k, p in enumerate(pending):
-        wallet, prior_wm, w_start_ms, d = p["wallet"], p["prior"], p["w_start_ms"], p["d"]
-        progress(current=wallet, analysed=k, analysed_total=len(pending))
-        fills, fills_saturated, twap_fills, s3_report = (p["fills"], p["fills_saturated"],
-                                                        p["twap_fills"], p["s3_report"])
-        funding, ledger_updates = d["funding"], d["ledger"]
-        chs, spot_state, staking, portfolio = d["chs"], d["spot_state"], d["staking"], d["portfolio"]
-        vaults = d["vaults"]
-        chs_by_dex = {dx: d.get(f"chs:{dx}") or {} for dx in d.get("_dexes_queried", [])}
-        price_start_ms = min(price_start_ms, w_start_ms)
-        log.info("[%s] fetched: %d fills, %d funding, %d ledger, %d positions%s",
-                 wallet[:10], len(fills), len(funding), len(ledger_updates),
-                 len(chs.get("assetPositions", [])),
-                 "  [FILLS TRUNCATED @10k cap]" if fills_saturated else "")
+    try:
+        for k, p in enumerate(pending):
+            wallet, prior_wm, w_start_ms, d = p["wallet"], p["prior"], p["w_start_ms"], p["d"]
+            progress(current=wallet, analysed=k, analysed_total=len(pending))
+            fills, fills_saturated, twap_fills, s3_report = (p["fills"], p["fills_saturated"],
+                                                            p["twap_fills"], p["s3_report"])
+            funding, ledger_updates = d["funding"], d["ledger"]
+            chs, spot_state, staking, portfolio = d["chs"], d["spot_state"], d["staking"], d["portfolio"]
+            vaults = d["vaults"]
+            chs_by_dex = {dx: d.get(f"chs:{dx}") or {} for dx in d.get("_dexes_queried", [])}
+            price_start_ms = min(price_start_ms, w_start_ms)
+            log.info("[%s] fetched: %d fills, %d funding, %d ledger, %d positions%s",
+                     wallet[:10], len(fills), len(funding), len(ledger_updates),
+                     len(chs.get("assetPositions", [])),
+                     "  [FILLS TRUNCATED @10k cap]" if fills_saturated else "")
 
-        # --- L1 --------------------------------------------------------------
-        l1_rows = mappers.map_fills_to_ledger(fills, wallet, now_iso, resolver, registry,
-                                              collateral_by_prefix=collateral_by_prefix)
-        l1_rows += mappers.map_funding_to_ledger(funding, wallet, now_iso, registry,
-                                                 collateral_by_prefix=collateral_by_prefix)
-        ledger_rows, unknown = mappers.map_non_funding_ledger(
-            ledger_updates, wallet, now_iso, resolver, registry)
-        l1_rows += ledger_rows
-        for k, v in unknown.items():
-            unknown_types_all[k] = unknown_types_all.get(k, 0) + v
+            # --- L1 --------------------------------------------------------------
+            l1_rows = mappers.map_fills_to_ledger(fills, wallet, now_iso, resolver, registry,
+                                                  collateral_by_prefix=collateral_by_prefix)
+            l1_rows += mappers.map_funding_to_ledger(funding, wallet, now_iso, registry,
+                                                     collateral_by_prefix=collateral_by_prefix)
+            ledger_rows, unknown = mappers.map_non_funding_ledger(
+                ledger_updates, wallet, now_iso, resolver, registry)
+            l1_rows += ledger_rows
+            for k, v in unknown.items():
+                unknown_types_all[k] = unknown_types_all.get(k, 0) + v
 
-        # --- L4x snapshot (main dex + every HIP-3 dex) ---------------------------
-        snap_rows = prices.clearinghouse_to_snapshot(chs, wallet, now_ms, now_iso, dex="main")
-        account_value_by_dex: dict[str, float] = {}
-        for dx, dchs in chs_by_dex.items():
-            if not dchs:
-                continue
-            av = float((dchs.get("marginSummary", {}) or {}).get("accountValue", 0) or 0)
-            dex_rows = prices.clearinghouse_to_snapshot(dchs, wallet, now_ms, now_iso, dex=dx)
-            if av or dex_rows:
-                account_value_by_dex[dx] = av
-                snap_rows += dex_rows
-        perp_coins_open.update(r["coin"] for r in snap_rows)
+            # --- L4x snapshot (main dex + every HIP-3 dex) ---------------------------
+            snap_rows = prices.clearinghouse_to_snapshot(chs, wallet, now_ms, now_iso, dex="main")
+            account_value_by_dex: dict[str, float] = {}
+            for dx, dchs in chs_by_dex.items():
+                if not dchs:
+                    continue
+                av = float((dchs.get("marginSummary", {}) or {}).get("accountValue", 0) or 0)
+                dex_rows = prices.clearinghouse_to_snapshot(dchs, wallet, now_ms, now_iso, dex=dx)
+                if av or dex_rows:
+                    account_value_by_dex[dx] = av
+                    snap_rows += dex_rows
+            perp_coins_open.update(r["coin"] for r in snap_rows)
 
-        # --- current spot prices for valuation (no candles) -------------------
-        balances = spot_state.get("balances", []) if spot_state else []
-        syms = {b.get("coin") for b in balances if float(b.get("total", 0) or 0) != 0.0}
-        if float(staking.get("delegated", 0) or 0) or float(staking.get("undelegated", 0) or 0):
-            syms.add("HYPE")
-        held_symbols |= {s for s in syms if s and s.upper() not in _STABLE_SYMBOLS}
-        # --- lending position: cached + window deltas, else resolved lazily below ---
-        lending_resolved = not p["need_ledger_all"]
-        if lending_resolved:
-            since = int(prior_wm.get("lending_through_ms") or 0)
-            new_deltas = [e for e in ledger_updates if int(e.get("time", 0) or 0) > since]
-            lending_by_token = analytics.merge_lending(prior_wm.get("lending_by_token") or {},
-                                                      analytics.lending_position(new_deltas))
-        else:
-            lending_by_token = {}          # provisional; see lazy pull after the oracle
+            # --- current spot prices for valuation (no candles) -------------------
+            balances = spot_state.get("balances", []) if spot_state else []
+            syms = {b.get("coin") for b in balances if float(b.get("total", 0) or 0) != 0.0}
+            if float(staking.get("delegated", 0) or 0) or float(staking.get("undelegated", 0) or 0):
+                syms.add("HYPE")
+            held_symbols |= {s for s in syms if s and s.upper() not in _STABLE_SYMBOLS}
+            # --- lending position: cached + window deltas, else resolved lazily below ---
+            lending_resolved = not p["need_ledger_all"]
+            if lending_resolved:
+                since = int(prior_wm.get("lending_through_ms") or 0)
+                new_deltas = [e for e in ledger_updates if int(e.get("time", 0) or 0) > since]
+                lending_by_token = analytics.merge_lending(prior_wm.get("lending_by_token") or {},
+                                                          analytics.lending_position(new_deltas))
+            else:
+                lending_by_token = {}          # provisional; see lazy pull after the oracle
 
-        # Analytics run over the wallet's ACCUMULATED ledger (disk + this run), not
-        # just this pull: in incremental mode the pull window is ~1h, but
-        # realized_7d/30d must be computed over everything we hold. Coverage
-        # starts at the earliest window ever pulled for the wallet (watermark).
-        coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
-        if incremental:
-            disk_rows = disk_rows_by_wallet.get(wallet, [])
-            if disk_rows and not prior_wm.get("coverage_start_ms"):
-                # pre-existing data without a coverage watermark: coverage begins at
-                # the earliest row we actually hold, not at this (short) window
-                coverage_start_ms = min(coverage_start_ms,
-                                        min(_iso_to_ms(r["block_timestamp"]) for r in disk_rows))
-            analysis_rows = merge_rows_by_key(disk_rows, l1_rows)
-        else:
-            analysis_rows = l1_rows
-        # Auto-tracked wallet at the API cap with no repair path: the fills before the
-        # oldest one returned are a hole we live with. Contiguous coverage therefore
-        # starts at that fill - the 7d/30d windows stay incomplete until genuinely
-        # covered - and the watermark advances below, so the next run pulls ~1h
-        # instead of the same capped window again.
-        accept_hole = fills_saturated and wallet in soft
-        if accept_hole:
-            coverage_start_ms = max(coverage_start_ms, int(p["oldest_api"]))
-        # price every symbol the ACCUMULATED ledger touched (fee/quote legs), not
-        # just holdings; historical tokens come from l1_token_metadata.csv
-        token_meta_all = dict(_load_token_meta(ns_dir / "l1_token_metadata.csv"))
-        token_meta_all.update(registry.items())
-        ledger_syms = {m.get("symbol") for m in token_meta_all.values()}
-        spot_px = prices.spot_symbol_prices(resolver, spot_meta, spot_ctxs, syms | ledger_syms)
-        token_usd_price = {addr: (1.0 if m.get("is_stablecoin") else spot_px.get(m.get("symbol")))
-                           for addr, m in token_meta_all.items()}
-        token_usd_price = {a: p for a, p in token_usd_price.items() if p is not None}
+            # Analytics run over the wallet's ACCUMULATED ledger (disk + this run), not
+            # just this pull: in incremental mode the pull window is ~1h, but
+            # realized_7d/30d must be computed over everything we hold. Coverage
+            # starts at the earliest window ever pulled for the wallet (watermark).
+            coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
+            if incremental:
+                disk_rows = staged_ledger.rows(wallet)
+                if disk_rows and not prior_wm.get("coverage_start_ms"):
+                    # pre-existing data without a coverage watermark: coverage begins at
+                    # the earliest row we actually hold, not at this (short) window
+                    coverage_start_ms = min(coverage_start_ms,
+                                            min(_iso_to_ms(r["block_timestamp"]) for r in disk_rows))
+                analysis_rows = merge_rows_by_key(disk_rows, l1_rows)
+            else:
+                analysis_rows = l1_rows
+            # Auto-tracked wallet at the API cap with no repair path: the fills before the
+            # oldest one returned are a hole we live with. Contiguous coverage therefore
+            # starts at that fill - the 7d/30d windows stay incomplete until genuinely
+            # covered - and the watermark advances below, so the next run pulls ~1h
+            # instead of the same capped window again.
+            accept_hole = fills_saturated and wallet in soft
+            if accept_hole:
+                coverage_start_ms = max(coverage_start_ms, int(p["oldest_api"]))
+            # price every symbol the ACCUMULATED ledger touched (fee/quote legs), not
+            # just holdings; historical tokens come from l1_token_metadata.csv
+            token_meta_all = dict(_load_token_meta(ns_dir / "l1_token_metadata.csv"))
+            token_meta_all.update(registry.items())
+            ledger_syms = {m.get("symbol") for m in token_meta_all.values()}
+            spot_px = prices.spot_symbol_prices(resolver, spot_meta, spot_ctxs, syms | ledger_syms)
+            token_usd_price = {addr: (1.0 if m.get("is_stablecoin") else spot_px.get(m.get("symbol")))
+                               for addr, m in token_meta_all.items()}
+            token_usd_price = {a: p for a, p in token_usd_price.items() if p is not None}
 
-        # --- analytics contribution + oracle ---------------------------------
-        wa = analytics.compute_analytics(analysis_rows, snap_rows, chs, spot_state, now_ms,
-                                         now_iso, spot_price_by_symbol=spot_px,
-                                         staking=staking, token_usd_price=token_usd_price,
-                                         vault_equities=vaults,
-                                         window_start_ms=coverage_start_ms,
-                                         fills_truncated=(fills_saturated
-                                                          or bool(prior_wm.get("fills_truncated"))),
-                                         account_value_by_dex=account_value_by_dex,
-                                         lending_by_token=lending_by_token,
-                                         open_orders=d.get("open_orders") or [])
-        # PnL oracle: HL's own 24h pnlHistory (perpDay) vs our realized perp cashflow
-        # + change in unrealized since the previous daily snapshot (~24h ago)
-        prior_unreal, prior_age_h = prior_unreal_by_wallet.get(wallet, (None, None))
-        oracle = analytics.validate_against_oracle(
-            wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
-        lending_lazy_pull = lending_deferred = lending_pulled_ok = False
-        lending_mismatch = ((not lending_resolved) and bool(oracle.get("checked"))
-                            and oracle.get("networth_matches") is False)
-        if lending_mismatch and deadline_ts is not None and time.time() >= deadline_ts - _LAZY_PULL_RESERVE_S:
-            # the full-history pull is the one unbounded call of phase 2 (541 s on an
-            # old whale): past the deadline it waits for the next run, uncached
-            lending_deferred = True
-            log.warning("[%s] lazy ledger_all pull skipped (soft deadline) - lending unresolved, "
-                        "retried next run", wallet[:10])
-        elif lending_mismatch:
-            # Net worth without lending does not match HL: the borrow/lend supply is
-            # the one component only the full ledger history reveals — pull it now
-            # (expensive for old whales, hence lazy) and recompute.
-            lending_lazy_pull = True
-            progress(current=wallet, detail="ledger_all pull (full history; up to ~10 min on an old whale)")
-            log.info("[%s] lazy ledger_all pull started (full history; up to ~10 min on an old whale)", wallet[:10])
-            try:
-                ledger_all = client.user_non_funding_ledger_updates(wallet, 0, now_ms)
-                lending_pulled_ok = True
-            except Exception as e:  # noqa: BLE001
-                log.warning("[%s] ledger_all failed: %s", wallet[:10], e)
-                ledger_all = []
-            lending_by_token = analytics.lending_position(ledger_all)
+            # --- analytics contribution + oracle ---------------------------------
             wa = analytics.compute_analytics(analysis_rows, snap_rows, chs, spot_state, now_ms,
                                              now_iso, spot_price_by_symbol=spot_px,
                                              staking=staking, token_usd_price=token_usd_price,
@@ -932,83 +972,127 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                                              account_value_by_dex=account_value_by_dex,
                                              lending_by_token=lending_by_token,
                                              open_orders=d.get("open_orders") or [])
+            # PnL oracle: HL's own 24h pnlHistory (perpDay) vs our realized perp cashflow
+            # + change in unrealized since the previous daily snapshot (~24h ago)
+            prior_unreal, prior_age_h = prior_unreal_by_wallet.get(wallet, (None, None))
             oracle = analytics.validate_against_oracle(
                 wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
-            log.info("[%s] lazy ledger_all pull: lending=%s -> networth_matches=%s",
-                     wallet[:10], lending_by_token, oracle.get("networth_matches"))
-            progress(detail=None)
-        # the lending position is cached only when it is actually known: from the
-        # cache, from a successful full-history pull, or implied by an oracle match
-        # (or an unchecked oracle) without it - never after a skipped or failed pull
-        lending_known = lending_resolved or lending_pulled_ok or not lending_mismatch
-        recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
-        recon["unmapped_ledger_types"] = unknown
-        recon["fetch_errors"] = d["_errors"]
-        recon["window_start_ms"] = w_start_ms
-        recon["twap_slice_fills"] = len(twap_fills)
-        recon["lending_lazy_pull"] = lending_lazy_pull
-        recon["lending_deferred"] = lending_deferred
-        recon["hole_accepted"] = accept_hole
-        recon["coverage_start_ms"] = coverage_start_ms
-        recon["analysis_rows"] = len(analysis_rows)
-        recon["s3_backfill"] = s3_report
-        recon["hip3_dexes_with_equity"] = sorted(account_value_by_dex)
-        recon["hip3_dexes_queried"] = d.get("_dexes_queried", [])
-        # Watermark rules:
-        #  * a window that is still truncated (no/incomplete S3 backfill) does NOT
-        #    advance through_ms, so a later --s3-backfill run re-pulls the same
-        #    window from S3 and genuinely repairs the hole - except for an
-        #    auto-tracked wallet, whose hole was accepted above (coverage_start_ms
-        #    already moved past it) and whose watermark therefore advances;
-        #  * fills_truncated is sticky until a run that is complete AND contiguous
-        #    with the prior watermark (w_start_ms <= prior through_ms) clears it.
-        prior_through = prior_wm.get("through_ms")
-        repaired = (not fills_saturated) and (prior_through is None or w_start_ms <= int(prior_through))
-        sticky = fills_saturated or (bool(prior_wm.get("fills_truncated")) and not repaired)
-        advance = (not fills_saturated) or accept_hole
-        # l4_wallet_metadata is a running aggregate carried next to the watermark and advanced
-        # under the SAME rule (wallet_meta): disjoint windows, exact counts, a capped window
-        # that will be re-pulled is never counted early
-        meta_state = wallet_meta.advance_state(prior_wm.get("meta"), analysis_rows, prior_through, now_ms, advance)
-        watermarks[wallet] = {
-            "through_ms": (now_ms if advance else prior_through),
-            "coverage_start_ms": coverage_start_ms,
-            "fills_truncated": sticky,
-            "lending_by_token": (lending_by_token if lending_known
-                                 else (prior_wm.get("lending_by_token") or {})),
-            "lending_through_ms": (now_ms if lending_known else prior_wm.get("lending_through_ms")),
-            "meta": meta_state,
-            "updated_at": now_iso,
-        }
-        if accept_hole:
-            log.warning("[%s] window capped - hole accepted for an auto-tracked wallet, coverage now starts at %s",
-                        wallet[:10], datetime.fromtimestamp(coverage_start_ms / 1000, tz=timezone.utc).isoformat())
-        elif fills_saturated:
-            log.warning("[%s] window incomplete — watermark kept at %s", wallet[:10], prior_through)
-        recon["spot_price_source"] = "spotMetaAndAssetCtxs"
-        recon["unpriced_held_symbols"] = sorted(s for s in syms
-                                               if s and s.upper() not in _STABLE_SYMBOLS
-                                               and s not in spot_px)
-        recon["unvalued_ledger_rows"] = wa.get("unvalued_ledger_rows", 0)
-        recon["oracle"] = oracle
-        recon_by_wallet[wallet] = recon
-        contrib[wallet] = wa
+            lending_lazy_pull = lending_deferred = lending_pulled_ok = False
+            lending_mismatch = ((not lending_resolved) and bool(oracle.get("checked"))
+                                and oracle.get("networth_matches") is False)
+            if lending_mismatch and deadline_ts is not None and time.time() >= deadline_ts - _LAZY_PULL_RESERVE_S:
+                # the full-history pull is the one unbounded call of phase 2 (541 s on an
+                # old whale): past the deadline it waits for the next run, uncached
+                lending_deferred = True
+                log.warning("[%s] lazy ledger_all pull skipped (soft deadline) - lending unresolved, "
+                            "retried next run", wallet[:10])
+            elif lending_mismatch:
+                # Net worth without lending does not match HL: the borrow/lend supply is
+                # the one component only the full ledger history reveals — pull it now
+                # (expensive for old whales, hence lazy) and recompute.
+                lending_lazy_pull = True
+                progress(current=wallet, detail="ledger_all pull (full history; up to ~10 min on an old whale)")
+                log.info("[%s] lazy ledger_all pull started (full history; up to ~10 min on an old whale)", wallet[:10])
+                try:
+                    ledger_all = client.user_non_funding_ledger_updates(wallet, 0, now_ms)
+                    lending_pulled_ok = True
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[%s] ledger_all failed: %s", wallet[:10], e)
+                    ledger_all = []
+                lending_by_token = analytics.lending_position(ledger_all)
+                wa = analytics.compute_analytics(analysis_rows, snap_rows, chs, spot_state, now_ms,
+                                                 now_iso, spot_price_by_symbol=spot_px,
+                                                 staking=staking, token_usd_price=token_usd_price,
+                                                 vault_equities=vaults,
+                                                 window_start_ms=coverage_start_ms,
+                                                 fills_truncated=(fills_saturated
+                                                                  or bool(prior_wm.get("fills_truncated"))),
+                                                 account_value_by_dex=account_value_by_dex,
+                                                 lending_by_token=lending_by_token,
+                                                 open_orders=d.get("open_orders") or [])
+                oracle = analytics.validate_against_oracle(
+                    wa, portfolio, now_ms, prior_unrealized=prior_unreal, prior_age_h=prior_age_h)
+                log.info("[%s] lazy ledger_all pull: lending=%s -> networth_matches=%s",
+                         wallet[:10], lending_by_token, oracle.get("networth_matches"))
+                progress(detail=None)
+            # the lending position is cached only when it is actually known: from the
+            # cache, from a successful full-history pull, or implied by an oracle match
+            # (or an unchecked oracle) without it - never after a skipped or failed pull
+            lending_known = lending_resolved or lending_pulled_ok or not lending_mismatch
+            recon = _reconcile(l1_rows, snap_rows, chs, fills_saturated, fills, funding)
+            recon["unmapped_ledger_types"] = unknown
+            recon["fetch_errors"] = d["_errors"]
+            recon["window_start_ms"] = w_start_ms
+            recon["twap_slice_fills"] = len(twap_fills)
+            recon["lending_lazy_pull"] = lending_lazy_pull
+            recon["lending_deferred"] = lending_deferred
+            recon["hole_accepted"] = accept_hole
+            recon["coverage_start_ms"] = coverage_start_ms
+            recon["analysis_rows"] = len(analysis_rows)
+            recon["s3_backfill"] = s3_report
+            recon["hip3_dexes_with_equity"] = sorted(account_value_by_dex)
+            recon["hip3_dexes_queried"] = d.get("_dexes_queried", [])
+            # Watermark rules:
+            #  * a window that is still truncated (no/incomplete S3 backfill) does NOT
+            #    advance through_ms, so a later --s3-backfill run re-pulls the same
+            #    window from S3 and genuinely repairs the hole - except for an
+            #    auto-tracked wallet, whose hole was accepted above (coverage_start_ms
+            #    already moved past it) and whose watermark therefore advances;
+            #  * fills_truncated is sticky until a run that is complete AND contiguous
+            #    with the prior watermark (w_start_ms <= prior through_ms) clears it.
+            prior_through = prior_wm.get("through_ms")
+            repaired = (not fills_saturated) and (prior_through is None or w_start_ms <= int(prior_through))
+            sticky = fills_saturated or (bool(prior_wm.get("fills_truncated")) and not repaired)
+            advance = (not fills_saturated) or accept_hole
+            # l4_wallet_metadata is a running aggregate carried next to the watermark and advanced
+            # under the SAME rule (wallet_meta): disjoint windows, exact counts, a capped window
+            # that will be re-pulled is never counted early
+            meta_state = wallet_meta.advance_state(prior_wm.get("meta"), analysis_rows, prior_through, now_ms, advance)
+            watermarks[wallet] = {
+                "through_ms": (now_ms if advance else prior_through),
+                "coverage_start_ms": coverage_start_ms,
+                "fills_truncated": sticky,
+                "lending_by_token": (lending_by_token if lending_known
+                                     else (prior_wm.get("lending_by_token") or {})),
+                "lending_through_ms": (now_ms if lending_known else prior_wm.get("lending_through_ms")),
+                "meta": meta_state,
+                "updated_at": now_iso,
+            }
+            if accept_hole:
+                log.warning("[%s] window capped - hole accepted for an auto-tracked wallet, coverage now starts at %s",
+                            wallet[:10], datetime.fromtimestamp(coverage_start_ms / 1000, tz=timezone.utc).isoformat())
+            elif fills_saturated:
+                log.warning("[%s] window incomplete — watermark kept at %s", wallet[:10], prior_through)
+            recon["spot_price_source"] = "spotMetaAndAssetCtxs"
+            recon["unpriced_held_symbols"] = sorted(s for s in syms
+                                                   if s and s.upper() not in _STABLE_SYMBOLS
+                                                   and s not in spot_px)
+            recon["unvalued_ledger_rows"] = wa.get("unvalued_ledger_rows", 0)
+            recon["oracle"] = oracle
+            recon_by_wallet[wallet] = recon
+            contrib[wallet] = wa
 
-        all_l1 += l1_rows
-        all_snap += snap_rows
-        all_spot += spot_balance_rows(balances, wallet, now_ms, now_iso, resolver, registry=registry)
-        meta_row = wallet_meta.row(wallet, meta_state, now_ms, now_iso)
-        if meta_row is not None:                  # no non-funding activity covered yet: no row
-            wallet_meta_rows.append(meta_row)
-        watchlist_rows.append({
-            "wallet_address": wallet, "wallet_group": S.addr_group(wallet),
-            "is_active": True, "whitelist_reason": "hypercore_ingest",
-            "created_at": now_iso, "updated_at": now_iso,
-        })
-        log.info("[%s] fidelity_ok=%s perp_oracle=%s networth_oracle=%s realized=%.2f unrealized=%.2f",
-                 wallet[:10], recon["fidelity_ok"],
-                 oracle.get("account_value_matches"), oracle.get("networth_matches"),
-                 recon["realized_pnl_window"], recon["unrealized_pnl_now"])
+            all_l1 += l1_rows
+            all_snap += snap_rows
+            all_spot += spot_balance_rows(balances, wallet, now_ms, now_iso, resolver, registry=registry)
+            meta_row = wallet_meta.row(wallet, meta_state, now_ms, now_iso)
+            if meta_row is not None:                  # no non-funding activity covered yet: no row
+                wallet_meta_rows.append(meta_row)
+            watchlist_rows.append({
+                "wallet_address": wallet, "wallet_group": S.addr_group(wallet),
+                "is_active": True, "whitelist_reason": "hypercore_ingest",
+                "created_at": now_iso, "updated_at": now_iso,
+            })
+            log.info("[%s] fidelity_ok=%s perp_oracle=%s networth_oracle=%s realized=%.2f unrealized=%.2f",
+                     wallet[:10], recon["fidelity_ok"],
+                     oracle.get("account_value_matches"), oracle.get("networth_matches"),
+                     recon["realized_pnl_window"], recon["unrealized_pnl_now"])
+
+    finally:
+        staged_ledger.close()
+    # the last wallet's accumulated rows are not needed past this point: drop them before
+    # the write phase (the loop variables would otherwise keep them alive to the end of the run)
+    disk_rows = analysis_rows = l1_rows = None
 
     progress(current=None, detail=None)
     if unknown_types_all:
