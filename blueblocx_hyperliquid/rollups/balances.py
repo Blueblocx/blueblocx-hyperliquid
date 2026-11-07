@@ -22,7 +22,8 @@ import datetime as dt
 
 import pyarrow as pa
 
-from .common import EPOCH, as_date, days_between, ddl_columns, ensure_inputs, group_rows, sort_key, table_from_rows, utc
+from .common import (EPOCH, as_date, concat_tables, days_between, ddl_columns, ensure_inputs, group_rows, ledger_chunk,
+                     sort_key, table_from_rows, utc, wallet_chunks)
 
 
 def running_balances(rows: list[dict], anchor: tuple[dt.datetime, float] | None = None) -> tuple[list[dict], float]:
@@ -125,32 +126,59 @@ def load_anchors(ctx) -> dict[tuple[str, str], tuple[dt.datetime, float]]:
         *(arrow.column(c).to_pylist() for c in ("wallet_address", "token_address", "total", "as_of_ts")))}
 
 
-def compute(ctx) -> dict[str, pa.Table]:
+LEDGER_SELECT = ("SELECT wallet_address, token_address, counterparty_address, block_timestamp, block_date, "
+                 "tx_hash, event_index, direction, amount_raw, amount, amount_signed FROM ledger")
+
+
+def compute(ctx, chunk_rows: int | None = None) -> dict[str, pa.Table]:
+    """Both balance tables for the wallets being recomputed.
+
+    Memory (v1.10.11): the ledger is NOT turned into Python dicts whole (READ_DAYS of
+    every changed wallet: tens of millions of dicts on a backlog day). Wallets are
+    processed in chunks of about `chunk_rows` ledger rows (HL_ROLLUP_BALANCE_CHUNK_ROWS,
+    never splitting a wallet); each chunk's per_tx / dense rows become Arrow before the
+    next chunk is read and the chunk tables are concatenated at the end. The rows are
+    the same as a single pass would produce (every consumer sorts or groups; the
+    writer replaces per wallet), only the Python-dict peak is bounded by one chunk.
+    Anchors, openings and the quiet-pair rule are unchanged."""
     ensure_inputs(ctx, ledger=True, meta=False)
     anchors = load_anchors(ctx)
-    ledger = ctx.sql("SELECT wallet_address, token_address, counterparty_address, block_timestamp, block_date, "
-                     "tx_hash, event_index, direction, amount_raw, amount, amount_signed FROM ledger")
-    per_tx_rows: list[dict] = []
-    dense_rows: list[dict] = []
+    per_tx_cols = ddl_columns("l4_wallet_balance_per_tx")
+    dense_cols = ddl_columns("l4_wallet_balance_1d_dense")
+    per_tx_parts: list[pa.Table] = []
+    dense_parts: list[pa.Table] = []
     openings: list[dict] = []
-    groups = group_rows(ledger, ("wallet_address", "token_address"))
-    for key, rows in groups.items():
-        pt, offset = running_balances(rows, anchors.get(key))
-        per_tx_rows.extend(pt)
-        dense_rows.extend(dense_days(pt, ctx.today, opening=offset))
-        if offset > 0 and pt:
-            openings.append({"wallet_address": key[0], "token_address": key[1], "opening_qty": offset,
-                             "first_block_timestamp": pt[0]["block_timestamp"]})
+    seen_pairs: set[tuple] = set()
+    for chunk in wallet_chunks(ctx, "ledger", chunk_rows):
+        ledger = ledger_chunk(ctx, chunk, LEDGER_SELECT)
+        groups = group_rows(ledger, ("wallet_address", "token_address"))
+        del ledger
+        per_tx_rows: list[dict] = []
+        dense_rows: list[dict] = []
+        for key, rows in groups.items():
+            pt, offset = running_balances(rows, anchors.get(key))
+            per_tx_rows.extend(pt)
+            dense_rows.extend(dense_days(pt, ctx.today, opening=offset))
+            if offset > 0 and pt:
+                openings.append({"wallet_address": key[0], "token_address": key[1], "opening_qty": offset,
+                                 "first_block_timestamp": pt[0]["block_timestamp"]})
+        seen_pairs.update(groups)
+        del groups
+        per_tx_parts.append(table_from_rows(per_tx_rows, per_tx_cols))
+        dense_parts.append(table_from_rows(dense_rows, dense_cols))
+        del per_tx_rows, dense_rows
     # holdings the exchange reports for which the lake has no ledger row at all
     wallets = set(ctx.wallets) if ctx.wallets is not None else None
+    quiet_rows: list[dict] = []
     for key, (as_of_ts, total) in anchors.items():
-        if key in groups or total <= 0 or (wallets is not None and key[0] not in wallets):
+        if key in seen_pairs or total <= 0 or (wallets is not None and key[0] not in wallets):
             continue
-        dense_rows.extend(dense_days([], ctx.today, quiet_pair=(key[0], key[1], as_of_ts.date(), total)))
+        quiet_rows.extend(dense_days([], ctx.today, quiet_pair=(key[0], key[1], as_of_ts.date(), total)))
         openings.append({"wallet_address": key[0], "token_address": key[1], "opening_qty": total,
                          "first_block_timestamp": as_of_ts})
-    per_tx = table_from_rows(per_tx_rows, ddl_columns("l4_wallet_balance_per_tx"))
-    dense = table_from_rows(dense_rows, ddl_columns("l4_wallet_balance_1d_dense"))
+    dense_parts.append(table_from_rows(quiet_rows, dense_cols))
+    per_tx = concat_tables(per_tx_parts, per_tx_cols)
+    dense = concat_tables(dense_parts, dense_cols)
     ctx.register("balance_per_tx_new", per_tx)
     ctx.register("balance_1d_new", dense)
     ctx.register("balance_openings", table_from_rows(openings, [

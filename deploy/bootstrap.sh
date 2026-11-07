@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.10.10}"
+RELEASE_TAG="${RELEASE_TAG:-v1.10.11}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -311,6 +311,11 @@ ensure_env HL_ROLLUP_TIME_BUDGET_MIN 8 "v1.9: minutes per run for the rollup ste
 ensure_env HL_PRICE_HISTORY_DAYS_1D 820 "v1.10: 1d candle history per token (the market fear index calibrates against 730 trailing days)"
 ensure_env HL_PRICE_1M_DAYS 3 "v1.10: 1-minute candles into l3_token_price_usd_1m for the token views, market signals and token quality (0 = off)"
 ensure_env HL_SUPPLY_REFRESH_HOURS 24 "v1.10: hours between two Info tokenDetails calls per token (total supply, deploy time)"
+ensure_env HL_ROLLUP_DUCKDB_MEMORY 32GB "v1.10.11: DuckDB memory_limit of the rollup run (spills to HL_OUT_DIR/.duckdb/rollups beyond it)"
+ensure_env HL_ROLLUP_DUCKDB_THREADS 4 "v1.10.11: DuckDB threads of the rollup run"
+ensure_env HL_ROLLUP_BALANCE_CHUNK_ROWS 2000000 "v1.10.11: per-wallet rollup engines process wallets in chunks of about this many ledger rows"
+ensure_env HL_UPSERT_STREAM_MIN_BYTES 268435456 "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB (bounded memory) instead of Python dicts"
+ensure_env HL_UPSERT_DUCKDB_MEMORY 16GB "v1.10.11: DuckDB memory_limit of the staged-CSV upsert (spills to <state dir>/.duckdb/upsert)"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then

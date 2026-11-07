@@ -97,7 +97,7 @@ sudo useradd --system --home-dir /var/lib/hypercore --no-create-home --shell /us
 sudo usermod -aG hypercore hatsadin
 sudo mkdir -p /var/lib/hypercore && sudo chown hypercore:hypercore /var/lib/hypercore && sudo chmod 750 /var/lib/hypercore
 sudo mkdir -p /opt/blueblocx-hyperliquid && sudo chown hatsadin:hypercore /opt/blueblocx-hyperliquid
-git clone --branch v1.10.10 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
+git clone --branch v1.10.11 git@github-blueblocx-hyperliquid:Blueblocx/blueblocx-hyperliquid.git /opt/blueblocx-hyperliquid
 cd /opt/blueblocx-hyperliquid && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c constraints.txt
 .venv/bin/python -m unittest discover -s tests -t .
 chmod -R g+rX,o-rwx /opt/blueblocx-hyperliquid
@@ -721,6 +721,28 @@ Release notes (state-file and lake-schema changes only):
 | v1.10.8 | none | `l1_token_metadata.total_supply` now carries the **circulating** supply from Info `tokenDetails` (minted total is the fallback when circulating is missing or not in (0, total]); the next hourly run rewrites `market_cap_latest` (35 days) and `token_summary.market_cap_usd` with it. Why: HyperCore deployers mint the whole cap up front (DRV 100B, USDH 100B), so total x price read $38B / $99.7B per token and the platform-wide total market cap swung by tens of billions as these tokens passed or failed the admission gates. `USDH`, `USDE`, `USDXL` join the stablecoin set (`is_stablecoin`, category `stablecoin`, price pinned at 1.0; `USDH` had been summed into the ex-stable total) | `RELEASE_TAG=v1.10.7 bash deploy/bootstrap.sh` (the next run restores total-supply caps) |
 | v1.10.9 | none | `market_cap_latest` / `market_fear_index` gain a liquidity gate: a non-stable token's cap must stay <= 5,000 x its trailing-7-day average spot volume (`rollups/market.py::CAP_MAX_TURNOVER_DAYS`). Why: Info reports circulating == total for most HyperCore tokens, so v1.10.8 still admitted DRV ($38 B on $1.2 M/day), ONEAR ($42 B), ZAMA, LINK0; every genuinely traded token sits below 2,000 (HYPE 548). `l4_wallet_metadata.count_tx` / `active_days` / `first_tx` / `latest_tx` now count token movements only (spot_fill, transfer, deposit, withdraw, mint, burn) - perp PnL, fee, funding, staking reward and interest rows are excluded, the same set the ETL drops from `wallet_transactions` via `HL_WALLET_TX_EVENT_TYPES`; a perp-only wallet has no metadata row. Both take effect on the next hourly run (35 days of market cap rewritten; wallet aggregates re-seed from staging on their next content change - run the ETL's hypercore backfill once to restate Neon) | `RELEASE_TAG=v1.10.8 bash deploy/bootstrap.sh` |
 | v1.10.10 | none | spot fill legs (base, quote, fee, builder fee) carry the market as `counterparty_address`: `market:<base>/<quote>` from spotMeta (`market:@<index>` when the pair is unknown), lowercased. Perp legs keep the coin. The site renders it as "Market HYPE/USDC" with an explanation; downstream consumers must not treat `market:*` as a wallet. Re-run the Neon hypercore backfill once so history is rewritten. |
+| v1.10.11 | none (`.env` gains `HL_ROLLUP_DUCKDB_MEMORY=32GB`, `HL_ROLLUP_DUCKDB_THREADS=4`, `HL_ROLLUP_BALANCE_CHUNK_ROWS=2000000`, `HL_UPSERT_STREAM_MIN_BYTES=268435456`, `HL_UPSERT_DUCKDB_MEMORY=16GB`; bootstrap appends them; new spill directories `<state dir>/.duckdb/upsert` and `HL_OUT_DIR/.duckdb/rollups` are created on demand, empty between runs) | none. **Memory fix** for the OOM-kill of every hourly run since 2026-11-06 ~09:10 UTC (unit `MemoryMax` 96 GiB on a 123 GB host): (1) `extract.upsert_csv` merged the staged ledger (8.5 GB, 28 M rows: retention prunes only after a successful lift, and no lift succeeded) as Python dicts, ~98 GB at peak; a staged file of at least `HL_UPSERT_STREAM_MIN_BYTES` is now merged by DuckDB under `HL_UPSERT_DUCKDB_MEMORY` (`csv_merge.py`; same rows, strings and order, `\n` line ends instead of `\r\n` - every reader is `csv.DictReader`). (2) the rollup DuckDB ran with its default memory_limit (80 % of RAM, above the cgroup cap, so the kernel killed it before it spilled) and no spill dir: now `HL_ROLLUP_DUCKDB_MEMORY`, `HL_ROLLUP_DUCKDB_THREADS`, `preserve_insertion_order=false`, spill under `HL_OUT_DIR/.duckdb/rollups`. (3) `balances` and `fifo` turn the ledger into Python dicts one wallet chunk (`HL_ROLLUP_BALANCE_CHUNK_ROWS` ledger rows, a wallet never split) at a time, Arrow in between; outputs unchanged. (4) **Engine order**: the cheap global groups (categories, market, tokens, signals, quality, pairs, flows, activity) run before the per-wallet chain (balances, networth, fifo, positions, ranks), so the 8-minute budget skips wallet tables, never `market_cap_latest` / `market_fear_index` (stuck since 2026-11-06 19:52 UTC because the wallet chain, ~8 min, came first). The first run after the deploy is a catch-up: expect `rollups.skipped` on the wallet tables for a few hours while the backlog drains | `RELEASE_TAG=v1.10.10 bash deploy/bootstrap.sh` (the five new `.env` keys are ignored by v1.10.10: remove them to silence preflight's `env_unknown` warning, or leave them) |
+
+**Memory controls and engine order (v1.10.11).** The hourly run has three places that
+scale with the staged / lake ledger and each is now bounded independently of its size:
+`extract.upsert_csv` runs the merge of any staged CSV of at least
+`HL_UPSERT_STREAM_MIN_BYTES` (256 MiB; in practice `l1_wallet_ledger.csv`) in DuckDB with
+`memory_limit = HL_UPSERT_DUCKDB_MEMORY` (16GB) spilling to `<state dir>/.duckdb/upsert`
+(the dict path stays for the small dimension / snapshot files and for calls with
+`replace_scope_fn` / `merge_fn`); the rollup `Context` sets `memory_limit =
+HL_ROLLUP_DUCKDB_MEMORY` (32GB), `threads = HL_ROLLUP_DUCKDB_THREADS` (4),
+`preserve_insertion_order = false` and spills to `HL_OUT_DIR/.duckdb/rollups`; the
+per-wallet engines (`balances`, `fifo`) process wallets in chunks of about
+`HL_ROLLUP_BALANCE_CHUNK_ROWS` (2,000,000) ledger rows, converting each chunk to Arrow
+before the next is read. Sizing rule: the two DuckDB limits plus the Python peak of one
+chunk (~3.5 KB per ledger row: ~7 GB at the default) must fit under the unit's
+`MemoryMax`; on the 123 GB / 96 GiB host the defaults leave ample headroom. The rollup
+engines run in the order categories, market, tokens, signals, quality, pairs, flows,
+activity (global groups: seconds each, lake inputs only), then balances, networth, fifo,
+positions, ranks (the per-wallet chain, producers before consumers); the time budget
+(`HL_ROLLUP_TIME_BUDGET_MIN`) therefore skips the expensive wallet tables on a backlog
+hour and the market widgets keep moving. `rollups.GLOBAL_GROUPS` /
+`rollups.ENGINE_DEPENDENCIES` pin the order; `tests/test_rollups.py` checks it.
 
 Several releases at once (e.g. v1.3.0 → v1.8.0 in one bootstrap) is supported: every
 step is cumulative and idempotent (env keys are appended for all releases, `migrate

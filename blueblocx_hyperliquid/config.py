@@ -95,6 +95,24 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
     "HL_ROLLUP_TIME_BUDGET_MIN": ("8", False,
                                   "minutes the rollup step may spend per run; tables whose turn comes later are "
                                   "skipped and reported (rollups.skipped) and caught up by the next run. 0 = no limit"),
+    "HL_ROLLUP_DUCKDB_MEMORY": ("32GB", False,
+                                "v1.10.11: DuckDB memory_limit of the rollup run (spills to HL_OUT_DIR/.duckdb/rollups "
+                                "beyond it). DuckDB's default is 80 % of the host RAM, above the unit's cgroup cap, so "
+                                "the kernel killed the run before DuckDB ever spilled"),
+    "HL_ROLLUP_DUCKDB_THREADS": ("4", False, "v1.10.11: DuckDB threads of the rollup run"),
+    "HL_ROLLUP_BALANCE_CHUNK_ROWS": ("2000000", False,
+                                     "v1.10.11: the per-wallet engines (balances, fifo) process wallets in chunks of "
+                                     "about this many ledger rows (a wallet is never split), converting each chunk to "
+                                     "Arrow before the next: the Python-dict peak is one chunk, not the whole ledger"),
+    # --- staging (extract.upsert_csv) ---------------------------------------------------
+    "HL_UPSERT_STREAM_MIN_BYTES": ("268435456", False,
+                                   "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB under "
+                                   "HL_UPSERT_DUCKDB_MEMORY instead of Python dicts (the 8.5 GB staged ledger of "
+                                   "2026-11-06 needed ~98 GB as dicts). Applies to the ledger (key + sort columns "
+                                   "known); dimension / snapshot files always take the dict path. 0 = always"),
+    "HL_UPSERT_DUCKDB_MEMORY": ("16GB", False,
+                                "v1.10.11: DuckDB memory_limit of the staged-CSV upsert (spills to "
+                                "<state dir>/.duckdb/upsert beyond it)"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock whose holder cannot be observed (another host, no /proc) is treated as "

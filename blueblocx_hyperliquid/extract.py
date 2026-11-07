@@ -70,6 +70,10 @@ _STAMP_AGE_WARN_MIN = 60.0
 # while at least this many seconds remain before the soft deadline; otherwise it is
 # deferred (lending_deferred, retried next run) exactly as if the deadline had passed.
 _LAZY_PULL_RESERVE_S = 12 * 60.0
+# the staged ledger's natural key and sort order as column names (the declarative twin
+# of the key_fn / sort_fn lambdas below; upsert_csv's bounded-memory DuckDB path needs them)
+LEDGER_KEY_COLS = ["tx_hash", "event_index", "direction"]
+LEDGER_SORT_COLS = ["block_timestamp", "tx_hash", ("event_index", "int")]
 
 
 def _now_iso() -> str:
@@ -126,7 +130,8 @@ def content_merge(columns: list[str], *, stamp_col: str = "updated_at",
 
 
 def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
-               sort_fn=None, replace_scope_fn=None, merge_fn=None) -> int:
+               sort_fn=None, replace_scope_fn=None, merge_fn=None,
+               key_cols: list[str] | None = None, sort_cols: list | None = None) -> int:
     """Merge `rows` into the CSV at `path` by natural key (new rows win).
 
     Existing rows are read back as strings; keys are compared as str tuples so
@@ -137,8 +142,28 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
     `merge_fn(old, new)` is given it decides the row for a key present on both
     sides (content_merge: keep the old row - and its stamp - when nothing changed).
     Returns the total row count.
+
+    Two implementations (v1.10.11). The dict path below holds the whole file in
+    Python dicts (~3.5 KB per ledger row: 98 GB for the 28 M-row staged ledger of
+    2026-11-06, OOM-killed every hour). When the caller also passes the key as
+    column names (`key_cols`, plus `sort_cols`: names, or (name, "int") for an
+    integer compare - the declarative twin of key_fn / sort_fn) and the existing
+    file is at least HL_UPSERT_STREAM_MIN_BYTES (256 MiB), the merge runs in
+    DuckDB under HL_UPSERT_DUCKDB_MEMORY (csv_merge.merge_csv_duckdb: same rows,
+    same strings, same order up to tie-breaking). Calls with `replace_scope_fn` or
+    `merge_fn` (the small dimension / snapshot files) always take the dict path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if key_cols and replace_scope_fn is None and merge_fn is None and path.exists():
+        from . import csv_merge
+        size = path.stat().st_size
+        threshold = csv_merge.stream_threshold_bytes()
+        if size >= threshold:
+            log.info("upsert %s: %.1f MB >= HL_UPSERT_STREAM_MIN_BYTES %.1f MB -> DuckDB merge (bounded memory)",
+                     path.name, size / 1e6, threshold / 1e6)
+            total = csv_merge.merge_csv_duckdb(path, columns, rows, key_cols=key_cols, sort_cols=sort_cols)
+            log.info("upserted %-34s +%6d -> %6d rows (duckdb path)", path.name, len(rows), total)
+            return total
     merged: dict[tuple, dict] = {}
     if path.exists():
         with path.open("r", newline="", encoding="utf-8") as fh:
@@ -167,7 +192,7 @@ def upsert_csv(path: Path, columns: list[str], rows: list[dict], *, key_fn,
         for r in out:
             w.writerow({c: ("" if r.get(c) in (None, "") else r[c]) for c in columns})
     os.replace(tmp, path)
-    log.info("upserted %-34s +%6d -> %6d rows%s", path.name, len(rows), len(out),
+    log.info("upserted %-34s +%6d -> %6d rows (dict path)%s", path.name, len(rows), len(out),
              f" ({unchanged} unchanged, stamps kept)" if unchanged else "")
     return len(out)
 
@@ -1081,7 +1106,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     l4x_scope = {(as_of_date, w) for w in run_wallets}
     upsert_csv(ns_dir / "l1_wallet_ledger.csv", S.L1_WALLET_LEDGER_COLUMNS, all_l1,
                key_fn=lambda r: (s(r["tx_hash"]), s(r["event_index"]), s(r["direction"])),
-               sort_fn=lambda r: (s(r["block_timestamp"]), s(r["tx_hash"]), int(r["event_index"])))
+               sort_fn=lambda r: (s(r["block_timestamp"]), s(r["tx_hash"]), int(r["event_index"])),
+               key_cols=LEDGER_KEY_COLS, sort_cols=LEDGER_SORT_COLS)
     # dimension rows: the stamp advances only on a content change (ETL Tier-A), created_at
     # is the first ingestion, first_seen never moves later
     upsert_csv(ns_dir / "l1_token_metadata.csv", S.L1_TOKEN_METADATA_COLUMNS, meta_rows,

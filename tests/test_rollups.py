@@ -3,15 +3,21 @@ pure functions over small synthetic ledgers, no catalog, no network."""
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import math
+import os
+import shutil
 import statistics
+import tempfile
 import unittest
+from pathlib import Path
 
 import pyarrow as pa
 
 from blueblocx_hyperliquid import schema as S
+from blueblocx_hyperliquid import rollups as R
 from blueblocx_hyperliquid.rollups import PLAN, REQUIRED, Budget, balances, categories, fifo, market, quality, signals, tokens
-from blueblocx_hyperliquid.rollups.common import asof, ddl_columns, midrank_percentile, table_from_rows
+from blueblocx_hyperliquid.rollups.common import asof, ddl_columns, midrank_percentile, table_from_rows, wallet_chunks
 
 UTC = dt.timezone.utc
 W = "0xwallet"
@@ -341,6 +347,235 @@ class TokenTests(unittest.TestCase):
         self.assertIsNone(tokens._pct((t1, 2.0), (t0, 0.0)))       # zero previous
         self.assertAlmostEqual(tokens._pct((t1, 2.0), (t0, 1.0), 100.0), 100.0)
         self.assertAlmostEqual(tokens._pct((t1, 2.0), (t0, 1.0)), 1.0)
+
+
+# --- v1.10.11: engine order, DuckDB memory controls, wallet chunking --------------------------
+
+class _Env:
+    def __init__(self, **kv):
+        self.kv, self.saved = kv, {}
+
+    def __enter__(self):
+        for k, v in self.kv.items():
+            self.saved[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def __exit__(self, *a):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# aliases an engine registers for a later engine (anything else reads only the lake)
+_PRODUCED_ALIASES = ("balance_per_tx_new", "balance_1d_new", "balance_openings", "networth_1d_new",
+                     "fifo_state_new", "fifo_pair_realized", "priced_statement", "ctx.outputs")
+
+
+class EngineOrderTests(unittest.TestCase):
+    def test_global_groups_first_then_the_wallet_chain_in_dependency_order(self):
+        order = [g for g, _, _ in R._engines()]
+        self.assertEqual(order, ["categories", "market", "tokens", "signals", "quality", "pairs", "flows", "activity",
+                                 "balances", "networth", "fifo", "positions", "ranks"])
+        self.assertEqual(tuple(order[:len(R.GLOBAL_GROUPS)]), R.GLOBAL_GROUPS)
+        for consumer, producers in R.ENGINE_DEPENDENCIES.items():
+            for p in producers:
+                self.assertLess(order.index(p), order.index(consumer), f"{p} must run before {consumer}")
+        # market_cap_latest / market_fear_index (the platform widgets) come before any per-wallet table
+        produced = {g: t for g, t, _ in R._engines()}
+        self.assertLess(order.index("market"), order.index("balances"))
+        self.assertIn("market_cap_latest", produced["market"])
+        self.assertIn("market_fear_index", produced["market"])
+
+    def test_global_groups_read_nothing_another_engine_registers(self):
+        from blueblocx_hyperliquid.rollups import activity, flows, pairs
+        mods = {"categories": categories, "market": market, "tokens": tokens, "signals": signals, "quality": quality,
+                "pairs": pairs, "flows": flows, "activity": activity}
+        self.assertEqual(set(mods), set(R.GLOBAL_GROUPS))
+        for name, mod in mods.items():
+            src = inspect.getsource(mod)
+            for alias in _PRODUCED_ALIASES:
+                self.assertNotIn(alias, src, f"{name} reads {alias}: it belongs to the per-wallet chain")
+        # every table of a global group is kind global / dated (never replaced per wallet)
+        for g, tables, _ in R._engines():
+            if g in R.GLOBAL_GROUPS:
+                for t in tables:
+                    self.assertNotEqual(PLAN[t]["kind"], "wallet", t)
+
+    def test_wallet_chain_producers_are_declared(self):
+        from blueblocx_hyperliquid.rollups import networth, positions, ranks
+        self.assertIn("balance_1d_new", inspect.getsource(networth))
+        self.assertIn("balance_openings", inspect.getsource(fifo))
+        for alias in ("fifo_state_new", "fifo_pair_realized", "priced_statement"):
+            self.assertIn(alias, inspect.getsource(positions))
+        for table in ("l4_wallet_pnl_realized_1d", "l4_wallet_networth_1d_dense"):
+            self.assertIn(table, inspect.getsource(ranks))
+
+
+class DuckdbSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.out = Path(tempfile.mkdtemp(prefix="hl-rollup-"))
+        self.addCleanup(shutil.rmtree, self.out, True)
+
+    def test_context_applies_memory_limit_threads_temp_dir_and_insertion_order(self):
+        with _Env(HL_OUT_DIR=str(self.out), HL_ROLLUP_DUCKDB_MEMORY="1GB", HL_ROLLUP_DUCKDB_THREADS="2"):
+            settings = R.Context.duckdb_settings()
+            self.assertEqual(settings, {"memory_limit": "1GB", "threads": 2,
+                                        "temp_directory": str(self.out / ".duckdb" / "rollups"),
+                                        "preserve_insertion_order": False})
+            ctx = R.Context(None, S.NS_HYPERCORE, dt.datetime(2026, 11, 7, tzinfo=UTC), wallets=None, all_wallets=True)
+        try:
+            cur = lambda k: ctx.con.execute(f"SELECT current_setting('{k}')").fetchone()[0]  # noqa: E731
+            self.assertEqual(cur("memory_limit"), "953.6 MiB")                   # 1 GB = 953.6 MiB
+            self.assertEqual(int(cur("threads")), 2)
+            self.assertEqual(cur("temp_directory"), str(self.out / ".duckdb" / "rollups"))
+            self.assertFalse(cur("preserve_insertion_order"))
+            self.assertTrue((self.out / ".duckdb" / "rollups").is_dir())           # created on demand
+        finally:
+            ctx.close()
+
+    def test_defaults_and_validation(self):
+        with _Env(HL_OUT_DIR=str(self.out), HL_ROLLUP_DUCKDB_MEMORY=None, HL_ROLLUP_DUCKDB_THREADS=None):
+            s = R.Context.duckdb_settings()
+            self.assertEqual((s["memory_limit"], s["threads"]), ("32GB", 4))
+        with _Env(HL_ROLLUP_DUCKDB_MEMORY="lots"):
+            with self.assertRaises(ValueError):
+                R.Context.duckdb_settings()
+
+
+def _ledger_table(rows: list[dict]) -> pa.Table:
+    cols = [("wallet_address", "STRING"), ("token_address", "STRING"), ("counterparty_address", "STRING"),
+            ("block_timestamp", "TIMESTAMP"), ("block_date", "DATE"), ("tx_hash", "STRING"), ("event_index", "INT"),
+            ("event_type", "STRING"), ("direction", "STRING"), ("amount_raw", "DOUBLE"), ("amount", "DOUBLE"),
+            ("amount_signed", "DOUBLE"), ("decimals", "INT")]
+    return table_from_rows(rows, cols)
+
+
+def _sorted_rows(t: pa.Table) -> list[tuple]:
+    return sorted(tuple(str(v) for v in r.values()) for r in t.to_pylist())
+
+
+class WalletChunkingTests(unittest.TestCase):
+    """balances.compute / fifo.compute: identical outputs whether the wallets are processed
+    one per chunk, three rows per chunk or all at once."""
+
+    def setUp(self):
+        self.out = Path(tempfile.mkdtemp(prefix="hl-rollup-"))
+        self.addCleanup(shutil.rmtree, self.out, True)
+        self.today = dt.date(2026, 10, 6)
+        rows = []
+        for i, w in enumerate(["0xw1", "0xw2", "0xw3", "0xw4", "0xw5"]):
+            for j, tok in enumerate([T, "hlcore:token:2"]):
+                base = 1.0 + i + j
+                rows += [dict(row(1, 1, 10.0 * base, idx=0, tx=f"{w}{tok}a"), wallet_address=w, token_address=tok,
+                              event_type="spot_fill", decimals=6),
+                         dict(row(2, 3, -4.0 * base, idx=1, tx=f"{w}{tok}b"), wallet_address=w, token_address=tok,
+                              event_type="spot_fill", decimals=6),
+                         dict(row(4, 0, 2.5, idx=0, tx=f"{w}{tok}c"), wallet_address=w, token_address=tok,
+                              event_type="transfer", decimals=6)]
+            # a self-transfer pair on w1 (the self-transfer rule) and a row dated today (fifo leaves it out)
+        rows.append(dict(row(3, 0, 1.0, idx=0, cp="0xw1", direction="in", tx="selfin"), wallet_address="0xw1", event_type="transfer"))
+        rows.append(dict(row(3, 0, -1.0, idx=1, cp="0xw1", direction="out", tx="selfout"), wallet_address="0xw1", event_type="transfer"))
+        rows.append(dict(row(6, 1, 3.0, idx=0, tx="today"), wallet_address="0xw2", event_type="spot_fill"))
+        self.rows = rows
+        self.anchors = [  # (wallet, token) -> exchange balance; w3/T pins above, w4/token2 below, w9 is a quiet holding
+            {"wallet_address": "0xw3", "token_address": T, "total": 500.0, "as_of_ts": ts(3)},
+            {"wallet_address": "0xw4", "token_address": "hlcore:token:2", "total": 1.0, "as_of_ts": ts(3)},
+            {"wallet_address": "0xw1", "token_address": "hlcore:token:9", "total": 42.0, "as_of_ts": ts(2)},
+            {"wallet_address": "0xnot", "token_address": T, "total": 7.0, "as_of_ts": ts(2)},
+        ]
+
+    def _ctx(self, wallets=None):
+        with _Env(HL_OUT_DIR=str(self.out), HL_ROLLUP_DUCKDB_MEMORY="1GB"):
+            ctx = R.Context(None, S.NS_HYPERCORE, dt.datetime(2026, 10, 6, 12, tzinfo=UTC), wallets=wallets,
+                            all_wallets=wallets is None)
+        ctx.register("ledger", _ledger_table(self.rows))
+        ctx.register("spot_snap", table_from_rows(self.anchors, [("wallet_address", "STRING"), ("token_address", "STRING"),
+                                                                 ("total", "DOUBLE"), ("as_of_ts", "TIMESTAMP")]))
+        ctx.has_table = lambda name: name == "l4x_spot_balance_snapshot"      # the anchor table "exists"
+        ctx.register("meta", table_from_rows(
+            [{"token_address": T, "symbol": "AAA", "is_stablecoin": False},
+             {"token_address": "hlcore:token:2", "symbol": "USDX", "is_stablecoin": True},
+             {"token_address": "hlcore:token:9", "symbol": "NINE", "is_stablecoin": False}],
+            [("token_address", "STRING"), ("symbol", "STRING"), ("is_stablecoin", "BOOLEAN")]))
+        ctx.register("px1h", table_from_rows(
+            [{"token_address": T, "bucket_minute": ts(d, h), "close_price_usd": px}
+             for d, h, px in ((1, 0, 2.0), (2, 0, 3.0), (3, 0, 1.5), (4, 0, 4.0), (5, 0, 4.5))],
+            [("token_address", "STRING"), ("bucket_minute", "TIMESTAMP"), ("close_price_usd", "DOUBLE")]))
+        return ctx
+
+    def test_wallet_chunks_never_split_a_wallet(self):
+        ctx = self._ctx()
+        try:
+            self.assertEqual(wallet_chunks(ctx, "ledger", 10 ** 9), [["0xw1", "0xw2", "0xw3", "0xw4", "0xw5"]])
+            ones = wallet_chunks(ctx, "ledger", 1)
+            self.assertEqual(ones, [["0xw1"], ["0xw2"], ["0xw3"], ["0xw4"], ["0xw5"]])     # one wallet > chunk: own chunk
+            sevens = wallet_chunks(ctx, "ledger", 7)
+            self.assertEqual([w for c in sevens for w in c], ["0xw1", "0xw2", "0xw3", "0xw4", "0xw5"])
+            self.assertTrue(all(len(c) == 1 for c in sevens))                              # 6-8 rows per wallet
+            self.assertEqual(wallet_chunks(ctx, "ledger", 14), [["0xw1"], ["0xw2", "0xw3"], ["0xw4", "0xw5"]])
+            with _Env(HL_ROLLUP_BALANCE_CHUNK_ROWS="13"):
+                self.assertEqual(wallet_chunks(ctx, "ledger"), [["0xw1"], ["0xw2", "0xw3"], ["0xw4", "0xw5"]])
+        finally:
+            ctx.close()
+
+    def test_balances_parity_across_chunk_sizes(self):
+        results = {}
+        for chunk_rows in (1, 3, 10 ** 9):
+            ctx = self._ctx()
+            try:
+                out = balances.compute(ctx, chunk_rows=chunk_rows)
+                results[chunk_rows] = (_sorted_rows(out["l4_wallet_balance_per_tx"]),
+                                       _sorted_rows(out["l4_wallet_balance_1d_dense"]),
+                                       _sorted_rows(ctx._arrow["balance_openings"]),
+                                       out["l4_wallet_balance_per_tx"].schema, out["l4_wallet_balance_1d_dense"].schema)
+            finally:
+                ctx.close()
+        self.assertEqual(results[1], results[3])
+        self.assertEqual(results[1], results[10 ** 9])
+        per_tx, dense, openings, _, _ = results[1]
+        self.assertEqual(len(per_tx), 5 * 2 * 3 + 1 + 1)                      # the self "in" leg dropped, today's row kept
+        pairs = {(r[0], r[1]) for r in dense}
+        self.assertIn(("0xw1", "hlcore:token:9"), pairs)                      # quiet holding carried from its snapshot
+        self.assertIn(("0xnot", T), pairs)                                    # every wallet in scope: its quiet pair too
+        self.assertEqual({(o[0], o[1]) for o in openings} >= {("0xw3", T), ("0xw1", "hlcore:token:9")}, True)
+
+    def test_balances_parity_with_a_wallet_subset(self):
+        results = []
+        for chunk_rows in (1, 10 ** 9):
+            ctx = self._ctx(wallets=["0xw2", "0xw3"])
+            try:
+                out = balances.compute(ctx, chunk_rows=chunk_rows)
+                results.append((_sorted_rows(out["l4_wallet_balance_per_tx"]), _sorted_rows(out["l4_wallet_balance_1d_dense"])))
+            finally:
+                ctx.close()
+        self.assertEqual(results[0], results[1])
+        # the quiet pair of an out-of-scope wallet is not produced (unchanged rule)
+        self.assertFalse(any(r[0] == "0xnot" for r in results[0][1]))
+
+    def test_fifo_parity_across_chunk_sizes(self):
+        results = {}
+        for chunk_rows in (1, 3, 10 ** 9):
+            ctx = self._ctx()
+            try:
+                balances.compute(ctx, chunk_rows=chunk_rows)                   # registers balance_openings
+                out = fifo.compute(ctx, chunk_rows=chunk_rows)
+                results[chunk_rows] = (_sorted_rows(out["l4_wallet_pnl_state_fifo"]),
+                                       _sorted_rows(out["l4_wallet_pnl_realized_1d"]),
+                                       _sorted_rows(ctx._arrow["fifo_pair_realized"]),
+                                       _sorted_rows(ctx._arrow["priced_statement"]))
+            finally:
+                ctx.close()
+        self.assertEqual(results[1], results[3])
+        self.assertEqual(results[1], results[10 ** 9])
+        states, realized, pair_tot, priced = results[1]
+        self.assertEqual(len(states), 10)                                     # one state per (wallet, token)
+        self.assertTrue(realized)                                             # the day-2 sells realized against day-1 lots
+        self.assertFalse(any("today" in r for r in priced))                  # rows dated today are not folded
 
 
 if __name__ == "__main__":

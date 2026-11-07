@@ -46,7 +46,19 @@ those wallets' ledgers); the run summary and control.table_watermarks say so.
 Time budget: HL_ROLLUP_TIME_BUDGET_MIN (8). A table whose turn comes after the
 budget is spent is SKIPPED and reported (run summary `rollups.skipped`, a warning),
 never silently; the next run picks it up because the state marker only advances
-for tables that were written.
+for tables that were written. Engine ORDER (v1.10.11): the cheap global groups
+(categories, market, tokens, signals, quality, pairs, flows, activity: seconds
+each, no wallet inputs) run first, the heavy per-wallet chain (balances ->
+networth -> fifo -> positions -> ranks: minutes) last, so a run that cannot afford
+everything skips wallet tables, never market_cap_latest (_engines() has the
+dependency rationale).
+
+Memory (v1.10.11): the run's DuckDB is capped at HL_ROLLUP_DUCKDB_MEMORY (32GB,
+spilling to <HL_OUT_DIR>/.duckdb/rollups) on HL_ROLLUP_DUCKDB_THREADS (4) threads,
+and the per-wallet engines process wallets in chunks of about
+HL_ROLLUP_BALANCE_CHUNK_ROWS (2,000,000) ledger rows, converting each chunk to Arrow
+before the next one is read - the Python-dict peak is one chunk, not the whole
+ledger.
 """
 from __future__ import annotations
 
@@ -54,6 +66,7 @@ import argparse
 import datetime as dt
 import json
 import logging
+import re
 import sys
 import time
 import uuid
@@ -142,6 +155,7 @@ class Context:
         self.read_since = self.today - dt.timedelta(days=read_days)
         self.con = duckdb.connect(database=":memory:")
         self.con.execute("SET TimeZone = 'UTC'")
+        self._configure_duckdb()               # before external access is locked: temp_directory is frozen by it
         self.con.execute("SET enable_external_access = false")
         self._loaded: dict[str, int] = {}
         self._arrow: dict[str, pa.Table] = {}
@@ -177,12 +191,56 @@ class Context:
         log.info("rollups: loaded %s as %s: %d rows", name, alias, arrow.num_rows)
         return arrow.num_rows
 
+    def _configure_duckdb(self) -> None:
+        """Memory controls (v1.10.11). DuckDB's default memory_limit is 80 % of the
+        host's RAM (~98 GB on the 123 GB production host), above the unit's cgroup cap,
+        so the kernel's OOM killer fired before DuckDB ever spilled (2026-11-07 11:10 UTC).
+        The limit is HL_ROLLUP_DUCKDB_MEMORY (32GB), the spill directory lives under
+        HL_OUT_DIR (the service user owns it; the system temp dir may be a small tmpfs),
+        the thread count is HL_ROLLUP_DUCKDB_THREADS (4: the rollup SQL is small, the
+        Python engines are single-threaded anyway) and insertion order is not preserved
+        (every consumer sorts or groups; this frees DuckDB to stream)."""
+        settings = self.duckdb_settings()
+        self.temp_dir = settings["temp_directory"]
+        try:
+            Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as e:  # noqa: BLE001 - a read-only HL_OUT_DIR: run without a spill dir
+            log.warning("rollups: cannot create the DuckDB spill dir %s (%s); spilling disabled", self.temp_dir, e)
+            self.temp_dir = None
+        self.con.execute(f"SET memory_limit = '{settings['memory_limit']}'")
+        self.con.execute(f"SET threads = {int(settings['threads'])}")
+        if self.temp_dir:
+            self.con.execute(f"SET temp_directory = '{self.temp_dir.replace(chr(39), chr(39) * 2)}'")
+        self.con.execute("SET preserve_insertion_order = false")
+
+    @staticmethod
+    def duckdb_settings() -> dict:
+        """The DuckDB settings a rollup Context applies, resolved from the environment
+        (config.ENV_VARS defaults when a key is absent or empty)."""
+        memory = (config.env("HL_ROLLUP_DUCKDB_MEMORY") or "32GB").strip()
+        if not re.fullmatch(r"\d+(\.\d+)?\s*[KMGT]i?B", memory, flags=re.IGNORECASE):
+            raise ValueError(f"HL_ROLLUP_DUCKDB_MEMORY must look like '32GB', got {memory!r}")
+        threads = max(1, config.env_int("HL_ROLLUP_DUCKDB_THREADS", 4))
+        return {"memory_limit": memory, "threads": threads,
+                "temp_directory": str(config.out_root() / ".duckdb" / "rollups"),
+                "preserve_insertion_order": False}
+
     def register(self, alias: str, arrow: pa.Table) -> None:
         if alias in self._arrow:
             self.con.unregister(alias)
         self.con.register(alias, arrow)
         self._arrow[alias] = arrow
         self._loaded[alias] = arrow.num_rows
+
+    def unregister(self, alias: str) -> None:
+        """Drop a registered Arrow table (a scratch input an engine no longer needs)."""
+        if alias in self._arrow:
+            try:
+                self.con.unregister(alias)
+            except Exception:  # noqa: BLE001
+                pass
+            self._arrow.pop(alias, None)
+            self._loaded.pop(alias, None)
 
     def has_table(self, name: str) -> bool:
         try:
@@ -306,18 +364,30 @@ def write_table(ctx: Context, name: str, arrow: pa.Table, ddl: dict, *, dry_run:
 # --- engines --------------------------------------------------------------------------------
 
 def _engines() -> list[tuple[str, list[str], Callable[[Context], dict[str, pa.Table]]]]:
-    """(group, tables produced, compute) in dependency order."""
+    """(group, tables produced, compute) in run order.
+
+    Order rationale (v1.10.11). The time budget skips whatever comes after it is
+    spent, so the groups are ordered cheap-and-independent first, heavy last:
+
+    1. the GLOBAL groups, seconds each, read only lake inputs (meta, candles, the
+       whitelist, the last days of every wallet's ledger) and nothing another engine
+       registers: categories, market (market_volume_24h, market_cap_latest,
+       market_fear_index), tokens, signals, quality, pairs, flows, activity. They
+       always land, whatever the per-wallet backlog costs that hour.
+    2. the PER-WALLET chain, minutes for a large changed set, in dependency order:
+       balances registers `balance_per_tx_new`, `balance_1d_new`, `balance_openings`
+       -> networth reads `balance_1d_new`; fifo reads `balance_openings` (the
+       pre-history opening lots) and registers `fifo_state_new`, `fifo_pair_realized`,
+       `priced_statement` -> positions reads those three -> ranks reads the WRITTEN
+       l4_wallet_pnl_realized_1d / l4_wallet_networth_1d_dense / l4_wallet_balance_*
+       back from the lake, so it comes last.
+    networth and positions call their producer themselves when its tables were not
+    registered this run (a --tables subset), which keeps the subset path correct.
+    """
     from . import activity, balances, categories, fifo, flows, market, networth, pairs, positions, quality, ranks, signals, tokens
     return [
+        # -- global groups: cheap, independent of every other engine --------------------
         ("categories", ["l1_token_categories"], categories.compute),
-        ("balances", ["l4_wallet_balance_per_tx", "l4_wallet_balance_1d_dense"], balances.compute),
-        ("networth", ["l4_wallet_networth_1d_dense"], networth.compute),
-        ("fifo", ["l4_wallet_pnl_state_fifo", "l4_wallet_pnl_realized_1d"], fifo.compute),
-        ("positions", ["wallet_token_stats", "wallet_trade_summary"], positions.compute),
-        ("activity", ["wallet_whale_moves_24h", "token_netflow_24h"], activity.compute),
-        ("ranks", ["wallet_overview_pnl_percentile_1d", "wallet_performance_30d", "l4_token_wallet_sharpe_1d"],
-         ranks.compute),
-        # v1.10.0: token / market tables (phases B and C)
         ("market", ["market_volume_24h", "market_cap_latest", "market_fear_index"], market.compute),
         ("tokens", ["token_stats", "token_price_gainers", "token_new_rank", "token_beta_volatility_sharp",
                     "token_activity_trending", "token_active_address", "token_summary"], tokens.compute),
@@ -325,7 +395,26 @@ def _engines() -> list[tuple[str, list[str], Callable[[Context], dict[str, pa.Ta
         ("quality", ["token_quality"], quality.compute),
         ("pairs", ["dex_pair_volume_1d"], pairs.compute),
         ("flows", ["exchange_flow"], flows.compute),
+        ("activity", ["wallet_whale_moves_24h", "token_netflow_24h"], activity.compute),
+        # -- per-wallet chain: producers before consumers ---------------------------------
+        ("balances", ["l4_wallet_balance_per_tx", "l4_wallet_balance_1d_dense"], balances.compute),
+        ("networth", ["l4_wallet_networth_1d_dense"], networth.compute),
+        ("fifo", ["l4_wallet_pnl_state_fifo", "l4_wallet_pnl_realized_1d"], fifo.compute),
+        ("positions", ["wallet_token_stats", "wallet_trade_summary"], positions.compute),
+        ("ranks", ["wallet_overview_pnl_percentile_1d", "wallet_performance_30d", "l4_token_wallet_sharpe_1d"],
+         ranks.compute),
     ]
+
+
+# the groups that read nothing another engine registers (tests pin the order)
+GLOBAL_GROUPS = ("categories", "market", "tokens", "signals", "quality", "pairs", "flows", "activity")
+# consumer group -> the producer groups that must have run before it
+ENGINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "networth": ("balances",),
+    "fifo": ("balances",),
+    "positions": ("fifo",),
+    "ranks": ("balances", "networth", "fifo"),
+}
 
 
 def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: float | None = None,

@@ -83,7 +83,9 @@ def run(wallets: list[str], blocks: int, out_dir: Path, rpc_url: str | None = No
 
     upsert_csv(ns_dir / "l1_wallet_ledger.csv", S.L1_WALLET_LEDGER_COLUMNS, all_rows,
                key_fn=lambda r: (s(r["tx_hash"]), s(r["event_index"]), s(r["direction"])),
-               sort_fn=lambda r: (int(r["block_number"]), s(r["tx_hash"]), int(r["event_index"])))
+               sort_fn=lambda r: (int(r["block_number"]), s(r["tx_hash"]), int(r["event_index"])),
+               key_cols=["tx_hash", "event_index", "direction"],
+               sort_cols=[("block_number", "int"), "tx_hash", ("event_index", "int")])
     meta_rows = token_metadata_rows(registry, now_iso)
     for m in meta_rows:
         m["source"] = "hyperevm:eth_call"

@@ -169,6 +169,52 @@ def stable_tokens(ctx) -> set[str]:
     return set(arrow.column("token_address").to_pylist()) | {S.USDC_ADDRESS}
 
 
+def balance_chunk_rows() -> int:
+    """HL_ROLLUP_BALANCE_CHUNK_ROWS (2,000,000): about how many ledger rows the per-wallet
+    engines turn into Python dicts at a time."""
+    from .. import config
+    return max(1, config.env_int("HL_ROLLUP_BALANCE_CHUNK_ROWS", 2_000_000))
+
+
+def wallet_chunks(ctx, alias: str = "ledger", chunk_rows: int | None = None) -> list[list[str]]:
+    """The wallets of `alias`, sorted, grouped into chunks of about `chunk_rows` ledger
+    rows each: a wallet is never split (its whole ledger is one running total), so a
+    single wallet larger than the chunk forms a chunk of its own."""
+    chunk_rows = chunk_rows or balance_chunk_rows()
+    counts = ctx.sql(f"SELECT wallet_address, count(*) AS n FROM {alias} GROUP BY 1 ORDER BY 1")
+    chunks: list[list[str]] = []
+    cur: list[str] = []
+    cur_n = 0
+    for w, n in zip(counts.column("wallet_address").to_pylist(), counts.column("n").to_pylist()):
+        if cur and cur_n + n > chunk_rows:
+            chunks.append(cur)
+            cur, cur_n = [], 0
+        cur.append(w)
+        cur_n += n
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def ledger_chunk(ctx, wallets: list[str], select_sql: str) -> pa.Table:
+    """`select_sql` (a SELECT ... FROM <alias> without WHERE) restricted to `wallets`
+    through a scratch Arrow table (not an IN literal: a chunk may hold thousands)."""
+    scratch = "_chunk_wallets"
+    ctx.register(scratch, pa.table({"wallet_address": pa.array(wallets, pa.string())}))
+    try:
+        return ctx.sql(f"{select_sql} WHERE wallet_address IN (SELECT wallet_address FROM {scratch})")
+    finally:
+        ctx.unregister(scratch)
+
+
+def concat_tables(parts: list[pa.Table], cols: list[tuple[str, str]]) -> pa.Table:
+    """One table from per-chunk tables built by table_from_rows(cols) (same schema)."""
+    parts = [t for t in parts if t.num_rows]
+    if not parts:
+        return table_from_rows([], cols)
+    return pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+
+
 def table_from_rows(rows: list[dict], cols: list[tuple[str, str]]) -> pa.Table:
     """Arrow table with the DDL columns (typed), from python dicts; missing keys -> NULL."""
     from ..iceberg_load import _arrow_type

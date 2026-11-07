@@ -16,8 +16,8 @@ import datetime as dt
 
 import pyarrow as pa
 
-from .common import (QTY_EPSILON, as_date, asof, ddl_columns, ensure_inputs, group_rows, hourly_prices,
-                     sort_key, stable_tokens, table_from_rows, utc)
+from .common import (QTY_EPSILON, as_date, asof, concat_tables, ddl_columns, ensure_inputs, group_rows, hourly_prices,
+                     ledger_chunk, sort_key, stable_tokens, table_from_rows, utc, wallet_chunks)
 
 
 def price_rows(rows: list[dict], prices: dict[str, list], stables: set[str], cutoff: dt.date) -> list[dict]:
@@ -115,52 +115,65 @@ def opening_lots(ctx, prices: dict[str, list], stables: set[str]) -> dict[tuple[
     return out
 
 
-def compute(ctx) -> dict[str, pa.Table]:
+LEDGER_SELECT = ("SELECT wallet_address, token_address, counterparty_address, block_timestamp, block_date, "
+                 "tx_hash, event_index, direction, amount_raw, amount, amount_signed FROM ledger")
+PRICED_COLS = [("wallet_address", "STRING"), ("token_address", "STRING"), ("block_date", "DATE"),
+               ("direction", "STRING"), ("amount", "DOUBLE"), ("amount_signed", "DOUBLE"), ("price_usd", "DOUBLE")]
+
+
+def compute(ctx, chunk_rows: int | None = None) -> dict[str, pa.Table]:
+    """FIFO state and daily realized rows for the wallets being recomputed.
+
+    Memory (v1.10.11): the same wallet-chunk pattern as balances.compute - wallets in
+    chunks of about `chunk_rows` ledger rows (HL_ROLLUP_BALANCE_CHUNK_ROWS, a wallet
+    never split); a chunk's priced statement becomes Arrow at once and its sell rows
+    are folded into the daily / per-pair totals before the next chunk is read. Rows
+    identical to the single pass (FIFO is per (wallet, token); the aggregates are sums)."""
     ensure_inputs(ctx, ledger=True, meta=True, px1h=True)
     prices = hourly_prices(ctx)
     stables = stable_tokens(ctx)
     openings = opening_lots(ctx, prices, stables)
-    ledger = ctx.sql("SELECT wallet_address, token_address, counterparty_address, block_timestamp, block_date, "
-                     "tx_hash, event_index, direction, amount_raw, amount, amount_signed FROM ledger")
     cutoff = ctx.today                         # rows dated today are not folded
     states: list[dict] = []
-    sells: list[dict] = []
-    priced: list[dict] = []
-    for (wallet,), rows in group_rows(ledger, ("wallet_address",)).items():
-        pr = price_rows(rows, prices, stables, cutoff)
-        priced.extend(pr)
-        by_token: dict[str, list[dict]] = {}
-        for r in pr:
-            by_token.setdefault(r["token_address"], []).append(r)
-        for _tok, trows in by_token.items():
-            opening = openings.get((wallet, _tok))
-            if opening is not None and opening["block_date"] < cutoff:
-                trows = [opening] + trows      # the pre-history holding is the first lot
-            st, sl = fifo_pair(trows)
-            states.append(st)
-            sells.extend(sl)
-    # daily realized per wallet
-    daily: dict[tuple, dict] = {}
-    for s in sells:
-        k = (s["wallet_address"], s["block_date"])
-        d = daily.setdefault(k, {"wallet_address": k[0], "snapshot_date": k[1], "realized_pnl_usd": 0.0,
-                                 "proceeds_usd": 0.0, "cost_usd": 0.0, "num_sells": 0})
-        d["realized_pnl_usd"] += s["realized_pnl_usd"]
-        d["proceeds_usd"] += s["proceeds_usd"]
-        d["cost_usd"] += s["cost_usd"]
-        d["num_sells"] += 1
+    daily: dict[tuple, dict] = {}              # (wallet, day) -> realized row
+    pair_tot: dict[tuple, float] = {}          # (wallet, token) -> realized total (positions engine)
+    priced_parts: list[pa.Table] = []
+    for chunk in wallet_chunks(ctx, "ledger", chunk_rows):
+        ledger = ledger_chunk(ctx, chunk, LEDGER_SELECT)
+        groups = group_rows(ledger, ("wallet_address",))
+        del ledger
+        priced: list[dict] = []
+        for (wallet,), rows in groups.items():
+            pr = price_rows(rows, prices, stables, cutoff)
+            priced.extend(pr)
+            by_token: dict[str, list[dict]] = {}
+            for r in pr:
+                by_token.setdefault(r["token_address"], []).append(r)
+            for _tok, trows in by_token.items():
+                opening = openings.get((wallet, _tok))
+                if opening is not None and opening["block_date"] < cutoff:
+                    trows = [opening] + trows      # the pre-history holding is the first lot
+                st, sl = fifo_pair(trows)
+                states.append(st)
+                for s in sl:
+                    k = (s["wallet_address"], s["block_date"])
+                    d = daily.setdefault(k, {"wallet_address": k[0], "snapshot_date": k[1], "realized_pnl_usd": 0.0,
+                                             "proceeds_usd": 0.0, "cost_usd": 0.0, "num_sells": 0})
+                    d["realized_pnl_usd"] += s["realized_pnl_usd"]
+                    d["proceeds_usd"] += s["proceeds_usd"]
+                    d["cost_usd"] += s["cost_usd"]
+                    d["num_sells"] += 1
+                    pk = (s["wallet_address"], s["token_address"])
+                    pair_tot[pk] = pair_tot.get(pk, 0.0) + s["realized_pnl_usd"]
+        del groups
+        priced_parts.append(table_from_rows(priced, PRICED_COLS))
+        del priced
     state_t = table_from_rows(states, ddl_columns("l4_wallet_pnl_state_fifo"))
     realized_t = table_from_rows(list(daily.values()), ddl_columns("l4_wallet_pnl_realized_1d"))
     # side tables for the positions engine
     pair_cols = [("wallet_address", "STRING"), ("token_address", "STRING"), ("realized_pnl_usd", "DOUBLE")]
-    pair_tot: dict[tuple, float] = {}
-    for s in sells:
-        k = (s["wallet_address"], s["token_address"])
-        pair_tot[k] = pair_tot.get(k, 0.0) + s["realized_pnl_usd"]
     ctx.register("fifo_pair_realized", table_from_rows(
         [{"wallet_address": w, "token_address": t, "realized_pnl_usd": v} for (w, t), v in pair_tot.items()], pair_cols))
-    priced_cols = [("wallet_address", "STRING"), ("token_address", "STRING"), ("block_date", "DATE"),
-                   ("direction", "STRING"), ("amount", "DOUBLE"), ("amount_signed", "DOUBLE"), ("price_usd", "DOUBLE")]
-    ctx.register("priced_statement", table_from_rows(priced, priced_cols))
+    ctx.register("priced_statement", concat_tables(priced_parts, PRICED_COLS))
     ctx.register("fifo_state_new", state_t)
     return {"l4_wallet_pnl_state_fifo": state_t, "l4_wallet_pnl_realized_1d": realized_t}
