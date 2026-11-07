@@ -349,7 +349,12 @@ def open_ledger_rows(path: Path, wallets: set[str], *, temp_dir: Path | None = N
     analysed is Python dicts, so the analyse / write / lift peak no longer scales with
     the staged file (every tracked wallet is in the hourly run, so the dict path held
     the WHOLE 28 M-row file: ~60 GB of the 64 GB peak measured on 2026-11-07). Below the
-    threshold (or with no file / no wallets) the dict path runs exactly as before."""
+    threshold (or with no file / no wallets) the dict path runs exactly as before.
+    v1.10.14: the store drops to HL_LEDGER_STORE_SERVE_MEMORY (2GB) once loaded, sweeps
+    the scratch databases of dead runs, and raises csv_merge.StagedCsvError (file name,
+    repair hint) for a file DuckDB cannot read as a rectangular CSV - the dict path
+    pads / collects a ragged row silently, but the write phase's DuckDB merge would have
+    failed on the same file anyway."""
     path = Path(path)
     if not wallets or not path.exists():
         return _DictLedgerRows({w: [] for w in wallets})
@@ -866,6 +871,9 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     # ledger is served per wallet (open_ledger_rows: DuckDB-backed above the stream
     # threshold, so only the wallet being analysed is Python dicts) and released before
     # the write phase, whose own DuckDB merge then has the memory to itself (v1.10.13).
+    # v1.10.14: the store serves under HL_LEDGER_STORE_SERVE_MEMORY once loaded, and the
+    # loop drops a wallet's rows before fetching the next, so the analyse peak is the load
+    # (HL_UPSERT_DUCKDB_MEMORY) or the serve limit + ONE wallet, whichever is larger.
     progress(phase="analyse")
     run_wallets = {p["wallet"] for p in pending}
     staged_ledger = (open_ledger_rows(ns_dir / "l1_wallet_ledger.csv", run_wallets)
@@ -933,6 +941,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
             # realized_7d/30d must be computed over everything we hold. Coverage
             # starts at the earliest window ever pulled for the wallet (watermark).
             coverage_start_ms = min(w_start_ms, int(prior_wm.get("coverage_start_ms") or w_start_ms))
+            # release the previous wallet's rows BEFORE fetching this one: the names were
+            # otherwise rebound only after rows() had materialised the next wallet, so two
+            # wallets' dicts were resident at once (v1.10.14)
+            disk_rows = analysis_rows = None
             if incremental:
                 disk_rows = staged_ledger.rows(wallet)
                 if disk_rows and not prior_wm.get("coverage_start_ms"):
@@ -1264,7 +1276,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         # 1h margin) are read from the staged CSVs and checked against the lake, so
         # a daily run costs O(new rows), not O(45 days of staging) over the network.
         # The cut-off never passes THIS run's own stamp (a long hand run that overlaps
-        # a scheduled lift must still lift its rows).
+        # a scheduled lift must still lift its rows). With NO marker (first lift, a
+        # deleted / reset _lift_state.json) this is a FULL lift: read_csv_rows then holds
+        # every staged row as dicts (~1.4 KB per row: ~40 GB at the 8.5 GB ledger) - at
+        # that size reset the marker only with MemoryMax raised, or lift with --since.
         lift_state = read_lift_state(ns_dir) if incremental else {}
         prev_lift = lift_state.get("last_success_run_iso")
         progress(phase="lift")

@@ -116,10 +116,16 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                    "2026-11-06 needed ~98 GB as dicts). Applies to the ledger (key + sort columns "
                                    "known); dimension / snapshot files always take the dict path. v1.10.12: the "
                                    "same threshold selects the DuckDB retention prune; v1.10.13: and the analyse "
-                                   "phase's per-wallet ledger store (extract.open_ledger_rows). 0 = always"),
+                                   "phase's per-wallet ledger store (extract.open_ledger_rows); v1.10.14: and the "
+                                   "lift's since-filtered read of a staged file (iceberg_load.read_csv_rows). 0 = always"),
     "HL_UPSERT_DUCKDB_MEMORY": ("16GB", False,
                                 "v1.10.11: DuckDB memory_limit of the staged-CSV upsert, retention prune and (v1.10.13) "
                                 "the analyse phase's wallet store (spills to <state dir>/.duckdb/upsert beyond it)"),
+    "HL_LEDGER_STORE_SERVE_MEMORY": ("2GB", False,
+                                     "v1.10.14: once the analyse phase's wallet store has loaded the staged ledger "
+                                     "(under HL_UPSERT_DUCKDB_MEMORY) it drops its DuckDB memory_limit to this for the "
+                                     "per-wallet reads, so the buffer pool is not held at the load limit across the "
+                                     "whole analyse loop"),
     # --- daily runner -----------------------------------------------------------------
     "HL_LOCK_STALE_HOURS": ("2", False,
                             "a run lock whose holder cannot be observed (another host, no /proc) is treated as "

@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import gc
 import json
 import random
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -268,6 +272,153 @@ class ExtractRunParityTests(unittest.TestCase):
         self.assertEqual(m1[W2]["count_tx"], "5")
         self.assertEqual(a["watermarks"][W1]["meta"]["count_tx"], 30)
         self.assertEqual(len(a["ledger"]), 30 + 5 + 1 + 2)
+
+    def test_a_wallets_rows_are_released_before_the_next_wallet_is_fetched(self):
+        """v1.10.14: the analyse loop drops disk_rows / analysis_rows before staged_ledger.rows()
+        materialises the next wallet, so only ONE wallet's dicts are ever resident (before, the
+        names were rebound after the fetch and two wallets - up to 7.1 M + 1.6 M rows on the
+        live host - were alive at once)."""
+        class _L(list):
+            __slots__ = ("__weakref__",)
+
+        alive_at_fetch: list[list[bool]] = []
+        real_open = extract.open_ledger_rows
+
+        def fake_open(path, wallets, **kw):
+            src = real_open(path, wallets, **kw)
+            orig, prev = src.rows, []
+
+            def rows(w):
+                gc.collect()
+                alive_at_fetch.append([ref() is not None for ref in prev])
+                out = _L(orig(w))
+                prev.append(weakref.ref(out))
+                return out
+            src.rows = rows
+            return src
+
+        with tempfile.TemporaryDirectory() as d:
+            ns = Path(d) / S.NS_HYPERCORE
+            ns.mkdir(parents=True)
+            rows = [_row(W1, i, T0 - (40 - i) * H) for i in range(30)]
+            rows += [_row(W2, 50 + i, T0 - (10 - i) * H) for i in range(5)]
+            _write(ns / "l1_wallet_ledger.csv", rows)
+            clock = _FakeTime(T0 / 1000)
+            fake = _FakeClient
+            fake.clock, fake.bump, fake.fills = clock, 0.0, {W1: [dict(self.FILL, time=T0 - H, tid=1)]}
+            with mock.patch.object(extract, "InfoClient", fake), mock.patch.object(extract, "time", clock), \
+                    mock.patch.object(extract, "open_ledger_rows", fake_open):
+                recon = extract.run([W1, W2], 2, Path(d), incremental=True, hip3=False, soft_wallets={W1, W2})
+        self.assertEqual(recon["wallets"], [W1, W2])
+        self.assertEqual(recon["by_wallet"][W1]["analysis_rows"], 32)
+        # at the second fetch the first wallet's list is already gone
+        self.assertEqual(alive_at_fetch, [[], [False]])
+
+
+class StoreHardeningTests(unittest.TestCase):
+    """v1.10.14: a clear error for a ragged staged file, the stale-scratch sweep and the
+    lowered serving memory_limit of csv_merge.WalletRowStore."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="hl-ledger-store-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = self.dir / "l1_wallet_ledger.csv"
+        self.scratch = self.dir / ".duckdb" / "upsert"
+
+    def test_ragged_file_raises_a_clear_error_above_the_threshold(self):
+        """csv.DictReader pads a short row (restval None) and collects a long one (restkey):
+        the dict path serves the wallet. DuckDB with the explicit column list refuses the
+        file; the store turns the sniffing error into StagedCsvError naming the file and
+        saying that lowering the threshold is not a fix (the write phase's merge of the
+        same file fails since v1.10.11). Nothing is left under the scratch dir."""
+        good = _row(A, 1, T0 - H)
+        with self.path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(S.L1_WALLET_LEDGER_COLUMNS)
+            w.writerow([good[c] for c in S.L1_WALLET_LEDGER_COLUMNS])
+            w.writerow([good[c] for c in S.L1_WALLET_LEDGER_COLUMNS][:-2])           # 2 fields short
+        got = extract._load_ledger_rows_by_wallet(self.path, {A})[A]
+        self.assertEqual(len(got), 2)
+        self.assertIsNone(got[1]["updated_at"])                                      # DictReader restval
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"):
+            with self.assertRaises(csv_merge.StagedCsvError) as cm:
+                extract.open_ledger_rows(self.path, {A})
+            msg = str(cm.exception)
+            self.assertIn(str(self.path), msg)
+            self.assertIn("HL_UPSERT_STREAM_MIN_BYTES is not a fix", msg)
+            self.assertIsInstance(cm.exception, RuntimeError)
+            self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), [])       # scratch db removed
+            # the lift's DuckDB read of the same file says the same
+            with self.assertRaises(csv_merge.StagedCsvError):
+                csv_merge.csv_rows_since_duckdb(self.path, S.L1_WALLET_LEDGER_COLUMNS, "updated_at", None)
+            # a long row too
+            with self.path.open("a", newline="", encoding="utf-8") as fh:
+                csv.writer(fh).writerow([good[c] for c in S.L1_WALLET_LEDGER_COLUMNS] + ["extra"])
+            with self.assertRaises(csv_merge.StagedCsvError):
+                extract.open_ledger_rows(self.path, {A})
+        # the dict path (below the threshold) still serves it, as before
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES=None):
+            src = extract.open_ledger_rows(self.path, {A})
+            self.assertEqual((src.kind, len(src.rows(A))), ("dict", 3))
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "pid liveness needs /proc")
+    def test_stale_scratch_databases_of_dead_runs_are_swept(self):
+        _write(self.path, [_row(A, 1, T0 - H)])
+        self.scratch.mkdir(parents=True)
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        dead = proc.pid
+        self.assertFalse(Path(f"/proc/{dead}").exists())
+        stale_db = self.scratch / f"ledger_rows.{dead}.duckdb"
+        stale_wal = self.scratch / f"ledger_rows.{dead}.duckdb.wal"
+        live = self.scratch / "ledger_rows.1.duckdb"                   # pid 1 is alive: left alone
+        other = self.scratch / "other.tmp"                            # not a scratch db: left alone
+        odd = self.scratch / "ledger_rows.abc.duckdb"                 # no pid: left alone
+        for p in (stale_db, stale_wal, live, other, odd):
+            p.write_bytes(b"x" * 1024)
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"), \
+                self.assertLogs("blueblocx_hyperliquid.csv_merge", level="WARNING") as logs:
+            src = extract.open_ledger_rows(self.path, {A})
+        try:
+            self.assertEqual(src._store.swept, [stale_db, stale_wal])
+            self.assertFalse(stale_db.exists())
+            self.assertFalse(stale_wal.exists())
+            self.assertTrue(live.exists() and other.exists() and odd.exists())
+            self.assertTrue(src._store.db_path.exists())
+            self.assertIn(f"dead pid {dead}", "\n".join(logs.output))
+            self.assertEqual(len(src.rows(A)), 1)
+        finally:
+            src.close()
+        self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), sorted([live.name, other.name, odd.name]))
+        # the sweep alone: nothing to do is nothing removed, a missing dir is not an error
+        self.assertEqual(csv_merge.sweep_stale_scratch(self.scratch), [])
+        self.assertEqual(csv_merge.sweep_stale_scratch(self.dir / "nope"), [])
+
+    def test_store_serves_under_the_lowered_memory_limit(self):
+        rows = _ledger_rows()
+        _write(self.path, rows)
+        expect = extract._load_ledger_rows_by_wallet(self.path, {A, B})
+
+        def limit(store) -> str:
+            return store._con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0", HL_UPSERT_DUCKDB_MEMORY="16GB", HL_LEDGER_STORE_SERVE_MEMORY=None), \
+                self.assertLogs("blueblocx_hyperliquid.csv_merge", level="INFO") as logs:
+            with extract.open_ledger_rows(self.path, {A, B}) as src:
+                st = src._store
+                self.assertEqual((st.memory_limit, st.serve_memory_limit), ("16GB", "2GB"))
+                self.assertEqual(limit(st), "1.8 GiB")                   # DuckDB's rendering of 2GB
+                for w in (A, B):
+                    self.assertEqual(src.rows(w), expect[w])              # parity after the drop
+        self.assertIn("serving under memory_limit 2GB", "\n".join(logs.output))
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0", HL_LEDGER_STORE_SERVE_MEMORY="512MB"):
+            with extract.open_ledger_rows(self.path, {A}) as src:
+                self.assertEqual(limit(src._store), "488.2 MiB")
+                self.assertEqual(src.rows(A), expect[A])
+        with _Env(HL_UPSERT_STREAM_MIN_BYTES="0", HL_LEDGER_STORE_SERVE_MEMORY="lots"):
+            with self.assertRaises(ValueError):
+                extract.open_ledger_rows(self.path, {A})
+        self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), [])
 
 
 if __name__ == "__main__":

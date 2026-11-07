@@ -11,7 +11,12 @@ widths) under --dir (default /tmp) and measures, each in its OWN subprocess, the
 
 Both passes compute the same checksum over the rows they serve (row count, sum of
 amount_signed, hash of tx_hash / event_index order), so the numbers come with a parity
-check. Never touches a state dir: everything lives under --dir and is removed unless
+check. v1.10.14: --skew gives the production shape of 2026-11-07 (one wallet 25 % of the
+rows, one 20 %, the rest as before; the default has at most ~6 % in one wallet), the
+serve-phase RSS (VmRSS sampled after every wallet, i.e. the store after it dropped to
+HL_LEDGER_STORE_SERVE_MEMORY plus one wallet's dicts) is reported next to the max RSS
+(which for the new path is the load under HL_UPSERT_DUCKDB_MEMORY), and the previous
+wallet's rows are dropped before the next is fetched, as the analyse loop does. Never touches a state dir: everything lives under --dir and is removed unless
 --keep. Note: on a host where /tmp is tmpfs the file and the scratch database are RAM
 too (host memory, not the measured process RSS); pass --dir on a disk for a cold read.
 
@@ -42,7 +47,7 @@ from blueblocx_hyperliquid import schema as S  # noqa: E402
 T0 = 1_762_500_000_000       # 2026-11-07T06:40:00Z (ms)
 
 
-def build_csv(path: Path, rows: int, wallets: int, seed: int = 1) -> list[str]:
+def build_csv(path: Path, rows: int, wallets: int, seed: int = 1, skew: bool = False) -> list[str]:
     rnd = random.Random(seed)
     addrs = ["0x" + hashlib.sha1(f"w{i}".encode()).hexdigest()[:40] for i in range(wallets)]
     tokens = [S.USDC_ADDRESS] + [f"hlcore:token:{i}" for i in range(1, 40)]
@@ -50,6 +55,10 @@ def build_csv(path: Path, rows: int, wallets: int, seed: int = 1) -> list[str]:
              "perp_realized_pnl"]
     # a skewed wallet distribution: the market-maker wallets own most of the rows
     weights = [1.0 / (i + 1) ** 0.6 for i in range(wallets)]
+    if skew and wallets >= 3:
+        # the live _reconciliation.json of 2026-11-07: 26 % and 20 % of 27.3 M rows in two wallets
+        rest = sum(weights[2:])
+        weights = [0.25, 0.20] + [0.55 * w / rest for w in weights[2:]]
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(S.L1_WALLET_LEDGER_COLUMNS)
@@ -76,13 +85,26 @@ def _checksum(rows: list[dict], state: dict) -> None:
         h.update(str(r["event_index"]).encode())
 
 
-def child(mode: str, path: Path, wallets: list[str], duckdb_memory: str | None, tmp: Path) -> dict:
+def _vm_rss_kb() -> int:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def child(mode: str, path: Path, wallets: list[str], duckdb_memory: str | None, tmp: Path,
+          serve_memory: str | None = None) -> dict:
     from blueblocx_hyperliquid import extract
     state = {"rows": 0, "amount": 0.0, "hash": hashlib.sha256()}
     wanted = set(wallets)
     t0 = time.monotonic()
     rss_after_load = None
     largest = 0
+    serve_peak_kb = 0
     if mode == "old":
         by_wallet = extract._load_ledger_rows_by_wallet(path, wanted)
         rss_after_load = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -90,18 +112,25 @@ def child(mode: str, path: Path, wallets: list[str], duckdb_memory: str | None, 
             rows = by_wallet.get(w, [])
             largest = max(largest, len(rows))
             _checksum(extract.merge_rows_by_key(rows, []), state)
+            serve_peak_kb = max(serve_peak_kb, _vm_rss_kb())
     elif mode == "new":
         os.environ["HL_UPSERT_STREAM_MIN_BYTES"] = "0"
         if duckdb_memory:
             os.environ["HL_UPSERT_DUCKDB_MEMORY"] = duckdb_memory
+        if serve_memory:
+            os.environ["HL_LEDGER_STORE_SERVE_MEMORY"] = serve_memory
         src = extract.open_ledger_rows(path, wanted, temp_dir=tmp / ".duckdb" / "upsert")
         assert src.kind == "duckdb", src.kind
         rss_after_load = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         try:
+            rows = merged = None
             for w in wallets:
+                rows = merged = None                       # as the analyse loop: drop the previous wallet first
                 rows = src.rows(w)
                 largest = max(largest, len(rows))
-                _checksum(extract.merge_rows_by_key(rows, []), state)
+                merged = extract.merge_rows_by_key(rows, [])
+                _checksum(merged, state)
+                serve_peak_kb = max(serve_peak_kb, _vm_rss_kb())
         finally:
             src.close()
     else:
@@ -110,6 +139,7 @@ def child(mode: str, path: Path, wallets: list[str], duckdb_memory: str | None, 
     return {"mode": mode, "seconds": round(time.monotonic() - t0, 1),
             "max_rss_mb": round(ru.ru_maxrss / 1024, 1),                 # Linux: ru_maxrss in KiB
             "max_rss_after_load_mb": round((rss_after_load or 0) / 1024, 1),
+            "serve_rss_peak_mb": round(serve_peak_kb / 1024, 1),
             "rows": state["rows"], "amount_sum": round(state["amount"], 2),
             "order_hash": state["hash"].hexdigest()[:16], "largest_wallet_rows": largest}
 
@@ -121,6 +151,10 @@ def main(argv=None) -> int:
     ap.add_argument("--dir", default=tempfile.gettempdir())
     ap.add_argument("--duckdb-memory", default=None,
                     help="HL_UPSERT_DUCKDB_MEMORY for the new path (default: the env / 16GB)")
+    ap.add_argument("--serve-memory", default=None,
+                    help="HL_LEDGER_STORE_SERVE_MEMORY for the new path (default: the env / 2GB)")
+    ap.add_argument("--skew", action="store_true",
+                    help="production-shaped wallets: one wallet 25 %% of the rows, one 20 %% (2026-11-07)")
     ap.add_argument("--modes", default="old,new")
     ap.add_argument("--keep", action="store_true", help="keep the synthetic file and the scratch dir")
     ap.add_argument("--child", nargs=2, metavar=("MODE", "SPEC"), help=argparse.SUPPRESS)
@@ -128,27 +162,30 @@ def main(argv=None) -> int:
     if args.child:
         mode, spec_path = args.child
         spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
-        res = child(mode, Path(spec["csv"]), spec["wallets"], spec.get("duckdb_memory"), Path(spec["tmp"]))
+        res = child(mode, Path(spec["csv"]), spec["wallets"], spec.get("duckdb_memory"), Path(spec["tmp"]),
+                    spec.get("serve_memory"))
         print(json.dumps(res))
         return 0
     tmp = Path(tempfile.mkdtemp(prefix="hl-bench-ledger-", dir=args.dir))
     try:
         csv_path = tmp / "l1_wallet_ledger.csv"
         t0 = time.monotonic()
-        wallets = build_csv(csv_path, args.rows, args.wallets)
+        wallets = build_csv(csv_path, args.rows, args.wallets, skew=args.skew)
         size_mb = csv_path.stat().st_size / 1e6
-        print(f"synthetic ledger: {args.rows} rows, {args.wallets} wallets, {size_mb:.0f} MB, built in "
-              f"{time.monotonic() - t0:.0f}s at {csv_path}", flush=True)
+        print(f"synthetic ledger: {args.rows} rows, {args.wallets} wallets{' (skewed)' if args.skew else ''}, "
+              f"{size_mb:.0f} MB, built in {time.monotonic() - t0:.0f}s at {csv_path}", flush=True)
         spec = tmp / "spec.json"
         spec.write_text(json.dumps({"csv": str(csv_path), "wallets": wallets, "tmp": str(tmp),
-                                    "duckdb_memory": args.duckdb_memory}), encoding="utf-8")
+                                    "duckdb_memory": args.duckdb_memory, "serve_memory": args.serve_memory}),
+                        encoding="utf-8")
         results = []
         for mode in args.modes.split(","):
             out = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child", mode, str(spec)],
                                  check=True, capture_output=True, text=True, cwd=str(ROOT))
             res = json.loads(out.stdout.strip().splitlines()[-1])
             results.append(res)
-            print(f"{mode:>4}: max RSS {res['max_rss_mb']:>9.1f} MB (after load {res['max_rss_after_load_mb']:.1f} MB), "
+            print(f"{mode:>4}: max RSS {res['max_rss_mb']:>9.1f} MB (after load {res['max_rss_after_load_mb']:.1f} MB, "
+                  f"serve-phase peak {res['serve_rss_peak_mb']:.1f} MB), "
                   f"{res['seconds']}s, rows {res['rows']}, amount_sum {res['amount_sum']}, "
                   f"order_hash {res['order_hash']}, largest wallet {res['largest_wallet_rows']} rows", flush=True)
         if len(results) == 2:

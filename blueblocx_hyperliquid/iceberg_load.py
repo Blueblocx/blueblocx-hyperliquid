@@ -66,7 +66,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from . import config
+from . import config, csv_merge
 # re-exported under their historical names: preflight/maintenance/tests import them from here
 from .config import catalog_mode, redacted_uri as _redacted_uri, warehouse_local_path  # noqa: F401
 from .ops import LockHeld, RunLock, atomic_write_text
@@ -283,13 +283,29 @@ def read_csv_rows(path: Path, since_iso: str | None = None, fallback_ts_col: str
     whose rows carry no updated_at). The filter is applied while streaming, so
     memory is bounded by the NEW rows, not by the file (a market-maker wallet
     stages ~180k rows/day; 45 days of that is gigabytes as Python dicts). Rows
-    without a parseable timestamp are kept, never dropped."""
+    without a parseable timestamp are kept, never dropped.
+
+    v1.10.14: a file of at least HL_UPSERT_STREAM_MIN_BYTES is read by DuckDB with the
+    filter in SQL (csv_merge.csv_rows_since_duckdb: same rows, strings and order, no
+    Python pass over the whole file). Either way a FULL lift - `since_iso` None: no lift
+    marker yet, a reset `_lift_state.json`, `iceberg_load --full` - materialises EVERY
+    row of the file as dicts (~1.4 KB per ledger row: ~40 GB at the 8.5 GB staged
+    ledger): do not reset the marker at that size without raising the unit's MemoryMax,
+    or lift with `--since`."""
     since = _parse_iso(since_iso)
+    path = Path(path)
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        header = next(csv.reader(fh), [])
+    ts_col = "updated_at" if "updated_at" in header else (fallback_ts_col if fallback_ts_col in header else None)
+    size = path.stat().st_size
+    threshold = csv_merge.stream_threshold_bytes()
+    if header and size >= threshold:
+        log.info("lift %s: %.1f MB >= HL_UPSERT_STREAM_MIN_BYTES %.1f MB -> DuckDB read (since %s)", path.name,
+                 size / 1e6, threshold / 1e6, since_iso)
+        return csv_merge.csv_rows_since_duckdb(path, header, ts_col, since)
     out: list[dict] = []
     with path.open("r", newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        header = reader.fieldnames or []
-        ts_col = "updated_at" if "updated_at" in header else (fallback_ts_col if fallback_ts_col in header else None)
         for r in reader:
             if since is not None and ts_col is not None:
                 ts = _parse_iso(r.get(ts_col))

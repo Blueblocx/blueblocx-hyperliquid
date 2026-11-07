@@ -17,8 +17,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from blueblocx_hyperliquid import duckdb_smoke, iceberg_load as il
+from blueblocx_hyperliquid import csv_merge, duckdb_smoke, iceberg_load as il
 from blueblocx_hyperliquid import preflight
+from tests.test_upsert_stream import _Env
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
@@ -61,6 +62,59 @@ class BoundedLiftTests(unittest.TestCase):
             # no usable timestamp column at all -> nothing is filtered out
             rows = il.read_csv_rows(p, t0.isoformat(), fallback_ts_col="nope")
             self.assertEqual(len(rows), 2)
+
+    def test_read_csv_rows_duckdb_path_matches_the_dict_path(self):
+        """v1.10.14: at or above HL_UPSERT_STREAM_MIN_BYTES read_csv_rows lets DuckDB stream the
+        file with the since filter in SQL; rows, strings and order equal the DictReader path,
+        including awkward values and unparseable / naive / empty timestamps."""
+        t0 = dt.datetime(2026, 10, 9, 0, 20, tzinfo=dt.timezone.utc)
+        rows = [
+            {"tx_hash": "old", "updated_at": (t0 - dt.timedelta(days=3)).isoformat(), "amount_signed": "1"},
+            {"tx_hash": "edge", "updated_at": t0.isoformat(), "amount_signed": "2"},
+            {"tx_hash": "new", "updated_at": (t0 + dt.timedelta(minutes=1)).isoformat(), "amount_signed": "3"},
+            {"tx_hash": "nots", "updated_at": "", "amount_signed": "4"},
+            {"tx_hash": "junk", "updated_at": "not a time", "amount_signed": ""},
+            {"tx_hash": "naive", "updated_at": (t0 + dt.timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+             "amount_signed": "5"},
+            {"tx_hash": "zulu", "updated_at": (t0 + dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "amount_signed": "6"},
+            {"tx_hash": "off", "updated_at": (t0 + dt.timedelta(hours=3)).astimezone(dt.timezone(dt.timedelta(hours=7))).isoformat(),
+             "amount_signed": "7"},
+            {"tx_hash": 'q"uote, comma\nnewline ü€ 漢', "updated_at": (t0 + dt.timedelta(hours=4)).isoformat(),
+             "amount_signed": " 8 "},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "l1_wallet_ledger.csv"
+            _write_csv(p, rows)
+            for since in (None, t0.isoformat(), (t0 + dt.timedelta(hours=1)).isoformat(), "2030-01-01T00:00:00+00:00"):
+                with _Env(HL_UPSERT_STREAM_MIN_BYTES=None):
+                    want = il.read_csv_rows(p, since)
+                with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"), \
+                        self.assertLogs("blueblocx_hyperliquid.iceberg_load", level="INFO") as logs:
+                    got = il.read_csv_rows(p, since)
+                self.assertIn("DuckDB read", "\n".join(logs.output))
+                self.assertEqual(got, want, since)
+                self.assertEqual([type(v) for r in got for v in r.values()], [type(v) for r in want for v in r.values()])
+            self.assertEqual([r["tx_hash"] for r in got], ["nots", "junk"])                     # far-future since
+            with _Env(HL_UPSERT_STREAM_MIN_BYTES="0"):
+                self.assertEqual([r["tx_hash"] for r in il.read_csv_rows(p, t0.isoformat())],
+                                 ["new", "nots", "junk", "naive", "zulu", "off", rows[-1]["tx_hash"]])
+                # no usable timestamp column: nothing filtered; header-only file: nothing
+                q = Path(d) / "snap.csv"
+                with q.open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.DictWriter(fh, fieldnames=["wallet_address", "as_of_ts"])
+                    w.writeheader()
+                    w.writerows([{"wallet_address": "0xa", "as_of_ts": (t0 - dt.timedelta(days=1)).isoformat()},
+                                 {"wallet_address": "0xb", "as_of_ts": (t0 + dt.timedelta(hours=2)).isoformat()}])
+                self.assertEqual([r["wallet_address"] for r in il.read_csv_rows(q, t0.isoformat(), fallback_ts_col="as_of_ts")], ["0xb"])
+                self.assertEqual(len(il.read_csv_rows(q, t0.isoformat(), fallback_ts_col="nope")), 2)
+                _write_csv(Path(d) / "hdr.csv", [])
+                self.assertEqual(il.read_csv_rows(Path(d) / "hdr.csv", t0.isoformat()), [])
+                (Path(d) / "empty.csv").write_bytes(b"")
+                self.assertEqual(il.read_csv_rows(Path(d) / "empty.csv"), [])
+                # the scratch dir is created next to the file and left empty
+                self.assertEqual(list((Path(d) / ".duckdb" / "upsert").iterdir()), [])
+            self.assertTrue(hasattr(csv_merge, "csv_rows_since_duckdb"))
 
     def test_since_with_margin(self):
         self.assertIsNone(il.since_with_margin(None))

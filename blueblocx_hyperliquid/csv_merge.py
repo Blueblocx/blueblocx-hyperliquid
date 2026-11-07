@@ -44,7 +44,16 @@ timestamps are kept, the file is left untouched when nothing is old.
 `WalletRowStore` (v1.10.13) serves the analyse phase (extract.open_ledger_rows): the
 file is loaded once into a DuckDB scratch database under the same memory_limit and the
 rows of ONE wallet at a time become Python dicts, in file order, strings as
-csv.DictReader would give them.
+csv.DictReader would give them. v1.10.14: once the table is loaded and checkpointed the
+store drops its memory_limit to HL_LEDGER_STORE_SERVE_MEMORY (2GB) for the per-wallet
+SELECTs (the buffer pool no longer sits at HL_UPSERT_DUCKDB_MEMORY for the whole analyse
+loop), sweeps the scratch databases left by DEAD runs (a run killed mid-analyse never
+reached close()), and a file DuckDB cannot read as a rectangular CSV raises
+`StagedCsvError` with the file name instead of a sniffing error.
+
+`csv_rows_since_duckdb` (v1.10.14) is iceberg_load.read_csv_rows for a large staged
+file: the since filter runs in SQL while DuckDB streams the file, so no Python pass over
+the whole file is made and only the selected rows become dicts.
 """
 from __future__ import annotations
 
@@ -76,6 +85,69 @@ def duckdb_memory_limit() -> str:
     if not _MEM_RE.fullmatch(mem):
         raise ValueError(f"HL_UPSERT_DUCKDB_MEMORY must look like '16GB', got {mem!r}")
     return mem
+
+
+def store_serve_memory_limit() -> str:
+    """HL_LEDGER_STORE_SERVE_MEMORY (v1.10.14): the DuckDB memory_limit WalletRowStore
+    drops to once the staged ledger is loaded and checkpointed, for the per-wallet
+    SELECTs of the analyse loop (default 2GB). The load itself runs under
+    HL_UPSERT_DUCKDB_MEMORY; without the drop the buffer pool stays filled to that
+    limit for the whole analyse phase (measured: 3.6 GB RSS -> 0.4 GB on a 1 GB file)."""
+    mem = (config.env("HL_LEDGER_STORE_SERVE_MEMORY") or "2GB").strip()
+    if not _MEM_RE.fullmatch(mem):
+        raise ValueError(f"HL_LEDGER_STORE_SERVE_MEMORY must look like '2GB', got {mem!r}")
+    return mem
+
+
+class StagedCsvError(RuntimeError):
+    """DuckDB cannot read a staged CSV as a rectangular file (v1.10.14): a row with fewer
+    or more fields than the header, i.e. a hand-edited / concatenated restore (upsert_csv,
+    csv_merge and the csv module write rectangular files). csv.DictReader would have
+    padded / collected the fields silently, so the dict path below
+    HL_UPSERT_STREAM_MIN_BYTES serves such a file - but lowering the threshold is NOT a
+    fix: the write phase's DuckDB merge of the same file (v1.10.11) fails the same way.
+    Repair the file."""
+
+
+def _unreadable(path: Path, e: BaseException) -> str:
+    return (f"staged CSV {path} is not a rectangular CSV DuckDB can read ({type(e).__name__}: {str(e)[:200]}) - "
+            "a row has fewer or more fields than the header (hand-edited / concatenated restore?); repair the file. "
+            "Lowering HL_UPSERT_STREAM_MIN_BYTES is not a fix: the write phase's DuckDB merge fails on it too")
+
+
+_SCRATCH_RE = re.compile(r"ledger_rows\.(\d+)\.duckdb(\.wal)?")
+
+
+def sweep_stale_scratch(temp_dir: Path) -> list[Path]:
+    """Remove the scratch databases of DEAD runs (v1.10.14). A run killed during the
+    analyse phase (SIGKILL / OOM / the unit timeout) never reaches WalletRowStore.close(),
+    and its `ledger_rows.<pid>.duckdb` (+ .wal; ~17-30 % of the staged file, ~1.5-2.6 GB
+    at the 8.5 GB ledger) stayed under <state dir>/.duckdb/upsert forever - a few dozen
+    such kills fill the root filesystem and the staged-CSV rewrite fails with ENOSPC.
+    A file whose pid is alive is left alone (the state dir's lock admits one run at a
+    time, so that is another store of THIS process or an unrelated recycled pid); where
+    liveness cannot be told (no /proc) nothing is removed. Returns the removed paths."""
+    from .ops import pid_alive
+    removed: list[Path] = []
+    try:
+        entries = sorted(Path(temp_dir).iterdir())
+    except OSError:
+        return removed
+    for p in entries:
+        m = _SCRATCH_RE.fullmatch(p.name)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if pid == os.getpid() or pid_alive(pid) is not False:
+            continue
+        try:
+            size = p.stat().st_size
+            p.unlink()
+        except OSError:
+            continue
+        removed.append(p)
+        log.warning("csv_merge: removed the stale scratch database %s (%.0f MB) left by dead pid %d", p, size / 1e6, pid)
+    return removed
 
 
 def _q(ident: str) -> str:
@@ -251,6 +323,47 @@ def merge_csv_duckdb(path: Path, columns: list[str], rows: list[dict], *, key_co
     return int(total)
 
 
+def csv_rows_since_duckdb(path: Path, columns: list[str], ts_col: str | None, since, *,
+                          memory_limit: str | None = None, threads: int = 4, temp_dir: Path | None = None) -> list[dict]:
+    """iceberg_load.read_csv_rows for a LARGE staged file (v1.10.14): the rows of `path`
+    as {column: str} dicts ('' for an empty field, file order) whose `ts_col` does NOT
+    parse to an instant at or before `since` (a tz-aware datetime); an unparseable or
+    empty timestamp keeps the row, as the DictReader path does; `ts_col` None or `since`
+    None = every row. DuckDB streams the file under `memory_limit` (default
+    HL_UPSERT_DUCKDB_MEMORY), so there is no Python pass over the whole file and only
+    the SELECTED rows become dicts. Raises StagedCsvError for a non-rectangular file."""
+    import duckdb
+    path = Path(path)
+    memory_limit = memory_limit or duckdb_memory_limit()
+    temp_dir = Path(temp_dir) if temp_dir is not None else path.parent / ".duckdb" / "upsert"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    pred = ""
+    if ts_col is not None and since is not None and ts_col in columns:
+        # fromisoformat accepts what TIMESTAMPTZ parses (ISO 8601 with offset or Z; a naive
+        # value is UTC under the connection's TimeZone); NULL (unparseable / '') = keep
+        pred = (f" WHERE NOT coalesce(TRY_CAST(nullif({_q(ts_col)}, '') AS TIMESTAMPTZ) <= "
+                f"CAST({_lit(since.isoformat())} AS TIMESTAMPTZ), false)")
+    t0 = time.monotonic()
+    con = _connect(memory_limit, threads, temp_dir, preserve_order=True)
+    out: list[dict] = []
+    try:
+        sel = ", ".join(_q(c) for c in columns)
+        try:
+            cur = con.execute(f"SELECT {sel} FROM {_read_csv_expr(path, columns)}{pred}")
+            while True:
+                batch = cur.fetchmany(50_000)
+                if not batch:
+                    break
+                out.extend({c: ("" if v is None else v) for c, v in zip(columns, t)} for t in batch)
+        except duckdb.InvalidInputException as e:
+            raise StagedCsvError(_unreadable(path, e)) from e
+    finally:
+        con.close()
+    log.info("csv_merge: %s read in DuckDB (memory_limit %s, since %s) in %.1fs -> %d rows", path.name, memory_limit,
+             since.isoformat() if since is not None else None, time.monotonic() - t0, len(out))
+    return out
+
+
 class WalletRowStore:
     """The staged ledger's rows for a set of wallets, served ONE WALLET AT A TIME
     (v1.10.13; the analyse phase of extract.run).
@@ -264,7 +377,14 @@ class WalletRowStore:
     HL_UPSERT_DUCKDB_MEMORY), filtered to the wanted wallets and clustered by wallet;
     `rows(wallet)` then materialises that wallet's rows only, in file order, as dicts
     of strings exactly as csv.DictReader would have produced them (NULL -> '').
-    `close()` drops the database file; use as a context manager."""
+    `close()` drops the database file; use as a context manager.
+
+    v1.10.14: after the load the store CHECKPOINTs and drops the connection's memory_limit
+    to HL_LEDGER_STORE_SERVE_MEMORY (2GB): the table is on disk, the per-wallet SELECTs
+    read their row groups from it (clustered by wallet), and the 16 GB buffer pool is not
+    held across the analyse loop. Stale scratch databases of dead runs under `temp_dir`
+    are removed first (sweep_stale_scratch). A file DuckDB cannot read as a rectangular
+    CSV raises StagedCsvError (the dict path would have served it; see the class)."""
 
     def __init__(self, path: Path, wallets, *, memory_limit: str | None = None, threads: int = 4,
                  temp_dir: Path | None = None, wallet_col: str = "wallet_address"):
@@ -273,10 +393,12 @@ class WalletRowStore:
         self.columns = _header(path)
         self.wallet_col = wallet_col
         self.memory_limit = memory_limit or duckdb_memory_limit()
+        self.serve_memory_limit = store_serve_memory_limit()
         temp_dir = Path(temp_dir) if temp_dir is not None else path.parent / ".duckdb" / "upsert"
         temp_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = temp_dir / f"ledger_rows.{os.getpid()}.duckdb"
         self._unlink_db()
+        self.swept = sweep_stale_scratch(temp_dir)
         self.row_count = 0
         self._con = None
         wanted = sorted({str(w) for w in wallets})
@@ -297,18 +419,27 @@ class WalletRowStore:
             # _rn = position in the file (preserve_insertion_order keeps the reader's order
             # through the streaming row_number), the table is clustered by wallet so a
             # per-wallet SELECT touches that wallet's row groups only (zonemaps)
-            con.execute(f"CREATE TABLE ledger AS SELECT row_number() OVER () AS _rn, {sel} "
-                        f"FROM {_read_csv_expr(path, self.columns)} "
-                        f"WHERE {_q(wallet_col)} IN (SELECT w FROM wanted) "
-                        f"ORDER BY {_q(wallet_col)}, _rn")
+            try:
+                con.execute(f"CREATE TABLE ledger AS SELECT row_number() OVER () AS _rn, {sel} "
+                            f"FROM {_read_csv_expr(path, self.columns)} "
+                            f"WHERE {_q(wallet_col)} IN (SELECT w FROM wanted) "
+                            f"ORDER BY {_q(wallet_col)}, _rn")
+            except duckdb.InvalidInputException as e:
+                raise StagedCsvError(_unreadable(path, e)) from e
             self.row_count = int(con.execute("SELECT count(*) FROM ledger").fetchone()[0])
+            # v1.10.14: the table is complete - write it out and shrink the buffer pool for
+            # the serving phase (DuckDB evicts down to the new limit; the per-wallet SELECTs
+            # then read the wallet's row groups from the scratch file)
+            con.execute("CHECKPOINT")
+            con.execute(f"SET memory_limit = {_lit(self.serve_memory_limit)}")
         except BaseException:
             con.close()
             self._unlink_db()
             raise
         self._con = con
-        log.info("csv_merge: %s loaded into DuckDB (memory_limit %s, db %s) in %.1fs: %d rows of %d wallet(s)",
-                 path.name, self.memory_limit, self.db_path, time.monotonic() - t0, self.row_count, len(wanted))
+        log.info("csv_merge: %s loaded into DuckDB (memory_limit %s, db %s) in %.1fs: %d rows of %d wallet(s); "
+                 "serving under memory_limit %s", path.name, self.memory_limit, self.db_path, time.monotonic() - t0,
+                 self.row_count, len(wanted), self.serve_memory_limit)
 
     def rows(self, wallet: str) -> list[dict]:
         """The wallet's rows in file order as {column: str} dicts ('' for an empty field);
