@@ -98,6 +98,13 @@ TABLE_PLAN = {
     "l4x_perp_position_snapshot": (["as_of_date", "wallet_address", "coin"], "replace_scope", ["as_of_date", "wallet_address"]),
     # v1.9.0: the exchange's spot balances (the anchor of the balance rollups)
     "l4x_spot_balance_snapshot": (["as_of_date", "wallet_address", "token_address"], "replace_scope", ["as_of_date", "wallet_address"]),
+    # v1.11.0 Token Heatmap (TOKEN_HEATMAP_DATA_SPEC.md section 2.3): bucket-keyed snapshots staged
+    # by extract.run when HL_HEATMAP=1 (heatmap.py). positions: a wallet pulled late into the same
+    # bucket replaces only its own rows; cohort: the whole bucket is replaced by the run's plan;
+    # market ctx: the whole bucket is replaced (pruned by the partition)
+    "l4x_perp_position_snap": (["as_of_bucket", "wallet_address", "coin"], "replace_scope", ["as_of_bucket", "wallet_address"]),
+    "l4x_wallet_cohort_snap": (["as_of_bucket", "wallet_address"], "replace_scope", ["as_of_bucket"]),
+    "l4x_perp_market_ctx_snap": (["as_of_bucket", "coin"], "replace_scope", ["as_of_date", "as_of_bucket"]),
     # v1.9.0 rollups (blueblocx_hyperliquid.rollups writes these directly from the lake,
     # not from staged CSVs; listed so readers / preflight / query know them)
     "l1_token_categories": (["token_address", "token_group", "category"], "replace_keys", []),
@@ -142,7 +149,12 @@ ROLLUP_TABLES = frozenset({   # written by blueblocx_hyperliquid.rollups, never 
 # the first lift of the 1-minute feed (HL_PRICE_1M_DAYS > 0, v1.10.0; before that the
 # development-only output of `--with-prices`), so a lake without it is not a
 # missing-table warning.
-OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"})
+OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"} | {
+    # v1.11.0: staged only with HL_HEATMAP=1 (default off): absent until the feature is enabled
+    "l4x_perp_position_snap", "l4x_wallet_cohort_snap", "l4x_perp_market_ctx_snap"})
+# v1.11.0: the Token Heatmap tables (staged and lifted only when HL_HEATMAP=1; lifted in their own
+# lift_directory call behind the skip guard in extract.run, so the main lift excludes them)
+HEATMAP_TABLES = ("l4x_perp_position_snap", "l4x_wallet_cohort_snap", "l4x_perp_market_ctx_snap")
 
 # Per table: the per-row WRITE stamp (what the ETL's Tier-A cursor reads: `updated_at`,
 # except l4x which has none), the business-date column (for watermark_date) and the
@@ -150,9 +162,13 @@ OPTIONAL_TABLES = frozenset({"l3_token_price_usd_1m"})
 _STAMP_COL = {name: "updated_at" for name in TABLE_PLAN}
 _STAMP_COL["l4x_perp_position_snapshot"] = "created_at"
 _STAMP_COL["l4x_spot_balance_snapshot"] = "created_at"
+for _t in HEATMAP_TABLES:
+    _STAMP_COL[_t] = "created_at"                      # v1.11.0: like l4x, no updated_at
 _BUSINESS_DATE_COL = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m": "bucket_date",
                       "l3_token_price_usd_1h": "bucket_date", "l3_token_price_usd_1d": "bucket_date",
                       "l4x_perp_position_snapshot": "as_of_date", "l4x_spot_balance_snapshot": "as_of_date",
+                      "l4x_perp_position_snap": "as_of_date", "l4x_wallet_cohort_snap": "as_of_date",
+                      "l4x_perp_market_ctx_snap": "as_of_date",
                       "l4_wallet_balance_per_tx": "block_date", "l4_wallet_balance_1d_dense": "snapshot_date",
                       "l4_wallet_networth_1d_dense": "snapshot_date", "l4_wallet_pnl_realized_1d": "snapshot_date",
                       "wallet_trade_summary": "last_activity_date",
@@ -162,7 +178,9 @@ _BUSINESS_DATE_COL = {"l1_wallet_ledger": "block_date", "l3_token_price_usd_1m":
                       "token_activity_trending": "activity_date", "token_market_signals": "bucket_date",
                       "token_quality": "as_of_date", "dex_pair_volume_1d": "bucket_date",
                       "exchange_flow": "bucket_date"}
-_SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts", "l4x_spot_balance_snapshot": "as_of_ts"}
+_SINCE_FALLBACK_COL = {"l4x_perp_position_snapshot": "as_of_ts", "l4x_spot_balance_snapshot": "as_of_ts",
+                       "l4x_perp_position_snap": "as_of_ts", "l4x_wallet_cohort_snap": "as_of_ts",
+                       "l4x_perp_market_ctx_snap": "as_of_ts"}
 
 # Columns that are NOT NULL by construction (natural keys, business dates, stamps,
 # the gates' is_active). The Iceberg schema of the tables created before v1.4.0
@@ -181,6 +199,13 @@ REQUIRED_COLS = {
     "l4_wallet_metadata": ["wallet_address", "updated_at"],
     "wallet_watchlist": ["wallet_address", "is_active", "created_at", "updated_at"],
     "token_whitelist": ["token_address", "is_active", "created_at", "updated_at"],
+    # v1.11.0 Token Heatmap (spec section 2.3 item 5)
+    "l4x_perp_position_snap": ["as_of_bucket", "bucket_minutes", "as_of_ts", "as_of_date", "wallet_address", "coin",
+                               "dex", "side", "source", "created_at"],
+    "l4x_wallet_cohort_snap": ["as_of_bucket", "bucket_minutes", "as_of_ts", "as_of_date", "wallet_address",
+                               "position_snapshot_present", "source", "created_at"],
+    "l4x_perp_market_ctx_snap": ["as_of_bucket", "bucket_minutes", "as_of_ts", "as_of_date", "coin", "dex", "source",
+                                 "created_at"],
 }
 
 # control.table_watermarks status vocabulary. 'completed' is python-ingestion's value

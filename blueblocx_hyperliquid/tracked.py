@@ -27,6 +27,7 @@ where this one stopped instead of starving the same wallets every hour.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import logging
 import math
@@ -50,13 +51,37 @@ CHUNK = 64 * 1024                      # small enough that the caps are checked 
 _ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 
 
+# the leaderboard's windowPerformances keys, in file order; `allTime` is the perf-cohort metric
+WINDOWS = ("day", "week", "month", "allTime")
+
+
 @dataclass(frozen=True)
 class Row:
+    """One leaderboard row above the scan floor. The month window drives the smart-money
+    selection (as in the TS backend); v1.11.0 keeps the other three windows as well, for
+    the heatmap's l4x_wallet_cohort_snap (pnl / roi / vlm per window, allTime.pnl = the
+    perf cohort). `rank_account_value` (1 = largest accountValue among the parsed rows)
+    is filled by parse_leaderboard once every row is known."""
     address: str
     account_value: float
     month_pnl: float
     month_roi: float
     month_vlm: float
+    day_pnl: float = 0.0
+    day_roi: float = 0.0
+    day_vlm: float = 0.0
+    week_pnl: float = 0.0
+    week_roi: float = 0.0
+    week_vlm: float = 0.0
+    all_pnl: float = 0.0
+    all_roi: float = 0.0
+    all_vlm: float = 0.0
+    rank_account_value: int | None = None
+
+    def window(self, name: str) -> tuple[float, float, float]:
+        """(pnl, roi, vlm) of a window: day | week | month | allTime (or all)."""
+        k = {"day": "day", "week": "week", "month": "month", "allTime": "all", "all": "all"}[name]
+        return (getattr(self, f"{k}_pnl"), getattr(self, f"{k}_roi"), getattr(self, f"{k}_vlm"))
 
 
 def _num(v) -> float:
@@ -100,21 +125,37 @@ def parse_leaderboard(text: str, *, min_account_value: float = LEADERBOARD_MIN_A
         av = _num(raw.get("accountValue"))
         if not _ADDR.match(addr) or av < min_account_value:
             continue
-        month: dict = {}
+        win: dict[str, dict] = {}
         for item in raw.get("windowPerformances") or []:
-            if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == "month":
-                month = item[1] or {}
-                break
-        rows.append(Row(addr, av, _num(month.get("pnl")), _num(month.get("roi")), _num(month.get("vlm"))))
-    return rows, total
+            if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] in WINDOWS:
+                win[item[0]] = item[1] if isinstance(item[1], dict) else {}
+        month, day, week, allt = (win.get(k) or {} for k in ("month", "day", "week", "allTime"))
+        rows.append(Row(addr, av, _num(month.get("pnl")), _num(month.get("roi")), _num(month.get("vlm")),
+                        _num(day.get("pnl")), _num(day.get("roi")), _num(day.get("vlm")),
+                        _num(week.get("pnl")), _num(week.get("roi")), _num(week.get("vlm")),
+                        _num(allt.get("pnl")), _num(allt.get("roi")), _num(allt.get("vlm"))))
+    return rank_rows(rows), total
+
+
+def rank_rows(rows: list[Row]) -> list[Row]:
+    """The same rows (same order) with `rank_account_value` filled: 1 = the largest
+    accountValue among `rows` (ties keep file order). Rows below the scan floor are not
+    counted, so the rank is 'among the leaderboard rows above the floor'."""
+    order = sorted(range(len(rows)), key=lambda i: -rows[i].account_value)
+    rank = {i: n + 1 for n, i in enumerate(order)}
+    return [Row(**{**r.__dict__, "rank_account_value": rank[i]}) for i, r in enumerate(rows)]
 
 
 def fetch_leaderboard_text(url: str, *, timeout: tuple[float, float] = (10.0, 120.0),
                            byte_cap: int = BYTE_CAP, total_timeout: float = TOTAL_TIMEOUT_S,
-                           chunk_size: int = CHUNK, get=None, clock=None) -> str:
+                           chunk_size: int = CHUNK, get=None, clock=None, headers_out: dict | None = None) -> str:
     """Stream the payload into memory under a byte cap and a wall-clock cap. The
     request timeout alone bounds connect and per-read stalls, not a slow trickle; the
-    wall clock starts before the request, like the TS AbortController."""
+    wall clock starts before the request, like the TS AbortController.
+
+    `headers_out` (v1.11.0): a dict that receives the response's `Last-Modified` header
+    (as `last_modified`, the raw HTTP-date string) - evidence of the stats file's refresh
+    cadence, kept in _tracked_wallets.json and l4x_wallet_cohort_snap."""
     if get is None:
         import requests
         get = requests.get
@@ -123,6 +164,11 @@ def fetch_leaderboard_text(url: str, *, timeout: tuple[float, float] = (10.0, 12
     r = get(url, stream=True, timeout=timeout)
     try:
         r.raise_for_status()
+        if headers_out is not None:
+            try:
+                headers_out["last_modified"] = (getattr(r, "headers", None) or {}).get("Last-Modified")
+            except Exception:  # noqa: BLE001 - a stand-in without headers
+                headers_out["last_modified"] = None
         buf = bytearray()
         for chunk in r.iter_content(chunk_size):
             buf += chunk
@@ -188,20 +234,56 @@ def save_cursor(ns_dir: Path, cursor: int) -> None:
     save_cached(ns_dir, data)
 
 
-def refresh_tracked(ns_dir: Path, *, now: float | None = None, fetch=None, **overrides
+def _accepts_headers_out(fn) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "headers_out" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def http_date_to_iso(value: str | None) -> str | None:
+    """RFC 7231 HTTP-date ('Sat, 08 Nov 2026 19:22:59 GMT') -> ISO 8601 UTC; None when absent
+    or unparseable (never raises: the header is evidence, not an input)."""
+    if not value:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        d = parsedate_to_datetime(str(value))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if d is None:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(dt.timezone.utc).isoformat()
+
+
+def refresh_tracked(ns_dir: Path, *, now: float | None = None, fetch=None, keep_rows_for=(), **overrides
                     ) -> tuple[dict[str, list[str]], dict]:
     """Fetch + select + cache. Returns (sets, meta); sets = {"whales": [...], "smart": [...]}.
 
     meta.source: "fresh" (fetched now) | "cache" (stats host failed, cached set within
     HL_TRACKED_MAX_AGE_HOURS reused; meta.error says why) | "none" (nothing usable;
     sets are empty). Never raises: the caller decides what an empty set means.
+
+    v1.11.0: on a fresh fetch meta also carries `rows_by_address` ({address: Row} for the
+    selected wallets plus `keep_rows_for`, e.g. the pins - the heatmap's cohort rows read
+    the four windows and the rank from it) and `last_modified` (the stats file's HTTP
+    Last-Modified as ISO, also logged and cached). A cached / failed refresh has no rows
+    (the heatmap then writes perf_cohort = unknown and NULL leaderboard columns).
     """
     s = settings()
     s.update(overrides)
     now = time.time() if now is None else now
     cached = load_cached(ns_dir)
     try:
-        text = (fetch or fetch_leaderboard_text)(s["url"])
+        hdrs: dict = {}
+        fetcher = fetch or fetch_leaderboard_text
+        if _accepts_headers_out(fetcher):
+            text = fetcher(s["url"], headers_out=hdrs)
+        else:                                    # a stand-in fetcher without the kwarg (tests, older callers)
+            text = fetcher(s["url"])
         rows, total = parse_leaderboard(
             text, min_account_value=min(LEADERBOARD_MIN_ACCOUNT_VALUE, s["smart_min_account_value"]))
         del text
@@ -214,16 +296,21 @@ def refresh_tracked(ns_dir: Path, *, now: float | None = None, fetch=None, **ove
                               smart_min_month_roi=s["smart_min_month_roi"],
                               smart_min_month_vlm=s["smart_min_month_vlm"])
         fetched_at = dt.datetime.fromtimestamp(now, tz=dt.timezone.utc).isoformat()
+        last_modified = http_date_to_iso(hdrs.get("last_modified"))
+        wanted = set(sets["whales"]) | set(sets["smart"]) | {str(w).lower() for w in (keep_rows_for or ())}
+        rows_by_address = {r.address: r for r in rows if r.address in wanted}
         save_cached(ns_dir, {
             "fetched_at": fetched_at, "fetched_at_ts": now, "source_url": s["url"],
-            "rows_total": total, "rows_kept": len(rows),
+            "rows_total": total, "rows_kept": len(rows), "last_modified": last_modified,
             "whales": sets["whales"], "smart": sets["smart"],
             "cursor": cached.get("cursor", 0),
         })
-        log.info("tracked set refreshed: %d whales, %d smart (%d of %d leaderboard rows above the floor)",
-                 len(sets["whales"]), len(sets["smart"]), len(rows), total)
+        log.info("tracked set refreshed: %d whales, %d smart (%d of %d leaderboard rows above the floor; "
+                 "Last-Modified %s)", len(sets["whales"]), len(sets["smart"]), len(rows), total,
+                 last_modified or "n/a")
         return sets, {"source": "fresh", "fetched_at": fetched_at, "rows_total": total,
-                      "rows_kept": len(rows)}
+                      "rows_kept": len(rows), "last_modified": last_modified,
+                      "rows_by_address": rows_by_address}
     except Exception as e:  # noqa: BLE001 - the run must go on with what it has (daily.Terminated
         err = f"{type(e).__name__}: {str(e)[:200]}"   # is a BaseException and passes through)
         log.warning("leaderboard refresh failed: %s", err)

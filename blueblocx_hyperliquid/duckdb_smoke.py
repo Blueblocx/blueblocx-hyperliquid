@@ -65,6 +65,11 @@ log = logging.getLogger("blueblocx_hyperliquid.duckdb_smoke")
 CATALOG_NAME = {"sql": "hl", "local": "local"}
 
 
+# tables whose per-row write stamp is created_at (no updated_at): l4x and the v1.11.0 heatmap
+# snapshots (mirrors iceberg_load._STAMP_COL without importing pyarrow into this venv-light module)
+_CREATED_AT_STAMPED = frozenset({"l4x_perp_position_snapshot", "l4x_spot_balance_snapshot",
+                                 "l4x_perp_position_snap", "l4x_wallet_cohort_snap", "l4x_perp_market_ctx_snap"})
+
 def _q(value: str) -> str:
     """A SQL string literal: iceberg_scan() takes a constant, so the path is inlined
     with single quotes doubled (a NAS share named "Leo's" must not break the statement)."""
@@ -201,7 +206,7 @@ def run(catalog_uri: str | None = None, namespace: str = "hypercore", tables: li
                     entry.update({"variant": variant, "scan": scan, "rows": int(n),
                                   "ms": round((time.monotonic() - t0) * 1000)})
                     report["variant"] = report["variant"] or variant
-                    stamp = "created_at" if name == "l4x_perp_position_snapshot" else "updated_at"
+                    stamp = "created_at" if name in _CREATED_AT_STAMPED else "updated_at"
                     try:
                         mx = con.execute(f"SELECT CAST(max({stamp}) AS VARCHAR) FROM {scan}").fetchone()[0]
                         entry["max_stamp"] = mx

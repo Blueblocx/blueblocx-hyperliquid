@@ -209,6 +209,27 @@ def check_env(env_file: Path | None) -> list[Check]:
             out.append(_ok("prices", f"{pb:g} min per run for native 1h/1d candles, {hd} days on a token's first visit"))
     except ValueError as e:
         out.append(_fail("prices", str(e)))
+    try:
+        from . import heatmap
+        hs = heatmap.settings()
+        if hs["writer"] not in (heatmap.SOURCE_HOURLY, heatmap.SOURCE_SWEEP):
+            out.append(_fail("heatmap", f"HL_HEATMAP_WRITER={hs['writer']!r} - must be hourly or sweep"))
+        elif not hs["enabled"]:
+            out.append(_ok("heatmap", "off (HL_HEATMAP=0): the run behaves as v1.10.14; set HL_HEATMAP=1 to stage the "
+                                      "three Token Heatmap tables"))
+        elif hs["writer"] == heatmap.SOURCE_SWEEP:
+            out.append(_warn("heatmap", "HL_HEATMAP_WRITER=sweep - the hourly run does not touch the heatmap tables; "
+                                        "the Stage-2 sweep must be running"))
+        elif hs["lift_deadline_s"] <= 0 or hs["lift_deadline_s"] >= 3000:
+            out.append(_warn("heatmap", f"HL_HEATMAP_LIFT_DEADLINE_S={hs['lift_deadline_s']:g} - the skip guard should sit "
+                                        f"between the 35-min soft deadline and the 50-min unit timeout (2400)"))
+        else:
+            out.append(_ok("heatmap", f"on: hourly writer, {len(hs['market_dexes'])} dex ctx calls "
+                                      f"(+{20 * len(hs['market_dexes'])} weight/run), lift skip guard at "
+                                      f"{hs['lift_deadline_s']:g} s, lake retention {hs['lake_retention_days']}/"
+                                      f"{hs['ctx_retention_days']} days"))
+    except ValueError as e:
+        out.append(_fail("heatmap", str(e)))
     desc = config.describe_env()
     secrets_set = sorted(k for k in config.SECRET_VARS if desc[k]["set"])
     out.append(_ok("secrets", "set: " + (", ".join(secrets_set) if secrets_set else "none") + " (values not shown)"))

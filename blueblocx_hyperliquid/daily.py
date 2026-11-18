@@ -112,13 +112,16 @@ def main(argv=None) -> int:
     recon, error, rc = None, None, 1
     lock_held = False
     wallets, auto, cursor, tracked_meta = list(dict.fromkeys(pins)), [], 0, None
+    sets: dict | None = None
+    lb_rows: dict | None = None            # v1.11.0: the heatmap's leaderboard inputs (heatmap.py)
     progress: ops.Progress | None = None
     try:
         with ops.RunLock(ns_dir / ".daily.lock"):
             progress = ops.Progress(ns_dir, planned=len(wallets))
             if source == "leaderboard":
                 progress.update(phase="tracked-set")
-                sets, tracked_meta = tracked.refresh_tracked(ns_dir)
+                sets, tracked_meta = tracked.refresh_tracked(ns_dir, keep_rows_for=pins)
+                lb_rows = tracked_meta.pop("rows_by_address", None)    # Row objects: not for the summary
                 cursor = tracked.load_cursor(ns_dir)
                 wallets, auto = tracked.plan_wallets(pins, sets, cursor)
                 log.info("wallet plan: %d pinned + %d tracked (%d whales, %d smart; %s), cursor %d",
@@ -136,7 +139,8 @@ def main(argv=None) -> int:
                                 max_workers=args.workers, s3_backfill=args.s3_backfill,
                                 iceberg=args.iceberg, incremental=True,
                                 retention_days=args.retention_days, deadline_ts=deadline_ts,
-                                soft_wallets=set(auto), progress=progress.update)
+                                soft_wallets=set(auto), progress=progress.update,
+                                leaderboard_rows=lb_rows, leaderboard_meta=tracked_meta, tracked_sets=sets)
             if auto:
                 tracked.save_cursor(ns_dir, tracked.advance_cursor(auto, cursor, set(recon.get("wallets") or [])))
     except ops.LockHeld as e:

@@ -845,3 +845,116 @@ TBLPROPERTIES (
     'format-version' = '2',
     'write.parquet.compression-codec' = 'zstd'
 );
+
+-- ----------------------------------------------------------------------------
+-- v1.11.0 TOKEN HEATMAP (TOKEN_HEATMAP_DATA_SPEC.md section 2): three small
+-- bucket-keyed snapshot tables staged by the hourly run when HL_HEATMAP=1 from the
+-- data the run already holds (clearinghouseState per wallet, the stats-data
+-- leaderboard) plus one metaAndAssetCtxs call per dex. The aggregation (open-state,
+-- cohort x coin cells) happens downstream in Dagster; the lake keeps the inputs.
+-- parse_ddl reads ONE column per line: never put two columns on a line here.
+-- ----------------------------------------------------------------------------
+
+-- bucket-keyed perp positions (one row per open position per bucket). Written by the
+-- hourly run (HL_HEATMAP_WRITER=hourly) or the Stage-2 sweep (sweep), never both.
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4x_perp_position_snap (
+    as_of_bucket            TIMESTAMP,  -- date_trunc('hour', run start) in the MVP; 30/15-min in Stage 2
+    bucket_minutes          INT,        -- 60 | 30 | 15 | 1440 (daily seed rows from l4x_perp_position_snapshot)
+    as_of_ts                TIMESTAMP,  -- when THIS wallet's clearinghouseState was fetched (not the run start)
+    as_of_date              DATE,
+    wallet_address          STRING,
+    wallet_group            INT,        -- xxh64 shard 0..3999 (schema.addr_group), not a cohort
+    coin                    STRING,     -- dex-qualified for HIP-3 (xyz:SP500)
+    dex                     STRING,     -- main | xyz | io | mkts | para | ...
+    side                    STRING,     -- long | short (sign of szi)
+    szi                     DOUBLE,
+    entry_px                DOUBLE,
+    position_value          DOUBLE,     -- abs notional at mark (Hyperliquid positionValue)
+    mark_px                 DOUBLE,
+    unrealized_pnl_usd      DOUBLE,
+    return_on_equity        DOUBLE,
+    liquidation_px          DOUBLE,
+    margin_used_usd         DOUBLE,
+    leverage_type           STRING,     -- cross | isolated
+    leverage_value          DOUBLE,
+    max_leverage            INT,        -- position.maxLeverage (new vs l4x)
+    cum_funding_all_time    DOUBLE,
+    cum_funding_since_open  DOUBLE,     -- resets when the position closes: reopen hint for the open-state rollup
+    cum_funding_since_change DOUBLE,    -- cumFunding.sinceChange (new vs l4x)
+    account_value_usd       DOUBLE,     -- marginSummary.accountValue of THIS dex's margin account
+    wallet_perp_equity_usd  DOUBLE,     -- SUM over dexes of account_value_usd (size cohort metric)
+    source                  STRING,     -- hourly | sweep | l4x_daily
+    run_id                  STRING,
+    created_at              TIMESTAMP   -- run stamp (= _STAMP_COL)
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES ('format-version' = '2', 'write.parquet.compression-codec' = 'zstd');
+
+-- one row per planned wallet per bucket: the only way to tell a flat wallet from a deferred one
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4x_wallet_cohort_snap (
+    as_of_bucket                TIMESTAMP,
+    bucket_minutes              INT,
+    as_of_ts                    TIMESTAMP,  -- run start (leaderboard + plan are per run)
+    as_of_date                  DATE,
+    wallet_address              STRING,
+    position_snapshot_present   BOOLEAN,    -- clearinghouseState fetched in this bucket (false = deferred / skipped)
+    perp_equity_usd             DOUBLE,     -- SUM over dexes of marginSummary.accountValue; NULL when not fetched
+    equity_source               STRING,     -- snapshot | NULL (carry-forward is done downstream by the rollup)
+    equity_has_non_usd          BOOLEAN,    -- a HIP-3 dex with non-USDC collateral contributed (flx/vntl/km/hyna/cash), valued at 1.0
+    leaderboard_account_value_usd DOUBLE,   -- stats-data accountValue (NOT perp equity; sweep pre-filter only)
+    rank_account_value          INT,        -- 1 = largest accountValue on the leaderboard
+    size_cohort                 STRING,     -- under_100k | small_whale | whale | tidal_whale | leviathan (by perp_equity_usd)
+    size_cohort_fine            INT,        -- HyperTracker 8-tier id 16,1,2,3,4,5,6,7
+    pnl_day                     DOUBLE,     -- leaderboard windowPerformances (one column per line: parse_ddl rule)
+    pnl_week                    DOUBLE,
+    pnl_month                   DOUBLE,
+    pnl_all                     DOUBLE,     -- allTime.pnl = perf cohort metric
+    roi_day                     DOUBLE,
+    roi_week                    DOUBLE,
+    roi_month                   DOUBLE,
+    roi_all                     DOUBLE,
+    vlm_day                     DOUBLE,
+    vlm_week                    DOUBLE,
+    vlm_month                   DOUBLE,     -- is_active = vlm_month > 0 OR has_open_position
+    vlm_all                     DOUBLE,
+    perf_cohort                 STRING,     -- money_printer | smart_money | consistent_trader | average_trader | losing_trader | unknown
+    perf_cohort_fine            INT,        -- HyperTracker tiers 8..15
+    is_tracked_whale            BOOLEAN,    -- bb_whale_top100 (top HL_WHALE_TOP_N by accountValue)
+    is_tracked_smart            BOOLEAN,    -- bb_smart_30d (HL_SMART_* rule)
+    is_pinned                   BOOLEAN,
+    is_active                   BOOLEAN,    -- vlm_month > 0 OR has_open_position
+    has_open_position           BOOLEAN,
+    leaderboard_fetched_at      TIMESTAMP,
+    leaderboard_last_modified   TIMESTAMP,  -- HTTP Last-Modified of the stats-data file (refresh cadence evidence)
+    size_cohort_version         STRING,     -- size_v1
+    perf_cohort_version         STRING,     -- perf_v1
+    source                      STRING,
+    run_id                      STRING,
+    created_at                  TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES ('format-version' = '2', 'write.parquet.compression-codec' = 'zstd');
+
+-- market-wide context per perp asset (metaAndAssetCtxs per dex): OI share and funding amplifiers
+CREATE TABLE IF NOT EXISTS nessie.hypercore.l4x_perp_market_ctx_snap (
+    as_of_bucket        TIMESTAMP,
+    bucket_minutes      INT,
+    as_of_ts            TIMESTAMP,  -- when metaAndAssetCtxs was called
+    as_of_date          DATE,
+    coin                STRING,     -- dex-qualified for HIP-3
+    dex                 STRING,
+    open_interest       DOUBLE,     -- coin units
+    open_interest_usd   DOUBLE,     -- open_interest * mark_px
+    funding_1h          DOUBLE,     -- hourly funding rate (APR = funding_1h * 8760 * 100, engine precedent)
+    mark_px             DOUBLE,
+    oracle_px           DOUBLE,
+    prev_day_px         DOUBLE,
+    day_ntl_vlm         DOUBLE,
+    premium             DOUBLE,
+    max_leverage        INT,
+    source              STRING,
+    run_id              STRING,
+    created_at          TIMESTAMP
+) USING iceberg
+PARTITIONED BY (as_of_date)
+TBLPROPERTIES ('format-version' = '2', 'write.parquet.compression-codec' = 'zstd');

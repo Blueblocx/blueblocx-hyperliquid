@@ -380,6 +380,22 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
             warnings.append(f"rollups_error={group}")
         if rollups.get("skipped"):
             warnings.append(f"rollups_skipped={len(rollups['skipped'])}")
+    # the Token Heatmap step (v1.11.0) never fails a run either: what it could not stage or
+    # lift is a warning (the bucket is repaired by the next run's separate lift)
+    heatmap = (recon or {}).get("heatmap")
+    if heatmap:
+        if heatmap.get("error"):
+            warnings.append("heatmap:failed")
+        if heatmap.get("errors"):
+            warnings.append(f"heatmap_errors={len(heatmap['errors'])}")
+        if heatmap.get("ctx_skipped"):
+            warnings.append("heatmap:ctx_skipped")
+        if heatmap.get("ctx_errors"):
+            warnings.append("heatmap_ctx_errors=" + ",".join(sorted(heatmap["ctx_errors"])))
+        if heatmap.get("lift_skipped"):
+            warnings.append("heatmap:lift_skipped")
+        if heatmap.get("lift_error"):
+            warnings.append("heatmap:lift_failed")
     statuses = [e["status"] for e in per_wallet.values()]
     ok = recon is not None and not problems
     return {
@@ -402,6 +418,7 @@ def build_summary(recon: dict | None, wallets: list[str], started_at: dt.datetim
         "retention": (recon or {}).get("retention"),
         "prices": prices or None,
         "rollups": ({k: v for k, v in rollups.items() if k != "watermarks"} if rollups else None),
+        "heatmap": heatmap or None,
         "hip3_dexes": (recon or {}).get("hip3_dexes_checked"),
         "unmapped_ledger_types": (recon or {}).get("unmapped_ledger_types") or {},
         "options": options or {},

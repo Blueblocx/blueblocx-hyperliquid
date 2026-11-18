@@ -324,3 +324,102 @@ def ledger_tx_hash(wallet: str, hash_val, typ: str, time_ms, dup_seq: int = 0) -
     else:
         base = f"hlcore:{_w(wallet)}:{typ}:{time_ms}"
     return base if not dup_seq else f"{base}:dup{dup_seq}"
+
+
+# --- v1.11.0 Token Heatmap: bucket-keyed snapshots (docs/PROPOSED_SCHEMA.sql, same order as
+# the DDL; TOKEN_HEATMAP_DATA_SPEC.md section 2). Staged by extract.run when HL_HEATMAP=1 from
+# data the hourly run already holds (clearinghouseState, the leaderboard) plus ONE
+# metaAndAssetCtxs call per dex; the aggregation (cohort x coin cells) is downstream (Dagster).
+L4X_PERP_POSITION_SNAP_COLUMNS = [
+    "as_of_bucket",            # date_trunc('hour', run start) in the MVP (30/15-min in Stage 2, 1440 = daily seed)
+    "bucket_minutes",
+    "as_of_ts",                # when THIS wallet's clearinghouseState was fetched (not the run start)
+    "as_of_date",
+    "wallet_address",
+    "wallet_group",
+    "coin",                    # dex-qualified for HIP-3 (xyz:SP500)
+    "dex",
+    "side",                    # long | short (sign of szi)
+    "szi",
+    "entry_px",
+    "position_value",
+    "mark_px",
+    "unrealized_pnl_usd",
+    "return_on_equity",
+    "liquidation_px",
+    "margin_used_usd",
+    "leverage_type",
+    "leverage_value",
+    "max_leverage",            # position.maxLeverage (new vs l4x)
+    "cum_funding_all_time",
+    "cum_funding_since_open",
+    "cum_funding_since_change",  # cumFunding.sinceChange (new vs l4x)
+    "account_value_usd",       # marginSummary.accountValue of THIS dex's margin account
+    "wallet_perp_equity_usd",  # SUM over dexes of account_value_usd (the size-cohort metric)
+    "source",                  # hourly | sweep | l4x_daily
+    "run_id",
+    "created_at",
+]
+
+L4X_WALLET_COHORT_SNAP_COLUMNS = [
+    "as_of_bucket",
+    "bucket_minutes",
+    "as_of_ts",                     # run start (leaderboard + plan are per run)
+    "as_of_date",
+    "wallet_address",
+    "position_snapshot_present",    # clearinghouseState fetched in this bucket (false = deferred / skipped)
+    "perp_equity_usd",              # SUM over dexes of marginSummary.accountValue; NULL when not fetched
+    "equity_source",                # snapshot | NULL
+    "equity_has_non_usd",           # a HIP-3 dex with non-USDC collateral contributed, valued at 1.0
+    "leaderboard_account_value_usd",  # stats-data accountValue (NOT perp equity)
+    "rank_account_value",           # 1 = largest accountValue on the leaderboard
+    "size_cohort",                  # under_100k | small_whale | whale | tidal_whale | leviathan
+    "size_cohort_fine",             # HyperTracker 8-tier id 16,1,2,3,4,5,6,7
+    "pnl_day",
+    "pnl_week",
+    "pnl_month",
+    "pnl_all",                      # allTime.pnl = the perf-cohort metric
+    "roi_day",
+    "roi_week",
+    "roi_month",
+    "roi_all",
+    "vlm_day",
+    "vlm_week",
+    "vlm_month",
+    "vlm_all",
+    "perf_cohort",                  # money_printer | smart_money | consistent_trader | average_trader | losing_trader | unknown
+    "perf_cohort_fine",             # HyperTracker tiers 8..15
+    "is_tracked_whale",             # bb_whale_top100
+    "is_tracked_smart",             # bb_smart_30d
+    "is_pinned",
+    "is_active",                    # vlm_month > 0 OR has_open_position
+    "has_open_position",
+    "leaderboard_fetched_at",
+    "leaderboard_last_modified",    # HTTP Last-Modified of the stats-data file
+    "size_cohort_version",          # size_v1
+    "perf_cohort_version",          # perf_v1
+    "source",
+    "run_id",
+    "created_at",
+]
+
+L4X_PERP_MARKET_CTX_SNAP_COLUMNS = [
+    "as_of_bucket",
+    "bucket_minutes",
+    "as_of_ts",            # when metaAndAssetCtxs was called
+    "as_of_date",
+    "coin",                # dex-qualified for HIP-3
+    "dex",
+    "open_interest",       # coin units
+    "open_interest_usd",   # open_interest * mark_px
+    "funding_1h",          # hourly funding rate
+    "mark_px",
+    "oracle_px",
+    "prev_day_px",
+    "day_ntl_vlm",
+    "premium",
+    "max_leverage",
+    "source",
+    "run_id",
+    "created_at",
+]

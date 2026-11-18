@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import schema as S
-from . import analytics, config, mappers, ops, price_step, prices, wallet_meta
+from . import analytics, config, heatmap, mappers, ops, price_step, prices, wallet_meta
 from .info_client import InfoClient
 from .ops import atomic_write_text
 from .spot_meta import SpotMetaResolver, empty as empty_resolver
@@ -663,7 +663,9 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
         hip3: bool = True, retention_days: int = 0, deadline_ts: float | None = None,
         soft_wallets: set[str] | None = None, progress=None,
-        price_budget_min: float | None = None, rollup_budget_min: float | None = None) -> dict:
+        price_budget_min: float | None = None, rollup_budget_min: float | None = None,
+        leaderboard_rows: dict | None = None, leaderboard_meta: dict | None = None,
+        tracked_sets: dict | None = None) -> dict:
     """Pull, map, snapshot, analyse and write every wallet in `wallets` (in order).
 
     deadline_ts (epoch seconds): after it, no further wallet is STARTED and the
@@ -687,6 +689,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     price_budget_min: minutes the native candle step (price_step, FIRST in the run) may
     spend; None = HL_PRICE_TIME_BUDGET_MIN, 0 = off. Its two tables are lifted right
     after the step when `iceberg` is set, so they land even if the wallet phase fails.
+
+    leaderboard_rows / leaderboard_meta / tracked_sets (v1.11.0, from daily.py): the
+    leaderboard rows of the planned wallets ({address: tracked.Row}), its fetch metadata
+    (fetched_at, last_modified) and the tracked sets ({whales, smart}) - inputs of the Token
+    Heatmap's l4x_wallet_cohort_snap when HL_HEATMAP=1 (heatmap.py); None = not read this
+    run (cohort rows then carry perf_cohort = unknown and NULL tracked flags).
     """
     wallets = list(dict.fromkeys(w.lower() for w in wallets))   # dedupe: one pull and one dimension row per wallet
     soft = {w.lower() for w in (soft_wallets or ())}
@@ -695,6 +703,17 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     now_iso = _now_iso()
     now_ms = int(time.time() * 1000)
     default_start_ms = now_ms - days * 86400 * 1000
+    # v1.11.0 Token Heatmap (heatmap.py): OFF unless HL_HEATMAP=1 and this run is the writer;
+    # every heatmap step below is guarded and reported (`heatmap` in the reconciliation /
+    # run summary), none can fail the run
+    heat_on = heatmap.enabled()
+    heat: dict = {"enabled": heat_on}
+    heat_bucket_ms = heatmap.bucket_start_ms(now_ms)
+    heat_run_id = heatmap.make_run_id(heatmap.SOURCE_HOURLY, now_ms)
+    heat_positions: list[dict] = []
+    heat_snapshots: dict[str, dict] = {}        # wallet -> {equity, has_non_usd, open_positions} when fetched
+    if heat_on:
+        heat.update(bucket=heatmap.iso(heat_bucket_ms), run_id=heat_run_id, writer=heatmap.writer())
     start_ms = default_start_ms          # run-level window (prices, reporting)
     ns_dir = out_dir / S.NS_HYPERCORE
     wm_path = ns_dir / "_watermarks.json"
@@ -823,7 +842,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         pending.append(dict(wallet=wallet, prior=prior, w_start_ms=w_start_ms, d=d, fills=fills,
                             fills_saturated=fills_saturated, oldest_api=oldest_api,
                             twap_fills=twap_fills, need_ledger_all=need_ledger_all,
-                            s3_report=None))
+                            s3_report=None, fetched_at_ms=int(time.time() * 1000)))   # v1.11.0: the heatmap row's as_of_ts
         # one line per wallet while pulling: the only sign of life in this phase
         log.info("[%d/%d] %s pulled in %.1fs: %d fills, %d funding, %d ledger%s",
                  i + 1, len(wallets), wallet[:10], time.monotonic() - t_wallet, len(fills),
@@ -919,6 +938,19 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                     account_value_by_dex[dx] = av
                     snap_rows += dex_rows
             perp_coins_open.update(r["coin"] for r in snap_rows)
+            if heat_on:
+                # v1.11.0: the bucket-keyed position rows from the SAME payloads (no extra call)
+                try:
+                    hrows = heatmap.position_rows(chs, chs_by_dex, wallet, bucket_ms=heat_bucket_ms,
+                                                  fetched_at_ms=int(p.get("fetched_at_ms") or now_ms),
+                                                  run_id=heat_run_id, now_iso=now_iso)
+                    heat_positions += hrows
+                    heat_snapshots[wallet] = {"equity": heatmap.wallet_perp_equity(chs, chs_by_dex),
+                                              "has_non_usd": heatmap.equity_has_non_usd(chs_by_dex, collateral_report),
+                                              "open_positions": len(hrows)}
+                except Exception as e:  # noqa: BLE001 - never the wallet's problem
+                    log.warning("[%s] heatmap position rows failed: %s: %s", wallet[:10], type(e).__name__, e)
+                    heat.setdefault("errors", {})[f"positions:{wallet}"] = f"{type(e).__name__}: {str(e)[:120]}"
 
             # --- current spot prices for valuation (no candles) -------------------
             balances = spot_state.get("balances", []) if spot_state else []
@@ -1247,6 +1279,44 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     # tokens the ledger referenced this run form the hot tier of the next run's price step
     price_step.record_seen(ns_dir, {r["token_address"] for r in all_l1}, now_ms)
 
+    # --- v1.11.0 Token Heatmap: market ctx (the only new Info weight, after the pull phase),
+    # cohort rows for every PLANNED wallet, then the three staged CSVs. Guarded: a failure is
+    # a run-summary warning, never a failed run (TOKEN_HEATMAP_DATA_SPEC.md section 2.6).
+    if heat_on:
+        t_heat = time.monotonic()
+        try:
+            progress(detail="heatmap")
+            errors_by_wallet = {w: (r.get("errors") or r.get("fetch_errors") or {}) for w, r in recon_by_wallet.items()}
+            ctx_rows: list[dict] = []
+            if heatmap.saw_rate_limit(errors_by_wallet):
+                heat["ctx_skipped"] = "429 during the pull phase"
+                log.warning("heatmap: metaAndAssetCtxs skipped - the pull phase saw HTTP 429")
+            else:
+                ctx_rows, ctx_errors = heatmap.fetch_market_ctx(client, heatmap.market_dexes(), bucket_ms=heat_bucket_ms,
+                                                                run_id=heat_run_id, now_iso=now_iso, clock=time)
+                if ctx_errors:
+                    heat["ctx_errors"] = ctx_errors
+            lb_meta = leaderboard_meta or {}
+            sets = tracked_sets or {}
+            coh_rows = heatmap.cohort_rows(
+                wallets, heat_snapshots, bucket_ms=heat_bucket_ms, run_start_ms=now_ms, run_id=heat_run_id,
+                now_iso=now_iso, leaderboard_rows=leaderboard_rows,
+                whales=sets.get("whales") or (), smart=sets.get("smart") or (),
+                pins=[w for w in wallets if w not in soft],
+                leaderboard_fetched_at=lb_meta.get("fetched_at"), leaderboard_last_modified=lb_meta.get("last_modified"))
+            heat.update(heatmap.stage(ns_dir, heat_positions, coh_rows, ctx_rows, bucket_iso=heatmap.iso(heat_bucket_ms),
+                                      scope_wallets=set(heat_snapshots)))
+            heat["wallets_present"] = len(heat_snapshots)
+            heat["leaderboard"] = "fresh" if leaderboard_rows is not None else "absent"
+            log.info("heatmap: staged %d position, %d cohort, %d market ctx rows for bucket %s in %.1fs",
+                     heat["positions"], heat["cohort"], heat["market_ctx"], heat["bucket"], time.monotonic() - t_heat)
+        except Exception as e:  # noqa: BLE001 - reported, never fatal
+            log.exception("heatmap staging failed")
+            heat["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+        finally:
+            progress(detail=None)
+        heat["stage_s"] = round(time.monotonic() - t_heat, 1)
+
     price_report = None
     if with_prices:
         from .price_job import build_price_rows
@@ -1283,12 +1353,47 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         lift_state = read_lift_state(ns_dir) if incremental else {}
         prev_lift = lift_state.get("last_success_run_iso")
         progress(phase="lift")
-        iceberg_report = lift_directory(ns_dir, since_iso=lift_since(prev_lift, now_iso))  # raises on failure
+        # the heatmap tables (v1.11.0) are lifted in their own call below, behind the skip
+        # guard; the main lift never includes them (and never waits for them)
+        from .iceberg_load import HEATMAP_TABLES, TABLE_PLAN
+        main_tables = [t for t in TABLE_PLAN if t not in HEATMAP_TABLES]
+        iceberg_report = lift_directory(ns_dir, tables=main_tables, since_iso=lift_since(prev_lift, now_iso))  # raises on failure
+        extra_state: dict = {}
+        if heat_on and not heat.get("error"):
+            # Skip guard (spec 2.6): past HL_HEATMAP_LIFT_DEADLINE_S the three small tables wait
+            # for the next run, which lifts them from the pending bucket's as_of_ts - the main
+            # lift marker (last_success_run_iso) moves every run regardless, and its 1h margin
+            # would lose a skipped bucket after two more runs, hence the separate marker.
+            pending = heatmap.pending_since(lift_state)
+            t_lift = time.monotonic()
+            if heatmap.lift_skipped(now_ms / 1000, time.time()):
+                heat["lift_skipped"] = True
+                heat["pending_since"] = heatmap.earlier_iso(pending, now_iso)
+                extra_state["heatmap"] = {"pending_since": heat["pending_since"], "skipped_at": _now_iso()}
+                log.warning("heatmap: lift skipped (run past HL_HEATMAP_LIFT_DEADLINE_S); pending since %s",
+                            heat["pending_since"])
+            else:
+                try:
+                    heat_since = heatmap.lift_since_iso(pending, prev_lift, now_iso)
+                    heat["lift"] = lift_directory(ns_dir, tables=list(HEATMAP_TABLES), since_iso=heat_since)
+                    heat["lift_since"] = heat_since
+                    extra_state["heatmap"] = {"last_lift_iso": now_iso}
+                    if pending:
+                        heat["repaired_since"] = pending
+                except Exception as e:  # noqa: BLE001 - a failed heatmap lift is a warning; the next run retries
+                    log.warning("heatmap lift failed (retried next run): %s: %s", type(e).__name__, e)
+                    heat["lift_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+                    heat["pending_since"] = heatmap.earlier_iso(pending, now_iso)
+                    extra_state["heatmap"] = {"pending_since": heat["pending_since"], "error": heat["lift_error"]}
+            heat["lift_s"] = round(time.monotonic() - t_lift, 1)
+        elif heat_on:
+            # staging failed this run: keep (or start) the pending marker so the bucket is not lost
+            pending = heatmap.pending_since(lift_state)
+            extra_state["heatmap"] = {"pending_since": heatmap.earlier_iso(pending, now_iso), "error": heat.get("error")}
         # Staged-CSV retention: the lake now holds these rows durably, so the
         # staging files only need to keep the analytics windows (30d) + margin.
         # Pruning rewrites the files whole, so it runs at most once a day (hourly
         # cadence would otherwise rewrite gigabytes every hour for nothing).
-        extra_state: dict = {}
         if retention_days and retention_days > 0:
             last_prune = lift_state.get("last_prune_iso")
             try:
@@ -1311,6 +1416,10 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                     "l4x_perp_position_snapshot": prune_csv(ns_dir / "l4x_perp_position_snapshot.csv", "as_of_ts", cutoff_ms),
                     "l4x_spot_balance_snapshot": prune_csv(ns_dir / "l4x_spot_balance_snapshot.csv", "as_of_ts", cutoff_ms),
                 }
+                if heat_on:
+                    # v1.11.0: the heatmap CSVs are rewritten whole every run and the lake is the
+                    # store: 7 days (like the 1m feed), never the full retention
+                    retention_report.update(heatmap.prune_staged(ns_dir, now_ms))
                 extra_state["last_prune_iso"] = now_iso
             else:
                 retention_report = {"retention_days": retention_days, "skipped": f"last prune {last_prune}"}
@@ -1380,6 +1489,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         "rollups": rollups_report,
         "hip3_dexes_checked": dexes,
         "hip3_collateral_by_dex": collateral_report,
+        "heatmap": heat if heat_on else None,
         "by_wallet": prev_by_wallet,
     }
     atomic_write_text(recon_path, json.dumps(recon, indent=2))

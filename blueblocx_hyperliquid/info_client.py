@@ -224,9 +224,14 @@ class InfoClient:
         data = self._post({"type": "tokenDetails", "tokenId": token_id})
         return data if isinstance(data, dict) else {}
 
-    def meta_and_asset_ctxs(self) -> tuple[dict, list[dict]]:
-        """Perp universe PLUS live markPx/funding/OI per coin — one call."""
-        meta, ctxs = self._post({"type": "metaAndAssetCtxs"}, est_items=500)
+    def meta_and_asset_ctxs(self, dex: str | None = None) -> tuple[dict, list[dict]]:
+        """Perp universe PLUS live markPx/funding/OI per coin — one call (weight 20).
+        `dex` (v1.11.0): a HIP-3 builder dex's universe + contexts (coin names carry the
+        `dex:` prefix); None = the main dex. universe[i] pairs with ctxs[i]."""
+        body: dict = {"type": "metaAndAssetCtxs"}
+        if dex:
+            body["dex"] = dex
+        meta, ctxs = self._post(body, est_items=500)
         return meta, ctxs
 
     def delegator_summary(self, user: str) -> dict:

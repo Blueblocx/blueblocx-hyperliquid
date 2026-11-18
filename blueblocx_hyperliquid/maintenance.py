@@ -26,6 +26,13 @@ lock and a tick that finds it held exits 3 (an hour skipped); what the deadline 
 off is done the next night. Partitions above COMPACT_MAX_ROWS are skipped (reported).
 Old snapshots keep the pre-compaction files alive for readers until the 7-day expiry.
 
+--drop-partitions (v1.11.0, nightly with the compaction): the Token Heatmap snapshot
+tables are the only lake tables with a retention - as_of_date partitions of
+l4x_perp_position_snap / l4x_wallet_cohort_snap older than HL_HEATMAP_LAKE_RETENTION_DAYS
+(45) and of l4x_perp_market_ctx_snap older than HL_HEATMAP_CTX_RETENTION_DAYS (90) are
+deleted, one commit per table per night (heatmap.drop_partitions; a table that does not
+exist yet, HL_HEATMAP off, is skipped).
+
 --fix-first-seen (one-time repair after deploying v1.6.0, between ticks): before
 v1.6.0 l1_token_metadata.first_seen moved to the last run that saw the token. Set it
 to the token's earliest staged ledger event when that is earlier and re-stamp the row
@@ -53,6 +60,8 @@ log = logging.getLogger("blueblocx_hyperliquid.maintenance")
 COMPACT_MIN_FILES = 8            # fewer data files in a partition: left alone
 COMPACT_MAX_ROWS = 3_000_000     # a partition this large is skipped (memory, time) and reported
 COMPACT_CLOSED_DAYS = {"l4x_perp_position_snapshot": 1, "l4x_spot_balance_snapshot": 1,
+                       # v1.11.0 heatmap snapshots: 24 lifts/day/table, bucket-keyed, closed after the UTC day
+                       "l4x_perp_position_snap": 1, "l4x_wallet_cohort_snap": 1, "l4x_perp_market_ctx_snap": 1,
                        # rewritten per day for 3 days by the hourly rollups (24 commits/day each)
                        "token_market_signals": 3, "token_quality": 3}   # default 2: UTC days before a partition is closed
 _DEFAULT_CLOSED_DAYS = 2
@@ -274,6 +283,9 @@ def main(argv=None) -> int:
     ap.add_argument("--compact", action="store_true",
                     help="rewrite closed, fragmented partitions into one file each (one commit per table), "
                          "bounded by the next hourly tick minus a minute; runs before the snapshot expiry")
+    ap.add_argument("--drop-partitions", action="store_true",
+                    help="v1.11.0: delete the Token Heatmap tables' as_of_date partitions older than "
+                         "HL_HEATMAP_LAKE_RETENTION_DAYS / HL_HEATMAP_CTX_RETENTION_DAYS (one commit per table)")
     args = ap.parse_args(argv)
     ns_dir = Path(args.out) / S.NS_HYPERCORE
     try:
@@ -282,18 +294,24 @@ def main(argv=None) -> int:
                 report = {"fix_first_seen": fix_first_seen(ns_dir, dt.datetime.now(tz=dt.timezone.utc).isoformat()),
                           "tables": {}}
             else:
-                compact_report = None
+                compact_report = drop_report = None
                 catalog = None
-                if args.compact:
+                if args.compact or args.drop_partitions:
                     from .iceberg_load import dispose_catalog, load_catalog_from_env
                     catalog, _ = load_catalog_from_env()
                     try:
-                        compact_report = compact(args.namespace, catalog)
+                        if args.compact:
+                            compact_report = compact(args.namespace, catalog)
+                        if args.drop_partitions:
+                            from . import heatmap
+                            drop_report = heatmap.drop_partitions(catalog, args.namespace)
                     finally:
                         dispose_catalog(catalog)
                 report = run(args.namespace, args.expire_days)
                 if compact_report is not None:
                     report["compact"] = compact_report
+                if drop_report is not None:
+                    report["drop_partitions"] = drop_report
     except ops.LockHeld as e:
         # a data run holds the lock: yield (exit 3 = SuccessExitStatus in the unit, not a
         # failure); the next nightly tick will do the work
@@ -302,6 +320,7 @@ def main(argv=None) -> int:
     print(json.dumps(report, indent=2, default=str))
     errors = [t for t, e in report["tables"].items() if "expire_error" in e or "properties_error" in e]
     errors += [t for t, e in (report.get("compact") or {}).get("tables", {}).items() if "error" in e]
+    errors += [t for t, e in (report.get("drop_partitions") or {}).items() if "error" in e]
     return 1 if errors else 0
 
 

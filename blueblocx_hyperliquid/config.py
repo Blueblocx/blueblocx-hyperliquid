@@ -109,6 +109,38 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                     "wallet batches of about this many ledger rows; every finished batch is written and "
                                     "recorded in _rollup_state.json (wallets_through), the time budget is checked "
                                     "between batches, so a backlog drains across runs instead of being redone each hour"),
+    # --- Token Heatmap (heatmap.py, v1.11.0: TOKEN_HEATMAP_DATA_SPEC.md section 2) ----------
+    "HL_HEATMAP": ("0", False,
+                   "v1.11: 1 = the hourly run stages the three bucket-keyed heatmap snapshot tables "
+                   "(l4x_perp_position_snap, l4x_wallet_cohort_snap, l4x_perp_market_ctx_snap) from the data "
+                   "it already holds plus one metaAndAssetCtxs call per dex (HL_HEATMAP_MARKET_DEXES), and "
+                   "lifts them behind the skip guard (HL_HEATMAP_LIFT_DEADLINE_S); 0 = off (the run behaves "
+                   "exactly as v1.10.14). Rollout: enable, watch 24 runs (duration_s < 2900, deferred "
+                   "unchanged), then `python -m blueblocx_hyperliquid.heatmap --seed-daily` once"),
+    "HL_HEATMAP_WRITER": ("hourly", False,
+                          "v1.11: which process owns the heatmap tables: hourly = the hourly run stages them; "
+                          "sweep = the Stage-2 position sweep does, the hourly run does not touch them"),
+    "HL_HEATMAP_SIZE_BOUNDS": ("100000,500000,1000000,5000000", False,
+                               "v1.11: size cohort (size_v1) bounds on perp equity, USD, ascending: under_100k < b0 <= "
+                               "small_whale < b1 <= whale < b2 <= tidal_whale < b3 <= leviathan"),
+    "HL_HEATMAP_PNL_BOUNDS": ("-10000,10000,100000,1000000", False,
+                              "v1.11: perf cohort (perf_v1) bounds on the leaderboard all-time pnl, USD, ascending: "
+                              "losing_trader <= b0 < average_trader < b1 <= consistent_trader < b2 <= smart_money < "
+                              "b3 <= money_printer"),
+    "HL_HEATMAP_MARKET_DEXES": ("main,xyz,io,mkts,para", False,
+                                "v1.11: perp dexes whose metaAndAssetCtxs is snapshotted into l4x_perp_market_ctx_snap "
+                                "once per run (20 weight each, after the pull phase); main = the main dex"),
+    "HL_HEATMAP_LIFT_DEADLINE_S": ("2400", False,
+                                   "v1.11: skip guard - when the run has been going longer than this many seconds "
+                                   "on entering the lift phase, the lift of the three heatmap tables is skipped "
+                                   "(heatmap.lift_skipped, heatmap.pending_since in _lift_state.json) and repaired "
+                                   "by the next run's separate heatmap lift; the main lift is never skipped"),
+    "HL_HEATMAP_LAKE_RETENTION_DAYS": ("45", False,
+                                       "v1.11: maintenance --drop-partitions deletes l4x_perp_position_snap / "
+                                       "l4x_wallet_cohort_snap partitions (as_of_date) older than this many days "
+                                       "(one commit per table per night); 0 = keep everything"),
+    "HL_HEATMAP_CTX_RETENTION_DAYS": ("90", False,
+                                      "v1.11: the same for l4x_perp_market_ctx_snap; 0 = keep everything"),
     # --- staging (extract.upsert_csv) ---------------------------------------------------
     "HL_UPSERT_STREAM_MIN_BYTES": ("268435456", False,
                                    "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB under "
