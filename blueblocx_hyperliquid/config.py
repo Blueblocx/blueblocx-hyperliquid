@@ -110,7 +110,7 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                     "recorded in _rollup_state.json (wallets_through), the time budget is checked "
                                     "between batches, so a backlog drains across runs instead of being redone each hour"),
     # --- Token Heatmap (heatmap.py, v1.11.0: TOKEN_HEATMAP_DATA_SPEC.md section 2) ----------
-    "HL_HEATMAP": ("0", False,
+    "HL_HEATMAP": ("1", False,
                    "v1.11: 1 = the hourly run stages the three bucket-keyed heatmap snapshot tables "
                    "(l4x_perp_position_snap, l4x_wallet_cohort_snap, l4x_perp_market_ctx_snap) from the data "
                    "it already holds plus one metaAndAssetCtxs call per dex (HL_HEATMAP_MARKET_DEXES), and "
@@ -130,7 +130,7 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
     "HL_HEATMAP_MARKET_DEXES": ("main,xyz,io,mkts,para", False,
                                 "v1.11: perp dexes whose metaAndAssetCtxs is snapshotted into l4x_perp_market_ctx_snap "
                                 "once per run (20 weight each, after the pull phase); main = the main dex"),
-    "HL_HEATMAP_LIFT_DEADLINE_S": ("2400", False,
+    "HL_HEATMAP_LIFT_DEADLINE_S": ("2900", False,
                                    "v1.11: skip guard - when the run has been going longer than this many seconds "
                                    "on entering the lift phase, the lift of the three heatmap tables is skipped "
                                    "(heatmap.lift_skipped, heatmap.pending_since in _lift_state.json) and repaired "

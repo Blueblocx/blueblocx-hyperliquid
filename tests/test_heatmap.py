@@ -403,8 +403,9 @@ class RegistrationTests(unittest.TestCase):
                   "HL_HEATMAP_LIFT_DEADLINE_S", "HL_HEATMAP_LAKE_RETENTION_DAYS", "HL_HEATMAP_CTX_RETENTION_DAYS"):
             self.assertIn(k, config.ENV_VARS)
             self.assertIn(k, (Path(__file__).resolve().parent.parent / "deploy" / ".env.example").read_text(encoding="utf-8"))
-        self.assertEqual(config.ENV_VARS["HL_HEATMAP"][0], "0")
-        with _Env(HL_HEATMAP=None, HL_HEATMAP_WRITER=None, HL_HEATMAP_SIZE_BOUNDS=None, HL_HEATMAP_PNL_BOUNDS=None):
+        self.assertEqual(config.ENV_VARS["HL_HEATMAP"][0], "1")   # default ON since the 2026-11-21 release decision
+        self.assertEqual(config.ENV_VARS["HL_HEATMAP_LIFT_DEADLINE_S"][0], "2900")
+        with _Env(HL_HEATMAP="0", HL_HEATMAP_WRITER=None, HL_HEATMAP_SIZE_BOUNDS=None, HL_HEATMAP_PNL_BOUNDS=None):
             c = next(c for c in preflight.check_env(None) if c.name == "heatmap")
             self.assertEqual(c.status, "OK")
             self.assertIn("off", c.detail)

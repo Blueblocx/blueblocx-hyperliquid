@@ -317,9 +317,9 @@ ensure_env HL_ROLLUP_BALANCE_CHUNK_ROWS 2000000 "v1.10.11: per-wallet rollup eng
 ensure_env HL_UPSERT_STREAM_MIN_BYTES 268435456 "v1.10.11: a staged CSV at least this large (256 MiB) is upserted by DuckDB (bounded memory) instead of Python dicts"
 ensure_env HL_UPSERT_DUCKDB_MEMORY 16GB "v1.10.11: DuckDB memory_limit of the staged-CSV upsert (spills to <state dir>/.duckdb/upsert)"
 ensure_env HL_ROLLUP_WALLET_BATCH_ROWS 8000000 "v1.10.12: the per-wallet rollup chain records its progress per batch of about this many ledger rows (a backlog drains across runs)"
-ensure_env HL_HEATMAP 0 "v1.11: 1 = stage + lift the three Token Heatmap snapshot tables every run (+100 Info weight: metaAndAssetCtxs per dex); 0 = off, the run behaves as v1.10.14. Gate 1: set 1, watch 24 runs, then heatmap --seed-daily once"
+ensure_env HL_HEATMAP 1 "v1.11: 1 = stage + lift the three Token Heatmap snapshot tables every run (+100 Info weight: metaAndAssetCtxs per dex); 0 = off, the run behaves as v1.10.14. Gate 1: set 1, watch 24 runs, then heatmap --seed-daily once"
 ensure_env HL_HEATMAP_WRITER hourly "v1.11: hourly = the hourly run writes the heatmap tables; sweep = the Stage-2 sweep owns them"
-ensure_env HL_HEATMAP_LIFT_DEADLINE_S 2400 "v1.11: skip the heatmap lift when the run is already this old on entering the lift (repaired next run)"
+ensure_env HL_HEATMAP_LIFT_DEADLINE_S 2900 "v1.11: skip the heatmap lift when the run is already this old on entering the lift (repaired next run)"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then
