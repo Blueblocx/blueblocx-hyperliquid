@@ -1,0 +1,19 @@
+# User-level port of deploy/hypercore-daily.service (2026-11-23, sudo-less operation): same command
+# line, same 50-minute cap and memory limit; the root-only sandbox options are dropped. Lives in
+# ~/.config/systemd/user/ of the operating user; the env file and wallets live in ~/.config/hypercore/.
+[Unit]
+Description=HyperCore scheduled extract (Hyperliquid -> lakehouse) [user]
+After=network-online.target
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/blueblocx-hyperliquid
+EnvironmentFile=%h/.config/hypercore/hypercore.env
+Environment=HL_ENV_FILE=%h/.config/hypercore/hypercore.env
+ExecStartPre=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.preflight --iceberg --wallets-file %h/.config/hypercore/wallets.txt
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.daily --wallets-file %h/.config/hypercore/wallets.txt --iceberg
+TimeoutStartSec=50min
+TimeoutStopSec=3min
+MemoryMax=96G
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

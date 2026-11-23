@@ -1,0 +1,9 @@
+[Unit]
+Description=Run hypercore-daily.service every hour [user]
+[Timer]
+OnCalendar=*-*-* *:10:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=hypercore-daily.service
+[Install]
+WantedBy=timers.target

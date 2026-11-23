@@ -1,0 +1,11 @@
+[Unit]
+Description=HyperCore lake maintenance (compact closed partitions, expire snapshots, heatmap retention) [user]
+After=network-online.target
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/blueblocx-hyperliquid
+EnvironmentFile=%h/.config/hypercore/hypercore.env
+Environment=HL_ENV_FILE=%h/.config/hypercore/hypercore.env
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.maintenance --expire-days 7 --compact --drop-partitions
+TimeoutStartSec=30min
+Nice=10

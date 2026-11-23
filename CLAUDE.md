@@ -51,6 +51,12 @@ the distinction is the whole safety model:
 
 ## Release flow (the only way production changes)
 
+> **2026-11-23: sudo-less operation.** The pipeline runs as the login user under `systemctl --user`
+> (units in `deploy/user/`, cutover in `docs/runbooks/2026-11-23_sudo-less-operation.md`). Releases use
+> `RELEASE_TAG=vX.Y.Z bash deploy/bootstrap-user.sh` (no sudo); the env file is `~/.config/hypercore/hypercore.env`
+> and status/log commands are `systemctl --user ...` / `journalctl --user -u hypercore-daily`. The flow below is
+> the legacy root-based one, kept for machines still on the system units.
+
 ```bash
 # in ~/blueblocx-hyperliquid, after tests pass
 # bump the version in: pyproject.toml, blueblocx_hyperliquid/__init__.py,

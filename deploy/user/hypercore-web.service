@@ -1,0 +1,13 @@
+[Unit]
+Description=HyperCore web monitor (read-only status page, HL_WEB_BIND:HL_WEB_PORT) [user]
+After=network-online.target
+[Service]
+WorkingDirectory=/opt/blueblocx-hyperliquid
+EnvironmentFile=%h/.config/hypercore/hypercore.env
+Environment=HL_ENV_FILE=%h/.config/hypercore/hypercore.env
+ExecStart=/opt/blueblocx-hyperliquid/.venv/bin/python -m blueblocx_hyperliquid.web
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+[Install]
+WantedBy=default.target
