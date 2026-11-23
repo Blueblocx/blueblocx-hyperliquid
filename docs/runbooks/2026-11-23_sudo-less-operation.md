@@ -16,7 +16,7 @@ set -e
 U=hatsadin
 # 1. stop the system timers and wait for the running extract to finish
 systemctl disable --now hypercore-hourly.timer hypercore-maintenance.timer
-while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done
+while [ "$(systemctl is-active hypercore-daily.service)" != inactive ]; do sleep 10; done   # a running oneshot reports 'activating'
 systemctl disable --now hypercore-web.service
 systemctl stop hypercore-daily.service hypercore-maintenance.service 2>/dev/null || true
 # 2. the state dir (runs, locks, staged CSVs) becomes the user's

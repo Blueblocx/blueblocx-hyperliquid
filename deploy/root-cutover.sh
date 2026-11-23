@@ -4,6 +4,6 @@
 # The user-side steps (checkout v1.11.0 in /opt, systemctl --user enable the units) are done by hatsadin afterwards.
 set -euo pipefail
 systemctl disable --now hypercore-hourly.timer hypercore-maintenance.timer hypercore-web.service
-while systemctl is-active --quiet hypercore-daily.service; do sleep 10; done
+while [ "$(systemctl is-active hypercore-daily.service)" != inactive ]; do sleep 10; done   # a running oneshot reports 'activating'
 chown -R hatsadin:hatsadin /var/lib/hypercore
 loginctl enable-linger hatsadin
