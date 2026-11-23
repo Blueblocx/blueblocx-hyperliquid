@@ -114,7 +114,7 @@ class CohortTests(unittest.TestCase):
 
     def test_enabled_requires_the_switch_and_the_hourly_writer(self):
         with _Env(HL_HEATMAP=None, HL_HEATMAP_WRITER=None):
-            self.assertFalse(heatmap.enabled())                             # default OFF
+            self.assertTrue(heatmap.enabled())                              # default ON (release decision 2026-11-21; 1.11.1 makes env_bool honour it)
         with _Env(HL_HEATMAP="1", HL_HEATMAP_WRITER=None):
             self.assertTrue(heatmap.enabled())
         with _Env(HL_HEATMAP="1", HL_HEATMAP_WRITER="sweep"):
@@ -405,6 +405,9 @@ class RegistrationTests(unittest.TestCase):
             self.assertIn(k, (Path(__file__).resolve().parent.parent / "deploy" / ".env.example").read_text(encoding="utf-8"))
         self.assertEqual(config.ENV_VARS["HL_HEATMAP"][0], "1")   # default ON since the 2026-11-21 release decision
         self.assertEqual(config.ENV_VARS["HL_HEATMAP_LIFT_DEADLINE_S"][0], "2900")
+        with _Env(HL_HEATMAP=None, HL_HEATMAP_WRITER=None):   # unset = the documented default = ON (1.11.1 fix: env_bool used to force 0)
+            self.assertTrue(heatmap.enabled())
+            self.assertIn("+100 weight", next(c for c in preflight.check_env(None) if c.name == "heatmap").detail)
         with _Env(HL_HEATMAP="0", HL_HEATMAP_WRITER=None, HL_HEATMAP_SIZE_BOUNDS=None, HL_HEATMAP_PNL_BOUNDS=None):
             c = next(c for c in preflight.check_env(None) if c.name == "heatmap")
             self.assertEqual(c.status, "OK")
@@ -451,7 +454,7 @@ class ExtractWiringTests(unittest.TestCase):
 
     def test_off_by_default_nothing_changes(self):
         with tempfile.TemporaryDirectory() as d:
-            recon = self._run(Path(d), [W1], clock=_FakeTime(T0), env={"HL_HEATMAP": None})
+            recon = self._run(Path(d), [W1], clock=_FakeTime(T0), env={"HL_HEATMAP": "0"})   # explicit off = v1.10.14 behaviour
             ns = Path(d) / S.NS_HYPERCORE
             self.assertIsNone(recon["heatmap"])
             self.assertEqual([p.name for p in ns.glob("l4x_*_snap.csv")], [])

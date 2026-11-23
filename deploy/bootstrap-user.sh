@@ -5,7 +5,7 @@
 # belongs to this user, `loginctl enable-linger` is set, the system units are gone.
 # Usage, between timer ticks:  RELEASE_TAG=vX.Y.Z bash deploy/bootstrap-user.sh
 set -euo pipefail
-RELEASE_TAG="${RELEASE_TAG:-v1.11.0}"
+RELEASE_TAG="${RELEASE_TAG:-v1.11.1}"
 PROD_DIR="${PROD_DIR:-/opt/blueblocx-hyperliquid}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 say() { printf '\n== %s\n' "$*"; }

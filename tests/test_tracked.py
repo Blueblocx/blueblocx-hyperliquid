@@ -317,8 +317,15 @@ class _FakeClient:
 
 
 class SoftDeadlineTests(unittest.TestCase):
+    def setUp(self):
+        # these tests describe the pre-heatmap files; the heatmap is ON by default since 1.11.1
+        env = mock.patch.dict(os.environ, {"HL_HEATMAP": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_deadline_in_the_past_defers_everything_and_touches_nothing(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(extract, "InfoClient", _ClientDown):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(extract, "InfoClient", _ClientDown), \
+             mock.patch.dict(os.environ, {"HL_HEATMAP": "0"}):   # heatmap is ON by default since 1.11.1; this test is about the pre-heatmap files
             out = Path(d)
             ns = out / S.NS_HYPERCORE
             ns.mkdir(parents=True)

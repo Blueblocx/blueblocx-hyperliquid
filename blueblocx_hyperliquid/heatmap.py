@@ -104,7 +104,7 @@ def writer() -> str:
 def enabled() -> bool:
     """The hourly run stages and lifts the three tables: HL_HEATMAP on AND the hourly run is
     the writer (HL_HEATMAP_WRITER=sweep hands the tables to the Stage-2 sweep)."""
-    return config.env_bool("HL_HEATMAP") and writer() == SOURCE_HOURLY
+    return config.env_bool("HL_HEATMAP", default=config.ENV_VARS["HL_HEATMAP"][0] == "1") and writer() == SOURCE_HOURLY
 
 
 def parse_bounds(raw: str, name: str = "bounds", n: int = 4) -> list[float]:
@@ -142,7 +142,7 @@ def lift_deadline_s() -> float:
 
 def settings() -> dict:
     """Resolved settings (validated), for preflight and the run report."""
-    return {"enabled": config.env_bool("HL_HEATMAP"), "writer": writer(), "size_bounds": size_bounds(),
+    return {"enabled": config.env_bool("HL_HEATMAP", default=config.ENV_VARS["HL_HEATMAP"][0] == "1"), "writer": writer(), "size_bounds": size_bounds(),
             "pnl_bounds": pnl_bounds(), "market_dexes": market_dexes(), "lift_deadline_s": lift_deadline_s(),
             "lake_retention_days": config.env_int("HL_HEATMAP_LAKE_RETENTION_DAYS"),
             "ctx_retention_days": config.env_int("HL_HEATMAP_CTX_RETENTION_DAYS")}
