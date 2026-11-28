@@ -176,24 +176,30 @@ def balance_chunk_rows() -> int:
     return max(1, config.env_int("HL_ROLLUP_BALANCE_CHUNK_ROWS", 2_000_000))
 
 
-def wallet_chunks(ctx, alias: str = "ledger", chunk_rows: int | None = None) -> list[list[str]]:
-    """The wallets of `alias`, sorted, grouped into chunks of about `chunk_rows` ledger
-    rows each: a wallet is never split (its whole ledger is one running total), so a
-    single wallet larger than the chunk forms a chunk of its own."""
+def wallet_chunks_with_rows(ctx, alias: str = "ledger", chunk_rows: int | None = None) -> list[tuple[list[str], int]]:
+    """wallet_chunks with the ledger row count of every chunk (v1.11.2: the rollup run
+    estimates a batch's duration from it before starting the batch)."""
     chunk_rows = chunk_rows or balance_chunk_rows()
     counts = ctx.sql(f"SELECT wallet_address, count(*) AS n FROM {alias} GROUP BY 1 ORDER BY 1")
-    chunks: list[list[str]] = []
+    chunks: list[tuple[list[str], int]] = []
     cur: list[str] = []
     cur_n = 0
     for w, n in zip(counts.column("wallet_address").to_pylist(), counts.column("n").to_pylist()):
         if cur and cur_n + n > chunk_rows:
-            chunks.append(cur)
+            chunks.append((cur, cur_n))
             cur, cur_n = [], 0
         cur.append(w)
-        cur_n += n
+        cur_n += int(n)
     if cur:
-        chunks.append(cur)
+        chunks.append((cur, cur_n))
     return chunks
+
+
+def wallet_chunks(ctx, alias: str = "ledger", chunk_rows: int | None = None) -> list[list[str]]:
+    """The wallets of `alias`, sorted, grouped into chunks of about `chunk_rows` ledger
+    rows each: a wallet is never split (its whole ledger is one running total), so a
+    single wallet larger than the chunk forms a chunk of its own."""
+    return [chunk for chunk, _rows in wallet_chunks_with_rows(ctx, alias, chunk_rows)]
 
 
 def ledger_chunk(ctx, wallets: list[str], select_sql: str) -> pa.Table:

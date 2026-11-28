@@ -371,6 +371,19 @@ class DailyMainTests(unittest.TestCase):
             self.assertFalse((out / "hypercore" / ".daily.lock").exists())
             self.assertTrue((out / "hypercore" / ops.HISTORY_FILE).exists())
 
+    def test_hard_deadline_is_handed_to_the_extract(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HL_RUN_HARD_DEADLINE_MIN": "47"}):
+            t0 = time.time()
+            code, summary, captured, _ = self._run(d, recon=_clean_recon(self.W))
+            self.assertEqual(code, 0)
+            self.assertAlmostEqual(captured["hard_deadline_ts"], t0 + 47 * 60, delta=30)   # run start + 47 min
+            self.assertIsNone(captured["deadline_ts"])                                      # soft deadline off (setUp)
+            self.assertEqual(summary["options"]["hard_deadline_min"], 47.0)
+            progress = json.loads((Path(d) / "out" / "hypercore" / ops.PROGRESS_FILE).read_text(encoding="utf-8"))
+            self.assertIn("hard_deadline_at", progress)
+            code, summary, captured, _ = self._run(d, recon=_clean_recon(self.W), extra=["--hard-deadline-min", "0"])
+            self.assertIsNone(captured["hard_deadline_ts"])
+
     def test_problem_run_exits_one(self):
         recon = _clean_recon(self.W)
         recon["by_wallet"][self.W[1]]["fills_truncated_at_10k_cap"] = True
@@ -446,6 +459,75 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(by["hl_api"].status, "SKIP")
             self.assertEqual(by["iceberg"].status, "WARN")          # local catalog is dev-only
             self.assertEqual(by["wallets"].status, "SKIP")
+
+    def test_hl_api_retries_transient_failures(self):
+        import requests
+
+        class _Resp:
+            def __init__(self, status, universe=3):
+                self.status_code, self._n, self.headers = status, universe, {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise requests.HTTPError(f"{self.status_code} Error")
+
+            def json(self):
+                return {"universe": [{}] * self._n}
+
+        state = {"answers": iter(()), "calls": 0}
+        slept: list[float] = []
+
+        def post(url, **kw):
+            state["calls"] += 1
+            a = next(state["answers"])
+            if isinstance(a, Exception):
+                raise a
+            return a
+
+        def probe(*answers):
+            state["answers"], state["calls"] = iter(answers), 0
+            slept.clear()
+            return preflight.check_hl_api(post=post, sleep=slept.append)[0]
+
+        with mock.patch.dict(os.environ, {"HL_INFO_URL": "https://hl.test/info", "HL_HTTP_TIMEOUT": "5"}):
+            # a 504, a timeout, then a 200: the probe passes (WARN: the flakiness stays visible), backoff 5 s then 10 s
+            c = probe(_Resp(504), requests.exceptions.Timeout("read timed out"), _Resp(200))
+            self.assertEqual(c.status, "WARN")
+            self.assertIn("3 perp assets", c.detail)
+            self.assertIn("2 transient failure(s): try 1: HTTP 504; try 2: Timeout", c.detail)
+            self.assertEqual((state["calls"], slept), (3, [5.0, 10.0]))
+            # three 5xx in a row: FAIL after the last try (the 08:12 UTC 2026-11-28 slot was lost to ONE 504)
+            c = probe(_Resp(504), _Resp(502), _Resp(504))
+            self.assertEqual(c.status, "FAIL")
+            self.assertIn("HTTP 504 after 3 tries", c.detail)
+            self.assertEqual((state["calls"], slept), (3, [5.0, 10.0]))
+            # a connection error on every try: FAIL after 3
+            c = probe(requests.exceptions.ConnectionError(), requests.exceptions.ConnectionError(), requests.exceptions.ConnectionError())
+            self.assertEqual((c.status, state["calls"]), ("FAIL", 3))
+            # a 4xx is not transient: one call, no sleep; a clean 200: OK at once
+            c = probe(_Resp(400))
+            self.assertEqual((c.status, state["calls"], slept), ("FAIL", 1, []))
+            c = probe(_Resp(200, universe=7))
+            self.assertEqual((c.status, state["calls"], slept), ("OK", 1, []))
+            self.assertIn("7 perp assets", c.detail)
+
+    def test_hard_deadline_env_check(self):
+        def check(**env):
+            with mock.patch.dict(os.environ, env, clear=False):
+                return {c.name: c for c in preflight.check_env(None)}["hard_deadline"]
+
+        c = check(HL_RUN_HARD_DEADLINE_MIN="47", HL_RUN_SOFT_DEADLINE_MIN="27", HL_ROLLUP_DEADLINE_MARGIN_S="120",
+                  HL_ROLLUP_TIME_BUDGET_MIN="20", HL_ROLLUP_AGGREGATES_WITH_PENDING="1")
+        self.assertEqual(c.status, "OK")
+        self.assertIn("47 min; the rollup step keeps 120 s clear", c.detail)
+        self.assertIn("aggregates recomputed even with pending wallets", c.detail)
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="0").status, "OK")
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="50").status, "WARN")                                   # the unit kills at 50
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="20", HL_RUN_SOFT_DEADLINE_MIN="27").status, "WARN")   # below the soft deadline
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="-1").status, "FAIL")
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="47", HL_ROLLUP_DEADLINE_MARGIN_S="-1").status, "FAIL")
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="47", HL_ROLLUP_DEADLINE_MARGIN_S="x").status, "FAIL")
+        self.assertEqual(check(HL_RUN_HARD_DEADLINE_MIN="abc").status, "FAIL")
 
     def test_env_sanity_failures(self):
         with mock.patch.dict(os.environ, {"HL_WEIGHT_BUDGET": "5000", "HL_RETENTION_DAYS": "10"}, clear=False):

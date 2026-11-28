@@ -65,6 +65,12 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                  "are deferred to the next run (rotating order) instead of the service "
                                  "timeout killing the whole run. Hourly cadence: 35 (TimeoutStartSec=50min). "
                                  "0 = off"),
+    "HL_RUN_HARD_DEADLINE_MIN": ("47", False,
+                                 "v1.11.2: minutes after the run start by which the run must be over: the unit's "
+                                 "TimeoutStartSec (50 min on the hourly cadence) minus 3. The rollup step starts no "
+                                 "wallet batch or table that would end after it less HL_ROLLUP_DEADLINE_MARGIN_S, so "
+                                 "rollups can no longer get the run killed; must be above HL_RUN_SOFT_DEADLINE_MIN. "
+                                 "0 = off (Dagster / hand runs / the daily cadence without a tight unit timeout)"),
     # --- native candle prices (price_step.py: the ETL's token_price_usd_1h / 1d) --------
     "HL_PRICE_TIME_BUDGET_MIN": ("3", False,
                                  "minutes at the START of every run spent fetching native 1h/1d candles for "
@@ -93,8 +99,11 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                    "1 = after every successful lift, recompute the rollup tables for the wallets whose "
                    "ledger changed (docs/HYPERCORE_FULL_CONTRACT_PLAN.md); 0 = off"),
     "HL_ROLLUP_TIME_BUDGET_MIN": ("8", False,
-                                  "minutes the rollup step may spend per run; tables whose turn comes later are "
-                                  "skipped and reported (rollups.skipped) and caught up by the next run. 0 = no limit"),
+                                  "minutes the rollup step may spend per run - a CAP since v1.11.2: the effective "
+                                  "budget is the smaller of this and the time left to HL_RUN_HARD_DEADLINE_MIN less "
+                                  "HL_ROLLUP_DEADLINE_MARGIN_S (hourly cadence: 20, so the step uses whatever the pull "
+                                  "phase left). Tables whose turn comes later are skipped and reported "
+                                  "(rollups.skipped) and caught up by the next run. 0 = no cap"),
     "HL_ROLLUP_DUCKDB_MEMORY": ("32GB", False,
                                 "v1.10.11: DuckDB memory_limit of the rollup run (spills to HL_OUT_DIR/.duckdb/rollups "
                                 "beyond it). DuckDB's default is 80 % of the host RAM, above the unit's cgroup cap, so "
@@ -109,6 +118,18 @@ ENV_VARS: dict[str, tuple[str, bool, str]] = {
                                     "wallet batches of about this many ledger rows; every finished batch is written and "
                                     "recorded in _rollup_state.json (wallets_through), the time budget is checked "
                                     "between batches, so a backlog drains across runs instead of being redone each hour"),
+    "HL_ROLLUP_DEADLINE_MARGIN_S": ("120", False,
+                                    "v1.11.2: seconds the rollup step keeps clear of HL_RUN_HARD_DEADLINE_MIN. A wallet "
+                                    "batch is started only when its estimate (rollups.batch_estimate_s: 20 s + 20 us per "
+                                    "ledger row) fits before the deadline less this margin; the margin absorbs the "
+                                    "estimate error of one batch (single-whale batches run up to 38 us per row) and the "
+                                    "watermark / state / summary writes"),
+    "HL_ROLLUP_AGGREGATES_WITH_PENDING": ("0", False,
+                                          "v1.11.2: 1 = the cross-wallet aggregate tables (ranks: wallet_overview_pnl_percentile_1d, "
+                                          "wallet_performance_30d, l4_token_wallet_sharpe_1d) are recomputed after the wallet batches "
+                                          "even when the budget left wallets pending - their rows are then one run stale and the "
+                                          "next run refreshes them; the chain keeps 60 s for the group. 0 = they wait for a run in "
+                                          "which every changed wallet fits (pre-1.11.2: on a standing backlog they froze for days)"),
     # --- Token Heatmap (heatmap.py, v1.11.0: TOKEN_HEATMAP_DATA_SPEC.md section 2) ----------
     "HL_HEATMAP": ("1", False,
                    "v1.11: 1 = the hourly run stages the three bucket-keyed heatmap snapshot tables "

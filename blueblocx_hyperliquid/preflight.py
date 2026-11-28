@@ -193,6 +193,31 @@ def check_env(env_file: Path | None) -> list[Check]:
     except ValueError as e:
         out.append(_fail("soft_deadline", str(e)))
     try:
+        hd = config.env_float("HL_RUN_HARD_DEADLINE_MIN")
+        margin = config.env_float("HL_ROLLUP_DEADLINE_MARGIN_S")
+        soft = config.env_float("HL_RUN_SOFT_DEADLINE_MIN")
+        cap = config.env_float("HL_ROLLUP_TIME_BUDGET_MIN")
+        agg = ("aggregates recomputed even with pending wallets"
+               if config.env("HL_ROLLUP_AGGREGATES_WITH_PENDING").strip().lower() in ("1", "true", "yes", "on")
+               else "aggregates wait for a complete wallet chain")
+        if hd < 0 or margin < 0:
+            out.append(_fail("hard_deadline", f"HL_RUN_HARD_DEADLINE_MIN={hd:g} / HL_ROLLUP_DEADLINE_MARGIN_S={margin:g} - "
+                                              f"both must be >= 0"))
+        elif hd == 0:
+            out.append(_ok("hard_deadline", f"off - the rollup step is bounded by HL_ROLLUP_TIME_BUDGET_MIN={cap:g} alone "
+                                            f"(hourly cadence: set 47 = TimeoutStartSec 50 min - 3)"))
+        elif hd >= 50:
+            out.append(_warn("hard_deadline", f"{hd:g} min - at or above the 50-minute unit timeout of the hourly cadence: "
+                                              f"a rollup batch started just before it is killed (47 = 50 - 3)"))
+        elif soft > 0 and hd <= soft:
+            out.append(_warn("hard_deadline", f"{hd:g} min is not above the soft deadline ({soft:g} min): the rollup step "
+                                              f"gets no time at all"))
+        else:
+            out.append(_ok("hard_deadline", f"{hd:g} min; the rollup step keeps {margin:g} s clear of it under the "
+                                            f"HL_ROLLUP_TIME_BUDGET_MIN={cap:g} cap; {agg}"))
+    except ValueError as e:
+        out.append(_fail("hard_deadline", str(e)))
+    try:
         pb = config.env_float("HL_PRICE_TIME_BUDGET_MIN")
         hd = config.env_int("HL_PRICE_HISTORY_DAYS")
         if pb < 0 or pb > 20:
@@ -319,19 +344,48 @@ def check_tracked(*, offline: bool, out_dir: Path, get=None) -> Check:
 
 # --- network checks -----------------------------------------------------------------------
 
-def check_hl_api() -> list[Check]:
+_HL_API_TRIES = 3                  # v1.11.2: a 5xx / timeout / connection error on the meta probe is retried
+_HL_API_BACKOFF_S = (5.0, 10.0)    # pause before the 2nd and the 3rd try
+
+
+class _Transient(Exception):
+    """An HTTP 5xx from the Info API: retried like a timeout."""
+
+
+def check_hl_api(post=None, sleep=None) -> list[Check]:
+    """The Info API answers `meta` (plus the clock skew against its Date header).
+    v1.11.2: HTTP 5xx, timeouts and connection errors are retried (_HL_API_TRIES tries,
+    _HL_API_BACKOFF_S between them) and FAIL only when the last try fails too - one
+    504 on 2026-11-28 08:12 UTC cost a whole hourly slot (ExecStartPre exit 1). A 4xx
+    or an unparsable answer fails at once. `post` / `sleep` are injection points for
+    the tests."""
     import requests
+    post = post or requests.post
+    sleep = sleep or time.sleep
     url = config.env("HL_INFO_URL")
     timeout = config.env_int("HL_HTTP_TIMEOUT")
-    t0 = time.monotonic()
-    try:
-        r = requests.post(url, json={"type": "meta"}, timeout=timeout)
-        latency = (time.monotonic() - t0) * 1000
-        r.raise_for_status()
-        n = len((r.json() or {}).get("universe", []))
-    except Exception as e:  # noqa: BLE001
-        return [_fail("hl_api", f"{url}: {type(e).__name__}: {str(e)[:120]}")]
-    out = [_ok("hl_api", f"{url} reachable, {n} perp assets, {latency:.0f} ms")]
+    transient: list[str] = []
+    for attempt in range(1, _HL_API_TRIES + 1):
+        t0 = time.monotonic()
+        try:
+            r = post(url, json={"type": "meta"}, timeout=timeout)
+            latency = (time.monotonic() - t0) * 1000
+            if 500 <= int(getattr(r, "status_code", 0) or 0) < 600:
+                raise _Transient(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            n = len((r.json() or {}).get("universe", []))
+            break
+        except (_Transient, requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            what = str(e) if isinstance(e, _Transient) else type(e).__name__
+            transient.append(f"try {attempt}: {what}")
+            if attempt == _HL_API_TRIES:
+                return [_fail("hl_api", f"{url}: {what} after {attempt} tries ({'; '.join(transient)})")]
+            sleep(_HL_API_BACKOFF_S[min(attempt - 1, len(_HL_API_BACKOFF_S) - 1)])
+        except Exception as e:  # noqa: BLE001
+            return [_fail("hl_api", f"{url}: {type(e).__name__}: {str(e)[:120]}")]
+    detail = f"{url} reachable, {n} perp assets, {latency:.0f} ms"
+    out = [_warn("hl_api", f"{detail} - after {len(transient)} transient failure(s): {'; '.join(transient)}")
+           if transient else _ok("hl_api", detail)]
     date_hdr = r.headers.get("Date")
     if date_hdr:
         try:

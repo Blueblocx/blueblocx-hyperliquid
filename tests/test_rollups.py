@@ -9,11 +9,13 @@ import os
 import shutil
 import statistics
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 import pyarrow as pa
 
+from blueblocx_hyperliquid import config
 from blueblocx_hyperliquid import schema as S
 from blueblocx_hyperliquid import rollups as R
 from blueblocx_hyperliquid.rollups import PLAN, REQUIRED, Budget, balances, categories, fifo, market, quality, signals, tokens
@@ -181,8 +183,45 @@ class CommonTests(unittest.TestCase):
     def test_budget(self):
         b = Budget(0)
         self.assertFalse(b.exhausted())
+        self.assertTrue(b.unlimited and b.fits(10 ** 9) and b.binding is None)
         b = Budget(1e-9, started=0.0)
         self.assertTrue(b.exhausted())
+
+    def test_budget_effective_limit_is_the_smaller_of_cap_and_deadline(self):
+        t0 = time.monotonic()
+        b = Budget(8, started=t0)                           # cap only (pre-1.11.2 behaviour)
+        self.assertEqual((b.seconds, b.binding, b.unlimited), (480.0, "cap", False))
+        b = Budget(8, started=t0, limit_s=300)              # the deadline is nearer than the cap
+        self.assertEqual((b.seconds, b.binding), (300.0, "deadline"))
+        self.assertTrue(b.fits(250))
+        self.assertFalse(b.fits(400))
+        b = Budget(8, started=t0, limit_s=3000)             # the cap is nearer than the deadline
+        self.assertEqual((b.seconds, b.binding), (480.0, "cap"))
+        b = Budget(0, started=t0, limit_s=90)               # no cap: the deadline alone bounds the step
+        self.assertEqual((b.seconds, b.binding, b.unlimited), (90.0, "deadline", False))
+        b = Budget(0, started=t0, limit_s=-5)               # deadline already passed: no time at all, NOT unlimited
+        self.assertTrue(b.exhausted())
+        self.assertFalse(b.fits(1))
+        self.assertEqual(b.describe(), {"cap_s": None, "limit_s": 0.0, "effective_s": 0.0, "binding": "deadline"})
+        self.assertEqual(Budget(0, started=t0).describe(), {"cap_s": None, "limit_s": None, "effective_s": None, "binding": None})
+
+    def test_batch_estimate_and_deadline_env_defaults(self):
+        self.assertEqual(R.batch_estimate_s(0), R.BATCH_FIXED_S)
+        self.assertAlmostEqual(R.batch_estimate_s(8_000_000), R.BATCH_FIXED_S + 160.0)
+        self.assertEqual(R.batch_estimate_s(-1), R.BATCH_FIXED_S)
+        example = (Path(__file__).resolve().parent.parent / "deploy" / ".env.example").read_text(encoding="utf-8")
+        for k, default in (("HL_RUN_HARD_DEADLINE_MIN", "47"), ("HL_ROLLUP_DEADLINE_MARGIN_S", "120"),
+                           ("HL_ROLLUP_AGGREGATES_WITH_PENDING", "0")):
+            self.assertEqual(config.ENV_VARS[k][0], default, k)
+            self.assertIn(k, example)
+        with _Env(HL_ROLLUP_AGGREGATES_WITH_PENDING=None, HL_ROLLUP_DEADLINE_MARGIN_S=None):
+            self.assertFalse(R.aggregates_with_pending_flag())        # documented default, not env_bool's own
+            self.assertEqual(R.deadline_margin_s(), 120.0)
+        with _Env(HL_ROLLUP_AGGREGATES_WITH_PENDING="1", HL_ROLLUP_DEADLINE_MARGIN_S="-3"):
+            self.assertTrue(R.aggregates_with_pending_flag())
+            self.assertEqual(R.deadline_margin_s(), 0.0)
+        self.assertTrue(set(R.AGGREGATE_GROUPS) < {g for g, _, _ in R._engines()})
+        self.assertTrue(set(R.AGGREGATE_GROUPS).isdisjoint(R.WALLET_CHAIN))
 
 
 class CategoryTests(unittest.TestCase):
@@ -726,6 +765,67 @@ class WalletBatchProgressTests(unittest.TestCase):
         self.assertEqual(self._state(), {})
         self.assertFalse(self.catalog.table_exists(f"{S.NS_HYPERCORE}.l4_wallet_balance_per_tx"))
 
+    def _first_batch_fits_then_none_does(self):
+        """Deterministic admission: the first batch's estimate fits the budget, the second never does."""
+        from unittest import mock
+        return mock.patch.object(R, "batch_estimate_s", side_effect=[1.0] + [10.0 ** 9] * 20)
+
+    def test_aggregates_run_with_pending_wallets_when_enabled(self):
+        wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet"]
+        ranks = [t for g, p, _c in R._engines() if g in R.AGGREGATE_GROUPS for t in p]
+        with self._first_batch_fits_then_none_does():
+            rep = R.run(self.ns_dir, self.catalog, now=self.now, budget_min=8, tables=wallet_tables + ranks, batch_rows=1,
+                        aggregates_with_pending=True, reserve_s=0)
+        self.assertEqual(rep["errors"], {})
+        self.assertEqual((rep["wallet_batches"], rep["wallets_done"], rep["wallets_pending"]), (3, 1, 2))
+        self.assertEqual((rep["stopped_before_batch"]["batch"], rep["stopped_before_batch"]["binding"]), (2, "cap"))
+        self.assertEqual(sorted(rep["skipped"]), sorted(wallet_tables))          # honest about the backlog...
+        for t in ranks:
+            self.assertIn(t, rep["tables"])                                      # ...but the aggregates were recomputed
+            self.assertNotIn(t, rep["skipped"])
+        self.assertEqual(rep["aggregates_with_pending_wallets"], 2)
+        self.assertNotIn("aggregates_skipped", rep)
+        self.assertTrue(rep["budget"]["aggregates_with_pending"])
+        self.assertEqual((rep["budget"]["binding"], rep["budget"]["cap_s"], rep["budget"]["limit_s"]), ("cap", 480.0, None))
+        # the marker semantics are untouched: progress per batch, ledger_through only when the chain is complete
+        self.assertFalse(rep["state_advanced"])
+        self.assertEqual(self._state()["wallets_through"], {"0xw1": self.STAMP.isoformat()})
+        self.assertNotIn("ledger_through", self._state())
+        self.assertEqual(set(self._rows("l4_wallet_balance_per_tx")), {"0xw1"})
+
+    def test_aggregates_wait_for_a_complete_chain_by_default(self):
+        wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet"]
+        ranks = [t for g, p, _c in R._engines() if g in R.AGGREGATE_GROUPS for t in p]
+        with self._first_batch_fits_then_none_does(), _Env(HL_ROLLUP_AGGREGATES_WITH_PENDING=None):
+            rep = R.run(self.ns_dir, self.catalog, now=self.now, budget_min=8, tables=wallet_tables + ranks, batch_rows=1)
+        self.assertEqual((rep["wallets_done"], rep["wallets_pending"]), (1, 2))
+        self.assertEqual(sorted(rep["skipped"]), sorted(wallet_tables + ranks))  # pre-1.11.2: the aggregates wait
+        for t in ranks:
+            self.assertNotIn(t, rep["tables"])
+        self.assertIn("2 wallets pending", rep["aggregates_skipped"])
+        self.assertFalse(rep["budget"]["aggregates_with_pending"])
+        self.assertEqual(rep["budget"]["reserve_s"], 0.0)
+        self.assertFalse(rep["state_advanced"])
+
+    def test_hard_deadline_caps_the_configured_budget(self):
+        wallet_tables = [t for t, p in PLAN.items() if p["kind"] == "wallet"]
+        # the deadline is already here: nothing starts, whatever the cap says (0 = none); state untouched
+        rep = R.run(self.ns_dir, self.catalog, now=self.now, budget_min=0, tables=wallet_tables, batch_rows=1,
+                    hard_deadline_ts=time.time(), margin_s=0)
+        self.assertEqual(sorted(rep["skipped"]), sorted(wallet_tables))
+        self.assertEqual((rep["wallets_pending"], rep["state_advanced"]), (3, False))
+        self.assertEqual((rep["budget"]["binding"], rep["budget"]["effective_s"], rep["budget"]["margin_s"]), ("deadline", 0.0, 0.0))
+        self.assertLessEqual(rep["budget"]["hard_deadline_in_s"], 1.0)
+        self.assertEqual(self._state(), {})
+        self.assertFalse(self.catalog.table_exists(f"{S.NS_HYPERCORE}.l4_wallet_balance_per_tx"))
+        # a far deadline leaves the cap in charge; the margin is reported; the run completes
+        rep = R.run(self.ns_dir, self.catalog, now=self.now, budget_min=8, tables=wallet_tables, batch_rows=1,
+                    hard_deadline_ts=time.time() + 3600, margin_s=120)
+        self.assertEqual((rep["budget"]["binding"], rep["budget"]["cap_s"], rep["budget"]["margin_s"]), ("cap", 480.0, 120.0))
+        self.assertAlmostEqual(rep["budget"]["limit_s"], 3480.0, delta=5.0)
+        self.assertEqual((rep["skipped"], rep["wallets_done"], rep["state_advanced"]), ([], 3, True))
+        self.assertEqual(self._state()["ledger_through"], self.STAMP.isoformat())
+
     def test_batch_rows_default_and_pending_logic(self):
         with _Env(HL_ROLLUP_WALLET_BATCH_ROWS=None):
             self.assertEqual(R.wallet_batch_rows(), 8_000_000)
@@ -741,6 +841,16 @@ class WalletBatchProgressTests(unittest.TestCase):
         self.assertTrue(set(R.WALLET_CHAIN) < {g for g, _, _ in R._engines()})
         for alias in ("ledger", "balance_openings", "fifo_state_new", "priced_statement", "spot_snap"):
             self.assertIn(alias, R.BATCH_ALIASES)
+        from blueblocx_hyperliquid.rollups.common import wallet_chunks_with_rows
+        ctx = R.Context(self.catalog, S.NS_HYPERCORE, self.now, wallets=None, all_wallets=True)
+        try:
+            ctx.load("l1_wallet_ledger", date_col="block_date", alias="ledger_changed")
+            sized = wallet_chunks_with_rows(ctx, "ledger_changed", 1)
+            self.assertEqual(sized, [([w], 3) for w in self.WALLETS])             # 3 ledger rows per wallet, one wallet per batch
+            self.assertEqual(wallet_chunks(ctx, "ledger_changed", 100), [self.WALLETS])
+            self.assertEqual(wallet_chunks_with_rows(ctx, "ledger_changed", 100), [(self.WALLETS, 9)])
+        finally:
+            ctx.close()
 
 
 if __name__ == "__main__":

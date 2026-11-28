@@ -43,13 +43,24 @@ the tokenDetails supply in l1_token_metadata, token_whitelist and the tracked le
 Scope: wallet-derived aggregates cover the TRACKED wallet set (the lake holds only
 those wallets' ledgers); the run summary and control.table_watermarks say so.
 
-Time budget: HL_ROLLUP_TIME_BUDGET_MIN (8). A table whose turn comes after the
-budget is spent is SKIPPED and reported (run summary `rollups.skipped`, a warning),
-never silently; the next run picks it up. The per-wallet chain runs in wallet
-BATCHES (HL_ROLLUP_WALLET_BATCH_ROWS ledger rows, v1.10.12) and records every
-finished batch in `_rollup_state.json[wallets_through]`, so a backlog the budget
-cannot absorb in one hour drains across runs (run() has the model; before, the
-marker only moved when the whole chain fit the budget and a backlog never drained).
+Time budget: HL_ROLLUP_TIME_BUDGET_MIN (8) is a CAP (v1.11.2); the effective budget is
+the smaller of it and the time left to the RUN's hard deadline (daily.py: the run start
++ HL_RUN_HARD_DEADLINE_MIN, 47 = the unit's 50-min TimeoutStartSec minus 3) less
+HL_ROLLUP_DEADLINE_MARGIN_S (120). A table whose turn comes after the budget is spent
+is SKIPPED and reported (run summary `rollups.skipped`, a warning), never silently;
+the next run picks it up. The per-wallet chain runs in wallet BATCHES
+(HL_ROLLUP_WALLET_BATCH_ROWS ledger rows, v1.10.12) and records every finished batch
+in `_rollup_state.json[wallets_through]`, so a backlog the budget cannot absorb in one
+hour drains across runs (run() has the model; before, the marker only moved when the
+whole chain fit the budget and a backlog never drained). A batch is STARTED only when
+its estimate (batch_estimate_s: 20 s + 20 us per ledger row, the p90 of production
+batches) fits the time left, so the step never runs the unit into its timeout for one
+more batch (`rollups.budget` / `rollups.stopped_before_batch` in the summary say what
+bound it). HL_ROLLUP_AGGREGATES_WITH_PENDING=1 lets the cross-wallet aggregate group
+(ranks) run after the batches even while wallets are still pending - the chain keeps
+AGGREGATES_RESERVE_S for it - instead of waiting for an hour in which every changed
+wallet fits (on the standing backlog of 2026-11-26..28 that hour never came and the
+three rank tables froze while the per-wallet tables kept moving).
 Engine ORDER (v1.10.11): the cheap global groups
 (categories, market, tokens, signals, quality, pairs, flows, activity: seconds
 each, no wallet inputs) run first, the heavy per-wallet chain (balances ->
@@ -130,15 +141,82 @@ REQUIRED: dict[str, list[str]] = {name: list(p["key"]) + ["updated_at"] for name
 
 
 class Budget:
-    def __init__(self, minutes: float, started: float | None = None):
+    """The time the rollup step may spend, counted from `started` (time.monotonic()).
+
+    `minutes` is the configured cap (HL_ROLLUP_TIME_BUDGET_MIN; 0 = no cap). `limit_s`
+    (v1.11.2) is a hard limit in seconds that applies even without a cap: the run's
+    hard deadline less the safety margin (run() derives it from `hard_deadline_ts`).
+    The effective budget is the smaller of the two. A limit <= 0 means the step has no
+    time at all - unlike minutes=0, which means unlimited."""
+
+    def __init__(self, minutes: float, started: float | None = None, limit_s: float | None = None):
         self.started = started if started is not None else time.monotonic()
-        self.seconds = max(0.0, float(minutes or 0)) * 60.0
+        self.cap_seconds = max(0.0, float(minutes or 0)) * 60.0       # 0 = no cap
+        self.limit_seconds = None if limit_s is None else max(0.0, float(limit_s))
+        if self.limit_seconds is None:
+            self.seconds = self.cap_seconds
+        elif self.cap_seconds > 0:
+            self.seconds = min(self.cap_seconds, self.limit_seconds)
+        else:
+            self.seconds = self.limit_seconds
+        self.unlimited = self.limit_seconds is None and self.cap_seconds == 0
+
+    @property
+    def binding(self) -> str | None:
+        """Which bound is in force: 'deadline', 'cap' or None (unlimited)."""
+        if self.unlimited:
+            return None
+        if self.limit_seconds is not None and (self.cap_seconds == 0 or self.limit_seconds < self.cap_seconds):
+            return "deadline"
+        return "cap"
 
     def left(self) -> float:
-        return self.seconds - (time.monotonic() - self.started) if self.seconds else float("inf")
+        if self.unlimited:
+            return float("inf")
+        return self.seconds - (time.monotonic() - self.started)
 
     def exhausted(self) -> bool:
-        return self.seconds > 0 and self.left() <= 0
+        return not self.unlimited and self.left() <= 0
+
+    def fits(self, seconds: float) -> bool:
+        """Can `seconds` of work start now and still end inside the budget?"""
+        return self.unlimited or self.left() >= seconds
+
+    def describe(self) -> dict:
+        return {"cap_s": self.cap_seconds or None, "limit_s": self.limit_seconds,
+                "effective_s": None if self.unlimited else round(self.seconds, 1), "binding": self.binding}
+
+
+# --- deadline awareness (v1.11.2) ------------------------------------------------------------
+# The chain's cost per ledger row of a wallet batch, used to decide whether one more batch
+# still fits before the run's hard deadline. Production, 216 batches 2026-11-20..28: p50 16 us,
+# p90 21 us per row; single-whale batches of ~10M rows run at up to 38 us per row - that
+# under-estimate (<= 180 s observed) is absorbed by HL_ROLLUP_DEADLINE_MARGIN_S plus the
+# 3 minutes between HL_RUN_HARD_DEADLINE_MIN and the unit timeout.
+CHAIN_S_PER_LEDGER_ROW = 20e-6
+BATCH_FIXED_S = 20.0             # per batch: the ledger slice, seven Iceberg commits, the state write
+# what the aggregate group needs after the chain (ranks: three tables, 30-36 s observed)
+AGGREGATES_RESERVE_S = 60.0
+# the groups after the per-wallet chain that read the WRITTEN per-wallet tables back
+# (cross-wallet, dated); HL_ROLLUP_AGGREGATES_WITH_PENDING decides whether they run while
+# wallets are still pending
+AGGREGATE_GROUPS = ("ranks",)
+
+
+def batch_estimate_s(ledger_rows: int) -> float:
+    """Seconds one wallet batch of `ledger_rows` ledger rows is expected to take (whole chain)."""
+    return BATCH_FIXED_S + max(0, int(ledger_rows or 0)) * CHAIN_S_PER_LEDGER_ROW
+
+
+def deadline_margin_s() -> float:
+    """HL_ROLLUP_DEADLINE_MARGIN_S (120): seconds kept clear of the run's hard deadline."""
+    return max(0.0, config.env_float("HL_ROLLUP_DEADLINE_MARGIN_S"))
+
+
+def aggregates_with_pending_flag() -> bool:
+    """HL_ROLLUP_AGGREGATES_WITH_PENDING (0): run the aggregate groups even when the
+    budget left wallets pending (their rows are then one run stale, never wrong)."""
+    return config.env("HL_ROLLUP_AGGREGATES_WITH_PENDING").strip().lower() in ("1", "true", "yes", "on")
 
 
 class Context:
@@ -551,37 +629,56 @@ def _run_group(ctx: Context, group: str, wanted: list[str], compute, *, ddl: dic
 def _run_wallet_chain(ctx: Context, chain: list[tuple[str, list[str], Callable]], *, stamps: dict[str, str],
                       pending: dict[str, str], full: bool, budget: Budget, state: dict, ns_dir: Path, ddl: dict,
                       now: dt.datetime, dry_run: bool, record_progress: bool, report: dict, pending_wm: list,
-                      written_tables: list[str], batch_rows: int | None = None) -> bool:
+                      written_tables: list[str], batch_rows: int | None = None, reserve_s: float = 0.0) -> bool:
     """balances -> networth -> fifo -> positions for the pending wallets, one wallet
     BATCH at a time (about `batch_rows` ledger rows, a wallet never split): every batch
     is computed, written and - when `record_progress` - recorded in
     state['wallets_through'] before the next one starts, and the time budget is
-    checked between batches. Returns True when every pending wallet was processed."""
-    from .common import ledger_chunk, wallet_chunks
+    checked between batches: a batch is started only while the budget is not spent AND
+    its estimate (batch_estimate_s of its ledger rows) plus `reserve_s` (what the
+    aggregate groups need after the chain, v1.11.2) fits the time left. Returns True
+    when every pending wallet was processed."""
+    from .common import ledger_chunk, wallet_chunks_with_rows
     wallets = sorted(pending)
     # the ledger of every pending wallet (READ_DAYS), loaded from the lake ONCE as Arrow
     # and sliced per batch below (a lake scan per batch would re-read every data file)
     ctx.wallets = None if (full and ctx.all_wallets) else wallets
     ctx.unregister("ledger_changed")
     ctx.load("l1_wallet_ledger", date_col="block_date", alias="ledger_changed")
-    batches = wallet_chunks(ctx, "ledger_changed", batch_rows or wallet_batch_rows())
+    sized = wallet_chunks_with_rows(ctx, "ledger_changed", batch_rows or wallet_batch_rows())
+    batches = [b for b, _n in sized]
+    rows_of = [n for _b, n in sized]                    # ledger rows per batch (its duration estimate)
     seen = {w for b in batches for w in b}
     rest = [w for w in wallets if w not in seen]        # changed, but no ledger row inside READ_DAYS
     if rest:
         batches.append(rest)
+        rows_of.append(0)
     ctx.all_wallets = False                             # every write below is scoped to its batch's wallets
     report["wallet_batches"] = len(batches)
     report.setdefault("wallets_done", 0)
     report.setdefault("wallets_failed", 0)
     done_all = True
     for i, batch in enumerate(batches, 1):
-        if budget.exhausted():
+        est = batch_estimate_s(rows_of[i - 1])
+        spent = budget.exhausted()
+        if spent or not budget.fits(est + reserve_s):
             left = sum(len(b) for b in batches[i - 1:])
             report["wallets_pending"] = left
             for _g, wanted, _c in chain:
                 report["skipped"] += [t for t in wanted if t not in report["skipped"]]
-            log.warning("rollups: time budget spent after %d of %d wallet batches; %d wallets wait for the next run",
-                        i - 1, len(batches), left)
+            if spent:
+                log.warning("rollups: time budget spent after %d of %d wallet batches; %d wallets wait for the next run",
+                            i - 1, len(batches), left)
+            else:
+                # v1.11.2: stop BEFORE a batch that would end past the budget (the run's hard
+                # deadline less the margin, or the cap) - not one batch after it
+                report["stopped_before_batch"] = {"batch": i, "wallets": len(batch), "ledger_rows": rows_of[i - 1],
+                                                  "estimate_s": round(est, 1), "left_s": round(budget.left(), 1),
+                                                  "reserve_s": reserve_s, "binding": budget.binding}
+                log.warning("rollups: wallet batch %d/%d (%d wallets, %d ledger rows, ~%.0fs) does not fit the %.0fs "
+                            "left (%s binds, %.0fs reserved for the aggregates) after %d batches; %d wallets wait for "
+                            "the next run", i, len(batches), len(batch), rows_of[i - 1], est, budget.left(),
+                            budget.binding, reserve_s, i - 1, left)
             done_all = False
             break
         t0 = time.monotonic()
@@ -614,7 +711,9 @@ def _run_wallet_chain(ctx: Context, chain: list[tuple[str, list[str], Callable]]
 
 def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: float | None = None,
         tables: list[str] | None = None, full: bool = False, dry_run: bool = False,
-        namespace: str = S.NS_HYPERCORE, read_catalog=None, batch_rows: int | None = None) -> dict:
+        namespace: str = S.NS_HYPERCORE, read_catalog=None, batch_rows: int | None = None,
+        hard_deadline_ts: float | None = None, margin_s: float | None = None,
+        aggregates_with_pending: bool | None = None, reserve_s: float | None = None) -> dict:
     """Compute and write the rollup tables. Returns the report the run summary embeds.
     `read_catalog` (tests / rehearsals): read the lake inputs from another catalog
     than the one the rollup tables are written to.
@@ -632,13 +731,44 @@ def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: fl
     every changed wallet is done, `ledger_through` becomes the newest stamp and
     `wallets_through` is cleared. Progress is recorded only when every wallet-kind
     table is in scope (no --tables subset of the chain) and never on --dry-run.
-    `ranks` (cross-wallet, reads the written tables back) runs after the chain."""
+    `ranks` (cross-wallet, reads the written tables back) runs after the chain.
+
+    Deadline (v1.11.2). `hard_deadline_ts` (epoch seconds; daily.py passes the run
+    start + HL_RUN_HARD_DEADLINE_MIN) bounds the step even when the cap is 0: the
+    effective budget is min(cap, hard_deadline_ts - now - margin_s), `margin_s`
+    defaulting to HL_ROLLUP_DEADLINE_MARGIN_S, and a wallet batch is started only when
+    batch_estimate_s(its ledger rows) plus the aggregates reserve fits what is left
+    (`rollups.budget` in the report says what bound the step). `aggregates_with_pending`
+    (HL_ROLLUP_AGGREGATES_WITH_PENDING) lets the AGGREGATE_GROUPS run after a chain the
+    budget cut short - the chain keeps `reserve_s` (AGGREGATES_RESERVE_S) for them and
+    their rows for the pending wallets are one run stale; off, they wait for a run in
+    which every changed wallet fits (the pre-1.11.2 behaviour). The marker semantics are
+    untouched either way: `ledger_through` moves only when every changed wallet went
+    through the whole chain, `wallets_through` records the finished batches."""
     now = now or utcnow()
-    budget = Budget(config.env_float("HL_ROLLUP_TIME_BUDGET_MIN") if budget_min is None else budget_min)
+    cap_min = config.env_float("HL_ROLLUP_TIME_BUDGET_MIN") if budget_min is None else budget_min
+    margin_s = deadline_margin_s() if margin_s is None else max(0.0, float(margin_s))
+    limit_s = None if hard_deadline_ts is None else float(hard_deadline_ts) - time.time() - margin_s
+    budget = Budget(cap_min, limit_s=limit_s)
+    with_pending = aggregates_with_pending_flag() if aggregates_with_pending is None else bool(aggregates_with_pending)
+    engines = _engines()
+    aggregate_tables = [t for g, p, _c in engines if g in AGGREGATE_GROUPS for t in p]
+    aggregates_wanted = any(not tables or t in tables for t in aggregate_tables)
+    if not (with_pending and aggregates_wanted):
+        reserve_s = 0.0
+    elif reserve_s is None:
+        reserve_s = AGGREGATES_RESERVE_S
+    else:
+        reserve_s = max(0.0, float(reserve_s))
     state = read_state(ns_dir)
     since = None if full else state.get("ledger_through")
     report: dict = {"run_id": uuid.uuid4().hex[:12], "started_at": now.isoformat(), "since": since,
-                    "full": full, "dry_run": dry_run, "tables": {}, "skipped": [], "errors": {}}
+                    "full": full, "dry_run": dry_run, "tables": {}, "skipped": [], "errors": {},
+                    "budget": {**budget.describe(), "configured_min": cap_min,
+                               "hard_deadline_in_s": (None if hard_deadline_ts is None
+                                                      else round(float(hard_deadline_ts) - time.time(), 1)),
+                               "margin_s": (None if hard_deadline_ts is None else margin_s),
+                               "aggregates_with_pending": with_pending, "reserve_s": reserve_s}}
     ddl = il.parse_ddl()
     probe = Context(catalog, namespace, now, wallets=None, all_wallets=True, read_catalog=read_catalog)
     try:
@@ -669,7 +799,6 @@ def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: fl
     written_tables: list[str] = []
     chain_done = True
     try:
-        engines = _engines()
         chain = [(g, [t for t in p if not tables or t in tables], c) for g, p, c in engines if g in WALLET_CHAIN]
         chain = [(g, w, c) for g, w, c in chain if w]
         chain_ran = False
@@ -689,14 +818,25 @@ def run(ns_dir: Path, catalog, *, now: dt.datetime | None = None, budget_min: fl
                 chain_done = _run_wallet_chain(ctx, chain, stamps=stamps, pending=pending, full=full, budget=budget,
                                                state=state, ns_dir=ns_dir, ddl=ddl, now=now, dry_run=dry_run,
                                                record_progress=record_progress, report=report, pending_wm=pending_wm,
-                                               written_tables=written_tables, batch_rows=batch_rows)
+                                               written_tables=written_tables, batch_rows=batch_rows, reserve_s=reserve_s)
                 continue
             wanted = [t for t in produced if not tables or t in tables]
             if not wanted:
                 continue
+            pending_left = report.get("wallets_pending") or 0
+            if group in AGGREGATE_GROUPS and pending_left and not with_pending:
+                # pre-1.11.2 semantics: the cross-wallet tables wait for a run in which every
+                # changed wallet went through the chain (HL_ROLLUP_AGGREGATES_WITH_PENDING=0)
+                report["skipped"] += wanted
+                report["aggregates_skipped"] = f"{pending_left} wallets pending (HL_ROLLUP_AGGREGATES_WITH_PENDING=0)"
+                continue
             if budget.exhausted():
                 report["skipped"] += wanted
                 continue
+            if group in AGGREGATE_GROUPS and pending_left:
+                # v1.11.2: recomputed from the lake as it stands - the pending wallets' rows are
+                # one run stale (deferred wallets already are, every hour), never wrong
+                report["aggregates_with_pending_wallets"] = pending_left
             _run_group(ctx, group, wanted, compute, ddl=ddl, now=now, dry_run=dry_run, report=report,
                        pending_wm=pending_wm, written_tables=written_tables)
         if pending_wm and not dry_run:
@@ -756,6 +896,9 @@ def main(argv=None) -> int:
     ap.add_argument("--full", action="store_true", help="recompute every wallet (ignore the state marker)")
     ap.add_argument("--dry-run", action="store_true", help="compute and report, write nothing")
     ap.add_argument("--budget-min", type=float, default=None, help="time budget (default HL_ROLLUP_TIME_BUDGET_MIN)")
+    ap.add_argument("--hard-deadline-min", type=float, default=None,
+                    help="v1.11.2: the step must be over this many minutes from now (the scheduled runner passes the "
+                         "run's HL_RUN_HARD_DEADLINE_MIN); default: no deadline, the budget alone bounds the step")
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--read-env", default=None,
                     help="rehearsal: read the lake inputs from the catalog this env file describes "
@@ -764,13 +907,16 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     ns_dir = Path(args.out) / args.namespace
     tables = [t for t in args.tables.split(",") if t] if args.tables else None
+    hard_deadline_ts = (time.time() + args.hard_deadline_min * 60.0
+                        if args.hard_deadline_min and args.hard_deadline_min > 0 else None)
     try:
         with RunLock(ns_dir / ".daily.lock"):
             catalog, _ = il.load_catalog_from_env(Path(args.local_dir) if args.local_dir else None)
             read_catalog = read_catalog_from_env_file(Path(args.read_env)) if args.read_env else None
             try:
                 rep = run(ns_dir, catalog, budget_min=args.budget_min, tables=tables, full=args.full,
-                          dry_run=args.dry_run, namespace=args.namespace, read_catalog=read_catalog)
+                          dry_run=args.dry_run, namespace=args.namespace, read_catalog=read_catalog,
+                          hard_deadline_ts=hard_deadline_ts)
             finally:
                 il.dispose_catalog(catalog)
                 if read_catalog is not None:

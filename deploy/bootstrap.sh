@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- settings
-RELEASE_TAG="${RELEASE_TAG:-v1.11.1}"
+RELEASE_TAG="${RELEASE_TAG:-v1.11.2}"
 GIT_ALIAS="${GIT_ALIAS:-github-blueblocx-hyperliquid}"        # Host alias in ~/.ssh/config
 REPO_URL="git@${GIT_ALIAS}:Blueblocx/blueblocx-hyperliquid.git"
 PROD_DIR="/opt/blueblocx-hyperliquid"
@@ -320,6 +320,9 @@ ensure_env HL_ROLLUP_WALLET_BATCH_ROWS 8000000 "v1.10.12: the per-wallet rollup 
 ensure_env HL_HEATMAP 1 "v1.11: 1 = stage + lift the three Token Heatmap snapshot tables every run (+100 Info weight: metaAndAssetCtxs per dex); 0 = off, the run behaves as v1.10.14. Gate 1: set 1, watch 24 runs, then heatmap --seed-daily once"
 ensure_env HL_HEATMAP_WRITER hourly "v1.11: hourly = the hourly run writes the heatmap tables; sweep = the Stage-2 sweep owns them"
 ensure_env HL_HEATMAP_LIFT_DEADLINE_S 2900 "v1.11: skip the heatmap lift when the run is already this old on entering the lift (repaired next run)"
+ensure_env HL_RUN_HARD_DEADLINE_MIN 47 "v1.11.2: the run must be over 47 min after its start (unit timeout 50 - 3); the rollup step starts nothing that would end after it"
+ensure_env HL_ROLLUP_DEADLINE_MARGIN_S 120 "v1.11.2: seconds the rollup step keeps clear of the hard deadline (absorbs one wallet batch's estimate error)"
+ensure_env HL_ROLLUP_AGGREGATES_WITH_PENDING 1 "v1.11.2: recompute the cross-wallet rank tables every run even while wallets are pending (stale rows beat frozen ones)"
 # keys of features removed in v1.3 (webhook / heartbeat alerts): drop them so preflight
 # does not warn about variables nothing reads
 if sudo grep -qE '^(HL_ALERT_WEBHOOK_URL|HL_ALERT_ON_SUCCESS|HL_ALERT_REPEAT_HOURS|HL_HEARTBEAT_URL)=' "$ENV_FILE"; then

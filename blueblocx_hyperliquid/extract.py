@@ -662,6 +662,7 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
         max_workers: int = 4, max_perp_price_coins: int = 30,
         s3_backfill: bool = False, iceberg: bool = False, incremental: bool = False,
         hip3: bool = True, retention_days: int = 0, deadline_ts: float | None = None,
+        hard_deadline_ts: float | None = None,
         soft_wallets: set[str] | None = None, progress=None,
         price_budget_min: float | None = None, rollup_budget_min: float | None = None,
         leaderboard_rows: dict | None = None, leaderboard_meta: dict | None = None,
@@ -675,6 +676,12 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
     wallets it did pull. The scheduled runner sets it well inside the service
     timeout so a list that outgrows one slot degrades to "the tail waits an hour"
     instead of the whole run being killed with nothing saved.
+
+    hard_deadline_ts (epoch seconds, v1.11.2): when the run MUST be over (daily.py: the
+    start plus HL_RUN_HARD_DEADLINE_MIN, i.e. the unit timeout minus 3 min). Only the
+    rollup step reads it: it starts no wallet batch or table that would end after
+    hard_deadline_ts minus HL_ROLLUP_DEADLINE_MARGIN_S (rollups.run), so a long pull
+    phase shortens the rollups instead of getting the run killed. None = unbounded.
 
     soft_wallets: the auto-tracked (leaderboard) wallets. They are never backfilled
     from S3 in this run, and an API-capped window is accepted as a hole: the
@@ -1433,7 +1440,8 @@ def run(wallets: list[str], days: int, out_dir: Path, *, with_prices: bool = Fal
                 from .iceberg_load import dispose_catalog, load_catalog_from_env
                 catalog, _ = load_catalog_from_env()
                 try:
-                    rollups_report = rollups.run(ns_dir, catalog, budget_min=rollup_budget_min)
+                    rollups_report = rollups.run(ns_dir, catalog, budget_min=rollup_budget_min,
+                                                 hard_deadline_ts=hard_deadline_ts)
                 finally:
                     dispose_catalog(catalog)
             except Exception as e:  # noqa: BLE001 - reported, never fatal

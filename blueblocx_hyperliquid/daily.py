@@ -17,7 +17,9 @@ Order of operations:
      overlap), HIP-3 dexes, today's l4x snapshot (replace-partition), S3 backfill
      for API-capped wallets, lift into Iceberg, staged-CSV retention (once a day);
      with HL_RUN_SOFT_DEADLINE_MIN the tail of the list is deferred to the next run
-     instead of the service timeout killing everything
+     instead of the service timeout killing everything; HL_RUN_HARD_DEADLINE_MIN
+     (v1.11.2: the unit timeout minus 3 min) is handed to the rollup step, which
+     starts nothing that would end after it
   4. build the run summary (hard problems vs warnings - see ops.build_summary),
      write _run_summary.json, append _run_history.jsonl
   Throughout, _run_progress.json records the phase and the wallet being pulled; the
@@ -79,6 +81,9 @@ def main(argv=None) -> int:
                     help="prune staged l1/l3/l4x CSV rows older than this after a successful lift (0 = never)")
     ap.add_argument("--deadline-min", type=float, default=config.env_float("HL_RUN_SOFT_DEADLINE_MIN"),
                     help="start no new wallet after this many minutes; the rest are deferred to the next run (0 = off)")
+    ap.add_argument("--hard-deadline-min", type=float, default=config.env_float("HL_RUN_HARD_DEADLINE_MIN"),
+                    help="the run must be over this many minutes after it started (the unit's TimeoutStartSec minus "
+                         "a margin): the rollup step starts no wallet batch or table that would end after it (0 = off)")
     ap.add_argument("--out", default=str(config.out_root()))
     args = ap.parse_args(argv)
 
@@ -132,13 +137,23 @@ def main(argv=None) -> int:
                                        f"and no pinned wallets in {wallets_path}")
             deadline_ts = (started.timestamp() + args.deadline_min * 60.0
                            if args.deadline_min and args.deadline_min > 0 else None)
+            # v1.11.2: the instant the run MUST be over (unit timeout minus a margin); only the
+            # rollup step reads it - it starts no batch or table that would end after it
+            hard_deadline_ts = (started.timestamp() + args.hard_deadline_min * 60.0
+                                if args.hard_deadline_min and args.hard_deadline_min > 0 else None)
+            if deadline_ts and hard_deadline_ts and hard_deadline_ts <= deadline_ts:
+                log.warning("hard deadline %g min is not above the soft deadline %g min: the rollup step gets no time",
+                            args.hard_deadline_min, args.deadline_min)
             progress.update(wallets_total=len(wallets),
                             deadline_at=(dt.datetime.fromtimestamp(deadline_ts, tz=dt.timezone.utc).isoformat()
-                                         if deadline_ts else None))
+                                         if deadline_ts else None),
+                            hard_deadline_at=(dt.datetime.fromtimestamp(hard_deadline_ts, tz=dt.timezone.utc).isoformat()
+                                              if hard_deadline_ts else None))
             recon = extract.run(wallets, args.days, out_dir, with_prices=args.with_prices,
                                 max_workers=args.workers, s3_backfill=args.s3_backfill,
                                 iceberg=args.iceberg, incremental=True,
                                 retention_days=args.retention_days, deadline_ts=deadline_ts,
+                                hard_deadline_ts=hard_deadline_ts,
                                 soft_wallets=set(auto), progress=progress.update,
                                 leaderboard_rows=lb_rows, leaderboard_meta=tracked_meta, tracked_sets=sets)
             if auto:
